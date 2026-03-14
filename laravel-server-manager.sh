@@ -12,6 +12,11 @@ BACKUPS_BASE="/var/backups/laravel-projects"
 SHARED_NETWORK="laravel-shared"
 PROXY_COMPOSE="${PROXY_BASE}/docker-compose.yml"
 SCRIPT_PATH="$(readlink -f "$0")"
+MAIL_BASE="/opt/mailserver"
+MAIL_COMPOSE="${MAIL_BASE}/compose.yaml"
+MAIL_ENV_FILE="${MAIL_BASE}/mailserver.env"
+WEBMAIL_BASE="/opt/webmail-roundcube"
+WEBMAIL_COMPOSE="${WEBMAIL_BASE}/compose.yaml"
 
 # Values loaded from "${app_dir}/.project-meta" (declared to keep shellcheck happy)
 PROJECT_NAME=""
@@ -704,6 +709,511 @@ ensure_cron_jobs() {
   setup_backup_cron
 }
 
+normalize_domain() {
+  local domain="$1"
+  domain="${domain,,}"
+  domain="${domain#http://}"
+  domain="${domain#https://}"
+  domain="${domain%%/*}"
+  domain="${domain%.}"
+  domain="${domain//[$'\t\r\n ']/}"
+  printf '%s' "$domain"
+}
+
+validate_domain() {
+  local domain="$1"
+  [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
+}
+
+ensure_proxy_stack() {
+  if [ ! -f "$PROXY_COMPOSE" ]; then
+    install_base
+    return 0
+  fi
+
+  proxy_up
+  ensure_cron_jobs
+}
+
+write_acme_only_vhost() {
+  local domain="$1"
+  local safe_name
+  safe_name="$(printf '%s' "$domain" | tr -cs 'a-zA-Z0-9.-' '-' | tr '[:upper:]' '[:lower:]')"
+
+  cat > "${PROXY_CONF_DIR}/acme-${safe_name}.conf" <<EOF
+server {
+    listen 80;
+    server_name ${domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 200 "OK\n";
+    }
+}
+EOF
+}
+
+write_roundcube_proxy_config_https() {
+  local domain="$1"
+  local upstream_name="roundcube-webmail"
+  local safe_name
+  safe_name="$(printf '%s' "$domain" | tr -cs 'a-zA-Z0-9.-' '-' | tr '[:upper:]' '[:lower:]')"
+
+  cat > "${PROXY_CONF_DIR}/webmail-${safe_name}.conf" <<EOF
+server {
+    listen 80;
+    server_name ${domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${domain};
+
+    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+
+    client_max_body_size 50M;
+
+    location / {
+        proxy_pass http://${upstream_name}:80;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Connection \"\";
+    }
+}
+EOF
+}
+
+setup_mailserver() {
+  local mail_domain mail_host admin_user admin_email admin_password proceed remove_old_cert
+
+  echo ""
+  echo "Email server setup (docker-mailserver)"
+  echo ""
+  echo "Important:"
+  echo "  - Many VPS providers block port 25 by default."
+  echo "  - Running a public mail server requires correct DNS (SPF/DKIM/DMARC) and rDNS (PTR)."
+  echo "  - If you misconfigure it, your mail may go to spam or be rejected."
+  echo ""
+
+  prompt mail_domain "Mail domain (e.g. example.com): "
+  mail_domain="$(normalize_domain "$mail_domain")"
+  if ! validate_domain "$mail_domain"; then
+    echo "Invalid domain: ${mail_domain}"
+    exit 1
+  fi
+
+  prompt mail_host "Mail host/FQDN (e.g. mail.example.com): "
+  mail_host="$(normalize_domain "$mail_host")"
+  if ! validate_domain "$mail_host"; then
+    echo "Invalid host: ${mail_host}"
+    exit 1
+  fi
+
+  prompt admin_user "Initial mailbox user [postmaster]: " "postmaster"
+  admin_user="${admin_user,,}"
+  admin_user="${admin_user//[$'\t\r\n ']/}"
+  if [[ ! "$admin_user" =~ ^[a-z0-9._-]+$ ]]; then
+    echo "Invalid mailbox user: ${admin_user}"
+    exit 1
+  fi
+  admin_email="${admin_user}@${mail_domain}"
+
+  prompt_secret admin_password "Initial mailbox password: "
+  if [ -z "$admin_password" ]; then
+    echo "Password is required."
+    exit 1
+  fi
+
+  echo ""
+  echo "DNS records you need (create these BEFORE expecting mail to work):"
+  echo "--------------------------------------------------------------"
+  echo "A/AAAA:"
+  echo "  ${mail_host} -> YOUR_SERVER_IP"
+  echo ""
+  echo "MX (for ${mail_domain}):"
+  echo "  ${mail_domain} MX 10 ${mail_host}"
+  echo ""
+  echo "PTR / rDNS (set at your VPS/provider):"
+  echo "  YOUR_SERVER_IP PTR ${mail_host}"
+  echo ""
+  echo "SPF (TXT for ${mail_domain}):"
+  echo "  v=spf1 mx -all"
+  echo ""
+  echo "DKIM + DMARC:"
+  echo "  The script will generate DKIM keys and show you the TXT record to add."
+  echo "  Example DMARC (TXT for _dmarc.${mail_domain}):"
+  echo "    v=DMARC1; p=none; rua=mailto:dmarc@${mail_domain}"
+  echo "--------------------------------------------------------------"
+  echo ""
+  echo "Multi-domain note:"
+  echo "  You can host multiple email domains on this ONE mail server."
+  echo "  For each additional domain, you will add its MX record pointing to ${mail_host}"
+  echo "  and create mailboxes like user@otherdomain.com."
+  echo "  Mail clients should always connect using the mail host: ${mail_host}"
+  echo ""
+
+  read -r -p "Ready to proceed and create the email server containers? (yes/no): " proceed
+  if [ "${proceed,,}" != "yes" ]; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  install_base
+  ensure_proxy_stack
+
+  echo "Issuing Let's Encrypt certificate for ${mail_host}..."
+  write_acme_only_vhost "$mail_host"
+  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+    --webroot \
+    --webroot-path=/var/www/certbot \
+    --email "admin@${mail_domain}" \
+    --agree-tos \
+    --no-eff-email \
+    -d "$mail_host"; then
+    echo "Failed to issue certificate for ${mail_host}."
+    exit 1
+  fi
+
+  echo "Creating mailserver stack in ${MAIL_BASE}..."
+  mkdir -p "${MAIL_BASE}/docker-data/dms/mail-data" \
+    "${MAIL_BASE}/docker-data/dms/mail-state" \
+    "${MAIL_BASE}/docker-data/dms/mail-logs" \
+    "${MAIL_BASE}/docker-data/dms/config"
+
+  cat > "$MAIL_ENV_FILE" <<EOF
+OVERRIDE_HOSTNAME=${mail_host}
+SSL_TYPE=letsencrypt
+SSL_CERT_PATH=/etc/letsencrypt/live/${mail_host}/fullchain.pem
+SSL_KEY_PATH=/etc/letsencrypt/live/${mail_host}/privkey.pem
+
+ENABLE_FAIL2BAN=1
+ENABLE_CLAMAV=0
+ENABLE_SPAMASSASSIN=0
+ENABLE_POSTGREY=0
+
+POSTMASTER_ADDRESS=postmaster@${mail_domain}
+LOG_LEVEL=info
+EOF
+
+  cat > "$MAIL_COMPOSE" <<EOF
+services:
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:latest
+    container_name: mailserver
+    hostname: ${mail_host%%.*}
+    domainname: ${mail_domain}
+    env_file:
+      - ./mailserver.env
+    ports:
+      - "25:25"
+      - "465:465"
+      - "587:587"
+      - "143:143"
+      - "993:993"
+    volumes:
+      - ./docker-data/dms/mail-data/:/var/mail/
+      - ./docker-data/dms/mail-state/:/var/mail-state/
+      - ./docker-data/dms/mail-logs/:/var/log/mail/
+      - ./docker-data/dms/config/:/tmp/docker-mailserver/
+      - ${PROXY_CERTBOT_CONF}:/etc/letsencrypt:ro
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+    stop_grace_period: 1m
+    cap_add:
+      - NET_ADMIN
+EOF
+
+  echo "Starting mailserver..."
+  dc -f "$MAIL_COMPOSE" up -d
+
+  echo "Creating initial mailbox: ${admin_email}"
+  docker exec -i mailserver setup email add "$admin_email" "$admin_password" >/dev/null 2>&1 || {
+    echo "Warning: failed to create mailbox automatically."
+    echo "You can create it manually with:"
+    echo "  docker exec -it mailserver setup email add ${admin_email}"
+  }
+
+  echo "Generating DKIM keys..."
+  docker exec -i mailserver setup config dkim >/dev/null 2>&1 || true
+  dc -f "$MAIL_COMPOSE" restart mailserver || true
+
+  local dkim_txt="${MAIL_BASE}/docker-data/dms/config/opendkim/keys/${mail_domain}/mail.txt"
+  echo ""
+  echo "=============================================================="
+  echo "MAILSERVER READY"
+  echo "Host: ${mail_host}"
+  echo "Domain: ${mail_domain}"
+  echo "Mailbox: ${admin_email}"
+  echo ""
+  echo "Ports opened by the container: 25, 465, 587, 143, 993"
+  echo ""
+  if [ -f "$dkim_txt" ]; then
+    echo "DKIM TXT record (add this in your DNS):"
+    echo "--------------------------------------------------------------"
+    sed -e 's/[[:space:]]*$//' "$dkim_txt" || true
+    echo "--------------------------------------------------------------"
+  else
+    echo "DKIM record file not found yet."
+    echo "Check: ${dkim_txt}"
+  fi
+  echo ""
+  echo "Next steps:"
+  echo "  1) Confirm DNS A/AAAA, MX, SPF, PTR are correct"
+  echo "  2) Add DKIM and DMARC"
+  echo "  3) Test SMTP submission on port 587 and IMAPS on 993"
+  echo "=============================================================="
+}
+
+ensure_mailserver_running() {
+  if ! docker_container_exists "mailserver"; then
+    echo "Mailserver container not found."
+    echo "Run option 10 first: Setup email server (docker-mailserver)."
+    exit 1
+  fi
+}
+
+print_mail_dns_instructions() {
+  local domain="$1"
+  local mail_host="$2"
+
+  echo "DNS checklist for ${domain}:"
+  echo "--------------------------------------------------------------"
+  echo "MX:"
+  echo "  ${domain} MX 10 ${mail_host}"
+  echo ""
+  echo "SPF (TXT for ${domain}):"
+  echo "  v=spf1 mx -all"
+  echo ""
+  echo "DMARC (TXT for _dmarc.${domain}):"
+  echo "  v=DMARC1; p=none; rua=mailto:dmarc@${domain}"
+  echo ""
+  echo "DKIM:"
+  echo "  Add the TXT record from:"
+  echo "    ${MAIL_BASE}/docker-data/dms/config/opendkim/keys/${domain}/mail.txt"
+  echo "--------------------------------------------------------------"
+}
+
+manage_mailserver() {
+  local action email_addr email_password domain_list mail_host guessed_host dkim_file
+
+  echo ""
+  echo "Manage email server (docker-mailserver)"
+  echo ""
+  echo "Tip: For multiple domains, keep one mail host (e.g. mail.example.com) and"
+  echo "set each domain's MX to that host."
+  echo ""
+
+  ensure_mailserver_running
+
+  prompt action "Action [status/add-mailbox/list-mailboxes/gen-dkim/show-dkim/dns-help]: " "status"
+
+  case "${action,,}" in
+    status)
+      docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | awk 'NR==1 || $1=="mailserver"'
+      ;;
+    add-mailbox)
+      prompt email_addr "New mailbox address (e.g. user@example.com): "
+      email_addr="${email_addr//[$'\t\r\n ']/}"
+      if [[ ! "$email_addr" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+        echo "Invalid email address: ${email_addr}"
+        exit 1
+      fi
+      prompt_secret email_password "Mailbox password: "
+      if [ -z "$email_password" ]; then
+        echo "Password is required."
+        exit 1
+      fi
+      echo "Creating mailbox: ${email_addr}"
+      docker exec -i mailserver setup email add "$email_addr" "$email_password"
+      echo "Mailbox created."
+      ;;
+    list-mailboxes)
+      docker exec -i mailserver setup email list || true
+      ;;
+    gen-dkim)
+      prompt domain_list "Domain(s) to generate DKIM for (comma-separated): "
+      domain_list="${domain_list//[$'\t\r\n ']/}"
+      if [ -z "$domain_list" ]; then
+        echo "Domain list is required."
+        exit 1
+      fi
+      echo "Generating DKIM keys for: ${domain_list}"
+      docker exec -i mailserver setup config dkim domain "$domain_list" || true
+      echo "DKIM generation done."
+      echo "Use 'show-dkim' to print the TXT record."
+      ;;
+    show-dkim)
+      prompt domain_list "Domain to show DKIM for (e.g. example.com): "
+      domain_list="$(normalize_domain "$domain_list")"
+      if ! validate_domain "$domain_list"; then
+        echo "Invalid domain: ${domain_list}"
+        exit 1
+      fi
+      dkim_file="${MAIL_BASE}/docker-data/dms/config/opendkim/keys/${domain_list}/mail.txt"
+      if [ ! -f "$dkim_file" ]; then
+        echo "DKIM file not found: ${dkim_file}"
+        echo "Run 'gen-dkim' first (and ensure a mailbox exists for that domain)."
+        exit 1
+      fi
+      echo "DKIM TXT record for ${domain_list}:"
+      echo "--------------------------------------------------------------"
+      sed -e 's/[[:space:]]*$//' "$dkim_file" || true
+      echo "--------------------------------------------------------------"
+      ;;
+    dns-help)
+      prompt domain_list "Domain (e.g. example.com): "
+      domain_list="$(normalize_domain "$domain_list")"
+      if ! validate_domain "$domain_list"; then
+        echo "Invalid domain: ${domain_list}"
+        exit 1
+      fi
+
+      guessed_host=""
+      if [ -f "$MAIL_ENV_FILE" ]; then
+        guessed_host="$(awk -F= '/^OVERRIDE_HOSTNAME=/{print $2}' "$MAIL_ENV_FILE" | head -n 1)"
+      fi
+      if [ -z "$guessed_host" ]; then
+        prompt mail_host "Mail host/FQDN (e.g. mail.example.com): "
+        mail_host="$(normalize_domain "$mail_host")"
+        if ! validate_domain "$mail_host"; then
+          echo "Invalid host: ${mail_host}"
+          exit 1
+        fi
+      else
+        mail_host="$guessed_host"
+      fi
+
+      print_mail_dns_instructions "$domain_list" "$mail_host"
+      ;;
+    *)
+      echo "Invalid option."
+      exit 1
+      ;;
+  esac
+}
+
+setup_webmail_roundcube() {
+  local webmail_domain mail_host mail_domain proceed
+
+  echo ""
+  echo "Webmail setup (Roundcube)"
+  echo ""
+  echo "This will create a Roundcube container and publish it via the existing reverse proxy."
+  echo "You will need a dedicated domain like: webmail.example.com"
+  echo ""
+
+  prompt webmail_domain "Webmail domain (e.g. webmail.example.com): "
+  webmail_domain="$(normalize_domain "$webmail_domain")"
+  if ! validate_domain "$webmail_domain"; then
+    echo "Invalid domain: ${webmail_domain}"
+    exit 1
+  fi
+
+  prompt mail_host "IMAP/SMTP host (e.g. mail.example.com): "
+  mail_host="$(normalize_domain "$mail_host")"
+  if ! validate_domain "$mail_host"; then
+    echo "Invalid host: ${mail_host}"
+    exit 1
+  fi
+
+  mail_domain="${mail_host#*.}"
+
+  echo ""
+  echo "DNS records you need:"
+  echo "--------------------------------------------------------------"
+  echo "A/AAAA:"
+  echo "  ${webmail_domain} -> YOUR_SERVER_IP"
+  echo "--------------------------------------------------------------"
+  echo ""
+
+  read -r -p "Ready to proceed and create the webmail container? (yes/no): " proceed
+  if [ "${proceed,,}" != "yes" ]; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  install_base
+  ensure_proxy_stack
+
+  echo "Issuing Let's Encrypt certificate for ${webmail_domain}..."
+  write_acme_only_vhost "$webmail_domain"
+  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+    --webroot \
+    --webroot-path=/var/www/certbot \
+    --email "admin@${mail_domain}" \
+    --agree-tos \
+    --no-eff-email \
+    -d "$webmail_domain"; then
+    echo "Failed to issue certificate for ${webmail_domain}."
+    exit 1
+  fi
+
+  echo "Creating Roundcube stack in ${WEBMAIL_BASE}..."
+  mkdir -p "${WEBMAIL_BASE}/data/db" "${WEBMAIL_BASE}/data/config" "${WEBMAIL_BASE}/data/temp"
+
+  cat > "$WEBMAIL_COMPOSE" <<EOF
+services:
+  roundcube:
+    image: roundcube/roundcubemail:latest
+    container_name: roundcube-webmail
+    restart: unless-stopped
+    environment:
+      ROUNDCUBEMAIL_DEFAULT_HOST: "ssl://${mail_host}"
+      ROUNDCUBEMAIL_DEFAULT_PORT: 993
+      ROUNDCUBEMAIL_SMTP_SERVER: "tls://${mail_host}"
+      ROUNDCUBEMAIL_SMTP_PORT: 587
+      ROUNDCUBEMAIL_USERNAME_DOMAIN: "${mail_domain}"
+      ROUNDCUBEMAIL_DB_TYPE: sqlite
+      ROUNDCUBEMAIL_UPLOAD_MAX_FILESIZE: 25M
+    volumes:
+      - ./data/db:/var/roundcube/db
+      - ./data/config:/var/roundcube/config
+      - ./data/temp:/tmp/roundcube-temp
+    networks:
+      ${SHARED_NETWORK}:
+        aliases:
+          - roundcube-webmail
+
+networks:
+  ${SHARED_NETWORK}:
+    external: true
+EOF
+
+  echo "Starting Roundcube..."
+  dc -f "$WEBMAIL_COMPOSE" up -d
+
+  echo "Publishing webmail via reverse proxy..."
+  write_roundcube_proxy_config_https "$webmail_domain"
+  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+  echo ""
+  echo "=============================================================="
+  echo "WEBMAIL READY"
+  echo "URL: https://${webmail_domain}"
+  echo "IMAP: ${mail_host}:993 (SSL)"
+  echo "SMTP: ${mail_host}:587 (STARTTLS)"
+  echo "=============================================================="
+}
+
 create_project() {
   local project_slug domain email db_name db_user db_password db_root_password app_dir project_name pma_port pma_bind_ip
 
@@ -720,14 +1230,9 @@ create_project() {
   fi
 
   prompt domain "Domain (e.g. example.com): "
-  domain="${domain,,}"
-  domain="${domain#http://}"
-  domain="${domain#https://}"
-  domain="${domain%%/*}"
-  domain="${domain%.}"
-  domain="${domain//[$'\t\r\n ']/}"
+  domain="$(normalize_domain "$domain")"
 
-  if [[ ! "$domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
+  if ! validate_domain "$domain"; then
     echo "Invalid domain: ${domain}"
     exit 1
   fi
@@ -820,6 +1325,94 @@ create_project() {
   echo "The queue worker runs under Supervisor inside the PHP container."
   echo "Daily automatic backup scheduled at 02:30."
   echo "=============================================================="
+}
+
+change_project_domain() {
+  local project_slug project_name app_dir old_domain new_domain email remove_old
+
+  echo ""
+  echo "Existing projects:"
+  print_existing_projects
+  echo ""
+  prompt project_slug "Project short name to change domain: "
+  project_name="$(slug_to_name "$project_slug")"
+  if [ -z "$project_name" ]; then
+    echo "Invalid project short name."
+    exit 1
+  fi
+
+  app_dir="$(resolve_project_dir "$project_name")"
+  ensure_project_exists "$project_name" "$app_dir"
+
+  if [ ! -f "${app_dir}/.project-meta" ]; then
+    echo "Project metadata not found at ${app_dir}/.project-meta"
+    echo "Run 'Update project' once to regenerate project files."
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
+  source "${app_dir}/.project-meta"
+  require_nonempty "PROJECT_NAME" "${PROJECT_NAME}"
+  require_nonempty "DOMAIN" "${DOMAIN}"
+  old_domain="${DOMAIN}"
+
+  echo ""
+  echo "Current domain: ${old_domain}"
+  prompt new_domain "New domain (e.g. example.com): "
+  new_domain="$(normalize_domain "$new_domain")"
+  if ! validate_domain "$new_domain"; then
+    echo "Invalid domain: ${new_domain}"
+    exit 1
+  fi
+
+  if [ "$new_domain" = "$old_domain" ]; then
+    echo "New domain is the same as the current domain."
+    exit 0
+  fi
+
+  prompt email "Email for Let's Encrypt: "
+  if [ -z "$email" ]; then
+    echo "Email is required."
+    exit 1
+  fi
+
+  ensure_proxy_stack
+
+  echo "Switching to HTTP for certificate issuance..."
+  write_proxy_config_http "$PROJECT_NAME" "$new_domain"
+  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+  echo "Requesting SSL certificate for ${new_domain}..."
+  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+    --webroot \
+    --webroot-path=/var/www/certbot \
+    --email "$email" \
+    --agree-tos \
+    --no-eff-email \
+    -d "$new_domain"; then
+    echo "Failed to issue certificate. Restoring previous HTTPS config..."
+    write_proxy_config_https "$PROJECT_NAME" "$old_domain"
+    dc -f "$PROXY_COMPOSE" restart reverse-proxy
+    exit 1
+  fi
+
+  echo "Enabling HTTPS for ${new_domain}..."
+  write_proxy_config_https "$PROJECT_NAME" "$new_domain"
+  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+  set_project_meta_var "${app_dir}/.project-meta" "DOMAIN" "$new_domain"
+
+  echo ""
+  prompt remove_old "Remove old certificate files for ${old_domain}? (yes/no): " "no"
+  if [ "${remove_old,,}" = "yes" ]; then
+    rm -rf "${PROXY_CERTBOT_CONF}/live/${old_domain}" || true
+    rm -rf "${PROXY_CERTBOT_CONF}/archive/${old_domain}" || true
+    rm -rf "${PROXY_CERTBOT_CONF}/renewal/${old_domain}.conf" || true
+    echo "Old certificate files removed."
+  fi
+
+  echo "Domain updated: https://${new_domain}"
 }
 
 delete_project() {
@@ -1364,6 +1957,10 @@ menu() {
   echo "6) Update project"
   echo "7) Run backup for all projects now"
   echo "8) Manage phpMyAdmin"
+  echo "9) Change project domain"
+  echo "10) Setup email server (docker-mailserver)"
+  echo "11) Setup webmail (Roundcube)"
+  echo "12) Manage email domains/mailboxes"
   echo ""
   read -r -p "Option: " action
 
@@ -1376,6 +1973,10 @@ menu() {
     6) update_project ;;
     7) backup_all ;;
     8) phpmyadmin_manage ;;
+    9) change_project_domain ;;
+    10) setup_mailserver ;;
+    11) setup_webmail_roundcube ;;
+    12) manage_mailserver ;;
     *) echo "Invalid option."; exit 1 ;;
   esac
 }
