@@ -290,6 +290,7 @@ It will:
 
 - Issue a Let's Encrypt certificate for your webmail domain (example: `webmail.example.com`)
 - Start Roundcube and publish it via the existing Nginx reverse proxy
+- Connect Roundcube to the mail server over the internal Docker network
 
 DNS record needed:
 

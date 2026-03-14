@@ -934,10 +934,18 @@ services:
       - ./docker-data/dms/config/:/tmp/docker-mailserver/
       - ${PROXY_CERTBOT_CONF}:/etc/letsencrypt:ro
       - /etc/localtime:/etc/localtime:ro
+    networks:
+      ${SHARED_NETWORK}:
+        aliases:
+          - ${mail_host}
     restart: unless-stopped
     stop_grace_period: 1m
     cap_add:
       - NET_ADMIN
+
+networks:
+  ${SHARED_NETWORK}:
+    external: true
 EOF
 
   echo "Starting mailserver..."
@@ -1214,6 +1222,7 @@ setup_webmail_roundcube() {
 
   echo "Creating Roundcube stack in ${WEBMAIL_BASE}..."
   mkdir -p "${WEBMAIL_BASE}/data/db" "${WEBMAIL_BASE}/data/config" "${WEBMAIL_BASE}/data/temp"
+  chown -R 33:33 "${WEBMAIL_BASE}/data" >/dev/null 2>&1 || true
 
   cat > "$WEBMAIL_COMPOSE" <<EOF
 services:
