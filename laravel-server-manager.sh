@@ -1011,7 +1011,7 @@ print_mail_dns_instructions() {
 }
 
 manage_mailserver() {
-  local action email_addr email_password domain_list mail_host guessed_host dkim_file
+  local action email_addr email_password domain_list mail_host guessed_host dkim_file confirm_delete
 
   echo ""
   echo "Manage email server (docker-mailserver)"
@@ -1022,7 +1022,7 @@ manage_mailserver() {
 
   ensure_mailserver_running
 
-  prompt action "Action [status/add-mailbox/list-mailboxes/gen-dkim/show-dkim/dns-help]: " "status"
+  prompt action "Action [status/add-mailbox/delete-mailbox/reset-password/list-mailboxes/gen-dkim/show-dkim/dns-help]: " "status"
 
   case "${action,,}" in
     status)
@@ -1043,6 +1043,51 @@ manage_mailserver() {
       echo "Creating mailbox: ${email_addr}"
       docker exec -i mailserver setup email add "$email_addr" "$email_password"
       echo "Mailbox created."
+      ;;
+    delete-mailbox)
+      prompt email_addr "Mailbox address to delete (e.g. user@example.com): "
+      email_addr="${email_addr//[$'\t\r\n ']/}"
+      if [[ ! "$email_addr" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+        echo "Invalid email address: ${email_addr}"
+        exit 1
+      fi
+      echo ""
+      echo "This will permanently delete the mailbox and its stored emails:"
+      echo "  ${email_addr}"
+      echo ""
+      read -r -p "Type DELETE to confirm: " confirm_delete
+      if [ "$confirm_delete" != "DELETE" ]; then
+        echo "Cancelled."
+        exit 0
+      fi
+      docker exec -i mailserver setup email del "$email_addr"
+      echo "Mailbox deleted."
+      ;;
+    reset-password)
+      prompt email_addr "Mailbox address to reset password for (e.g. user@example.com): "
+      email_addr="${email_addr//[$'\t\r\n ']/}"
+      if [[ ! "$email_addr" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+        echo "Invalid email address: ${email_addr}"
+        exit 1
+      fi
+      prompt_secret email_password "New mailbox password: "
+      if [ -z "$email_password" ]; then
+        echo "Password is required."
+        exit 1
+      fi
+      echo "Resetting password for: ${email_addr}"
+      if docker exec -i mailserver setup email update "$email_addr" "$email_password"; then
+        echo "Password updated."
+      elif docker exec -i mailserver setup email add "$email_addr" "$email_password"; then
+        echo "Password updated."
+        echo "Note: Your docker-mailserver setup tool did not accept 'update'."
+        echo "This used 'add' as a fallback (some versions treat it as a password reset)."
+      else
+        echo "Failed to reset password."
+        echo "Try inside the container:"
+        echo "  docker exec -it mailserver setup email help"
+        exit 1
+      fi
       ;;
     list-mailboxes)
       docker exec -i mailserver setup email list || true

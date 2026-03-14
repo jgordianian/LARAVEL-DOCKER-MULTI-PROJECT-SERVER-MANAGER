@@ -55,7 +55,7 @@ The script is interactive and shows a menu.
 - `9) Change project domain` - updates Nginx + issues a new SSL cert for a new domain
 - `10) Setup email server (docker-mailserver)` - provisions a basic mail server stack and prints DNS instructions
 - `11) Setup webmail (Roundcube)` - provisions Roundcube webmail behind the reverse proxy
-- `12) Manage email domains/mailboxes` - add mailboxes, generate/show DKIM, and print DNS help for additional domains
+- `12) Manage email domains/mailboxes` - add/delete mailboxes, reset mailbox passwords, manage DKIM, and print DNS help for additional domains
 
 ## Non-interactive commands
 
@@ -278,7 +278,7 @@ High-level steps for each additional domain (example `otherdomain.com`):
 - Generate DKIM for `otherdomain.com` and add the TXT record
 - Create mailboxes like `user@otherdomain.com`
 
-Use menu option `12) Manage email domains/mailboxes` to do the mailbox + DKIM steps from the server.
+Use menu option `12) Manage email domains/mailboxes` to add/delete mailboxes, reset mailbox passwords, and manage DKIM from the server.
 
 ## Webmail (optional)
 
