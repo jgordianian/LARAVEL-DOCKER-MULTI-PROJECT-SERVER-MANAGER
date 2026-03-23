@@ -17,6 +17,7 @@ MAIL_COMPOSE="${MAIL_BASE}/compose.yaml"
 MAIL_ENV_FILE="${MAIL_BASE}/mailserver.env"
 WEBMAIL_BASE="/opt/webmail-roundcube"
 WEBMAIL_COMPOSE="${WEBMAIL_BASE}/compose.yaml"
+WEBMAIL_META_FILE="${WEBMAIL_BASE}/.webmail-meta"
 
 # Values loaded from "${app_dir}/.project-meta" (declared to keep shellcheck happy)
 PROJECT_NAME=""
@@ -720,6 +721,64 @@ normalize_domain() {
   printf '%s' "$domain"
 }
 
+safe_domain_name() {
+  local domain="$1"
+  printf '%s' "$domain" | tr -cs 'a-zA-Z0-9.-' '-' | tr '[:upper:]' '[:lower:]'
+}
+
+normalize_domain_csv() {
+  local input="$1"
+  local part normalized result=""
+  local -A seen=()
+
+  input="${input//;/,}"
+  IFS=',' read -r -a parts <<< "$input"
+
+  for part in "${parts[@]}"; do
+    normalized="$(normalize_domain "$part")"
+    [ -n "$normalized" ] || continue
+    if [ -z "${seen[$normalized]+x}" ]; then
+      seen[$normalized]=1
+      if [ -z "$result" ]; then
+        result="$normalized"
+      else
+        result="${result},${normalized}"
+      fi
+    fi
+  done
+
+  printf '%s' "$result"
+}
+
+validate_domain_csv() {
+  local input="$1"
+  local part
+
+  [ -n "$input" ] || return 1
+  IFS=',' read -r -a parts <<< "$input"
+  for part in "${parts[@]}"; do
+    [ -n "$part" ] || return 1
+    validate_domain "$part" || return 1
+  done
+}
+
+csv_first_value() {
+  local input="$1"
+  printf '%s' "${input%%,*}"
+}
+
+csv_contains_value() {
+  local csv="$1"
+  local needle="$2"
+  local part
+
+  IFS=',' read -r -a parts <<< "$csv"
+  for part in "${parts[@]}"; do
+    [ "$part" = "$needle" ] && return 0
+  done
+  return 1
+}
+
 validate_domain() {
   local domain="$1"
   [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
@@ -738,7 +797,7 @@ ensure_proxy_stack() {
 write_acme_only_vhost() {
   local domain="$1"
   local safe_name
-  safe_name="$(printf '%s' "$domain" | tr -cs 'a-zA-Z0-9.-' '-' | tr '[:upper:]' '[:lower:]')"
+  safe_name="$(safe_domain_name "$domain")"
 
   cat > "${PROXY_CONF_DIR}/acme-${safe_name}.conf" <<EOF
 server {
@@ -760,7 +819,7 @@ write_roundcube_proxy_config_https() {
   local domain="$1"
   local upstream_name="roundcube-webmail"
   local safe_name
-  safe_name="$(printf '%s' "$domain" | tr -cs 'a-zA-Z0-9.-' '-' | tr '[:upper:]' '[:lower:]')"
+  safe_name="$(safe_domain_name "$domain")"
 
   cat > "${PROXY_CONF_DIR}/webmail-${safe_name}.conf" <<EOF
 server {
@@ -796,6 +855,194 @@ server {
     }
 }
 EOF
+}
+
+write_webmail_meta() {
+  local webmail_domain="$1"
+  local webmail_domains="$2"
+  local mail_host="$3"
+
+  mkdir -p "$WEBMAIL_BASE"
+  {
+    printf 'WEBMAIL_PRIMARY_DOMAIN=%q\n' "$webmail_domain"
+    printf 'WEBMAIL_DOMAIN=%q\n' "$webmail_domain"
+    printf 'WEBMAIL_DOMAINS=%q\n' "$webmail_domains"
+    printf 'MAIL_HOST=%q\n' "$mail_host"
+  } > "$WEBMAIL_META_FILE"
+}
+
+remove_webmail_proxy_configs() {
+  local domain="$1"
+  local safe_name
+
+  safe_name="$(safe_domain_name "$domain")"
+  rm -f "${PROXY_CONF_DIR}/webmail-${safe_name}.conf" || true
+  rm -f "${PROXY_CONF_DIR}/acme-${safe_name}.conf" || true
+}
+
+print_webmail_dns_targets() {
+  local webmail_domains="$1"
+  local domain
+
+  IFS=',' read -r -a domains <<< "$webmail_domains"
+  for domain in "${domains[@]}"; do
+    echo "  ${domain} -> YOUR_SERVER_IP"
+  done
+}
+
+write_roundcube_proxy_configs() {
+  local webmail_domains="$1"
+  local domain
+
+  IFS=',' read -r -a domains <<< "$webmail_domains"
+  for domain in "${domains[@]}"; do
+    write_roundcube_proxy_config_https "$domain"
+  done
+}
+
+write_roundcube_compose() {
+  local webmail_domain="$1"
+  local webmail_domains="$2"
+  local mail_host="$3"
+
+  mkdir -p "${WEBMAIL_BASE}/data/db" "${WEBMAIL_BASE}/data/config" "${WEBMAIL_BASE}/data/temp"
+  chown -R 33:33 "${WEBMAIL_BASE}/data" >/dev/null 2>&1 || true
+
+  cat > "$WEBMAIL_COMPOSE" <<EOF
+services:
+  roundcube:
+    image: roundcube/roundcubemail:latest
+    container_name: roundcube-webmail
+    restart: unless-stopped
+    environment:
+      ROUNDCUBEMAIL_DEFAULT_HOST: "ssl://${mail_host}"
+      ROUNDCUBEMAIL_DEFAULT_PORT: 993
+      ROUNDCUBEMAIL_SMTP_SERVER: "tls://${mail_host}"
+      ROUNDCUBEMAIL_SMTP_PORT: 587
+      ROUNDCUBEMAIL_DB_TYPE: sqlite
+      ROUNDCUBEMAIL_UPLOAD_MAX_FILESIZE: 25M
+    volumes:
+      - ./data/db:/var/roundcube/db
+      - ./data/config:/var/roundcube/config
+      - ./data/temp:/tmp/roundcube-temp
+    networks:
+      ${SHARED_NETWORK}:
+        aliases:
+          - roundcube-webmail
+
+networks:
+  ${SHARED_NETWORK}:
+    external: true
+EOF
+
+  write_webmail_meta "$webmail_domain" "$webmail_domains" "$mail_host"
+}
+
+issue_webmail_certificate() {
+  local webmail_domain="$1"
+  local cert_email="$2"
+
+  echo "Issuing Let's Encrypt certificate for ${webmail_domain}..."
+  write_acme_only_vhost "$webmail_domain"
+  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+    --webroot \
+    --webroot-path=/var/www/certbot \
+    --email "$cert_email" \
+    --agree-tos \
+    --no-eff-email \
+    -d "$webmail_domain"; then
+    echo "Failed to issue certificate for ${webmail_domain}."
+    return 1
+  fi
+
+  rm -f "${PROXY_CONF_DIR}/acme-$(safe_domain_name "$webmail_domain").conf" || true
+
+  return 0
+}
+
+issue_webmail_certificates() {
+  local webmail_domains="$1"
+  local cert_email="$2"
+  local domain
+
+  IFS=',' read -r -a domains <<< "$webmail_domains"
+  for domain in "${domains[@]}"; do
+    issue_webmail_certificate "$domain" "$cert_email" || return 1
+  done
+}
+
+issue_mail_host_certificate() {
+  local mail_host="$1"
+  local cert_email="$2"
+
+  echo "Issuing Let's Encrypt certificate for ${mail_host}..."
+  write_acme_only_vhost "$mail_host"
+  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+    --webroot \
+    --webroot-path=/var/www/certbot \
+    --email "$cert_email" \
+    --agree-tos \
+    --no-eff-email \
+    -d "$mail_host"; then
+    echo "Failed to issue certificate for ${mail_host}."
+    return 1
+  fi
+
+  rm -f "${PROXY_CONF_DIR}/acme-$(safe_domain_name "$mail_host").conf" || true
+  return 0
+}
+
+sync_webmail_mail_host_if_needed() {
+  local old_mail_host="$1"
+  local new_mail_host="$2"
+  local current_webmail_domains current_webmail_domain current_mail_host
+
+  [ -f "$WEBMAIL_COMPOSE" ] || return 0
+
+  current_webmail_domains=""
+  current_webmail_domain=""
+  current_mail_host=""
+
+  if [ -f "$WEBMAIL_META_FILE" ]; then
+    # shellcheck disable=SC1090
+    # shellcheck disable=SC1091
+    source "$WEBMAIL_META_FILE"
+    current_webmail_domain="${WEBMAIL_PRIMARY_DOMAIN:-${WEBMAIL_DOMAIN:-}}"
+    current_webmail_domains="${WEBMAIL_DOMAINS:-}"
+    current_mail_host="${MAIL_HOST:-}"
+  fi
+
+  if [ -z "$current_mail_host" ]; then
+    current_mail_host="$(awk -F'"' '/ROUNDCUBEMAIL_DEFAULT_HOST:/ {print $2}' "$WEBMAIL_COMPOSE" | sed 's/^ssl:\/\///' | head -n 1)"
+  fi
+  if [ "$current_mail_host" != "$old_mail_host" ]; then
+    return 0
+  fi
+
+  if [ -z "$current_webmail_domains" ]; then
+    current_webmail_domains="$(awk '/server_name / {print $2}' "${PROXY_CONF_DIR}"/webmail-*.conf 2>/dev/null | sed 's/;//' | sort -u | paste -sd ',' -)"
+  fi
+  if [ -z "$current_webmail_domain" ] && [ -n "$current_webmail_domains" ]; then
+    current_webmail_domain="$(csv_first_value "$current_webmail_domains")"
+  fi
+  if [ -z "$current_webmail_domain" ]; then
+    current_webmail_domain="$(awk '/server_name / {print $2}' "${PROXY_CONF_DIR}"/webmail-*.conf 2>/dev/null | sed 's/;//' | head -n 1)"
+  fi
+  if [ -z "$current_webmail_domains" ] && [ -n "$current_webmail_domain" ]; then
+    current_webmail_domains="$current_webmail_domain"
+  fi
+
+  if [ -z "$current_webmail_domain" ] || [ -z "$current_webmail_domains" ]; then
+    return 0
+  fi
+
+  echo "Updating Roundcube to use the new mail host..."
+  write_roundcube_compose "$current_webmail_domain" "$current_webmail_domains" "$new_mail_host"
+  dc -f "$WEBMAIL_COMPOSE" up -d --force-recreate
 }
 
 setup_mailserver() {
@@ -1018,6 +1265,144 @@ print_mail_dns_instructions() {
   echo "--------------------------------------------------------------"
 }
 
+add_mail_domain() {
+  local domain mail_host guessed_host dkim_file proceed
+
+  ensure_mailserver_running
+
+  prompt domain "Domain to add (e.g. example.com): "
+  domain="$(normalize_domain "$domain")"
+  if ! validate_domain "$domain"; then
+    echo "Invalid domain: ${domain}"
+    exit 1
+  fi
+
+  guessed_host=""
+  if [ -f "$MAIL_ENV_FILE" ]; then
+    guessed_host="$(awk -F= '/^OVERRIDE_HOSTNAME=/{print $2}' "$MAIL_ENV_FILE" | head -n 1)"
+  fi
+
+  if [ -n "$guessed_host" ]; then
+    mail_host="$guessed_host"
+  else
+    prompt mail_host "Mail host/FQDN (e.g. mail.example.com): "
+    mail_host="$(normalize_domain "$mail_host")"
+    if ! validate_domain "$mail_host"; then
+      echo "Invalid host: ${mail_host}"
+      exit 1
+    fi
+  fi
+
+  echo ""
+  print_mail_dns_instructions "$domain" "$mail_host"
+  echo ""
+  read -r -p "Generate DKIM now for ${domain}? (yes/no): " proceed
+  if [ "${proceed,,}" != "yes" ]; then
+    echo "Skipped DKIM generation."
+    return 0
+  fi
+
+  echo "Generating DKIM keys for ${domain}..."
+  docker exec -i mailserver setup config dkim domain "$domain" || true
+  dkim_file="${MAIL_BASE}/docker-data/dms/config/opendkim/keys/${domain}/mail.txt"
+
+  echo ""
+  if [ -f "$dkim_file" ]; then
+    echo "DKIM TXT record for ${domain}:"
+    echo "--------------------------------------------------------------"
+    sed -e 's/[[:space:]]*$//' "$dkim_file" || true
+    echo "--------------------------------------------------------------"
+  else
+    echo "DKIM record file not found yet."
+    echo "Check: ${dkim_file}"
+  fi
+
+  echo ""
+  echo "Next steps for ${domain}:"
+  echo "  1) Add the MX/SPF/DMARC records shown above"
+  echo "  2) Add the DKIM TXT record"
+  echo "  3) Create mailbox(es) like user@${domain}"
+}
+
+change_mail_host() {
+  local old_mail_host new_mail_host cert_email remove_old new_mail_domain current_postmaster
+
+  ensure_mailserver_running
+
+  if [ ! -f "$MAIL_ENV_FILE" ] || [ ! -f "$MAIL_COMPOSE" ]; then
+    echo "Mailserver config files not found."
+    echo "Run option 10 first: Setup email server (docker-mailserver)."
+    exit 1
+  fi
+
+  old_mail_host="$(awk -F= '/^OVERRIDE_HOSTNAME=/{print $2}' "$MAIL_ENV_FILE" | head -n 1)"
+  if [ -z "$old_mail_host" ]; then
+    echo "Current mail host not found in ${MAIL_ENV_FILE}."
+    exit 1
+  fi
+
+  current_postmaster="$(awk -F= '/^POSTMASTER_ADDRESS=/{print $2}' "$MAIL_ENV_FILE" | head -n 1)"
+
+  echo "Current mail host: ${old_mail_host}"
+  prompt new_mail_host "New mail host/FQDN (e.g. mail.example.com): "
+  new_mail_host="$(normalize_domain "$new_mail_host")"
+  if ! validate_domain "$new_mail_host"; then
+    echo "Invalid host: ${new_mail_host}"
+    exit 1
+  fi
+
+  if [ "$new_mail_host" = "$old_mail_host" ]; then
+    echo "New mail host is the same as the current mail host."
+    exit 0
+  fi
+
+  new_mail_domain="${new_mail_host#*.}"
+  prompt cert_email "Email for Let's Encrypt [${current_postmaster:-admin@${new_mail_domain}}]: " "${current_postmaster:-admin@${new_mail_domain}}"
+  if [ -z "$cert_email" ]; then
+    echo "Email is required."
+    exit 1
+  fi
+
+  echo ""
+  echo "You must update DNS after this change:"
+  echo "  A/AAAA: ${new_mail_host} -> YOUR_SERVER_IP"
+  echo "  PTR/rDNS: YOUR_SERVER_IP -> ${new_mail_host}"
+  echo "  Update MX for every hosted mail domain to point to ${new_mail_host}"
+  echo "  Update SPF/DMARC where needed if they mention the old host"
+  echo ""
+
+  if ! issue_mail_host_certificate "$new_mail_host" "$cert_email"; then
+    exit 1
+  fi
+
+  sed -i "s|^OVERRIDE_HOSTNAME=.*|OVERRIDE_HOSTNAME=${new_mail_host}|" "$MAIL_ENV_FILE"
+  sed -i "s|^SSL_CERT_PATH=.*|SSL_CERT_PATH=/etc/letsencrypt/live/${new_mail_host}/fullchain.pem|" "$MAIL_ENV_FILE"
+  sed -i "s|^SSL_KEY_PATH=.*|SSL_KEY_PATH=/etc/letsencrypt/live/${new_mail_host}/privkey.pem|" "$MAIL_ENV_FILE"
+  sed -i "s|^[[:space:]]*hostname: .*|    hostname: ${new_mail_host%%.*}|" "$MAIL_COMPOSE"
+  sed -i "s|^[[:space:]]*domainname: .*|    domainname: ${new_mail_domain}|" "$MAIL_COMPOSE"
+  sed -i "/^[[:space:]]*aliases:/ {n; s|^.*$|          - ${new_mail_host}|;}" "$MAIL_COMPOSE"
+
+  echo "Recreating mailserver with the new mail host..."
+  dc -f "$MAIL_COMPOSE" up -d --force-recreate
+
+  sync_webmail_mail_host_if_needed "$old_mail_host" "$new_mail_host"
+
+  echo ""
+  prompt remove_old "Remove old certificate files for ${old_mail_host}? (yes/no): " "no"
+  if [ "${remove_old,,}" = "yes" ]; then
+    rm -rf "${PROXY_CERTBOT_CONF}/live/${old_mail_host}" || true
+    rm -rf "${PROXY_CERTBOT_CONF}/archive/${old_mail_host}" || true
+    rm -rf "${PROXY_CERTBOT_CONF}/renewal/${old_mail_host}.conf" || true
+    echo "Old certificate files removed."
+  fi
+
+  echo ""
+  echo "MAIL HOST UPDATED"
+  echo "Old host: ${old_mail_host}"
+  echo "New host: ${new_mail_host}"
+  echo "Reminder: update MX records for all hosted mail domains."
+}
+
 manage_mailserver() {
   local action email_addr email_password domain_list mail_host guessed_host dkim_file confirm_delete
 
@@ -1030,11 +1415,17 @@ manage_mailserver() {
 
   ensure_mailserver_running
 
-  prompt action "Action [status/add-mailbox/delete-mailbox/reset-password/list-mailboxes/gen-dkim/show-dkim/dns-help]: " "status"
+  prompt action "Action [status/add-domain/change-mail-host/add-mailbox/delete-mailbox/reset-password/list-mailboxes/gen-dkim/show-dkim/dns-help]: " "status"
 
   case "${action,,}" in
     status)
       docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | awk 'NR==1 || $1=="mailserver"'
+      ;;
+    add-domain)
+      add_mail_domain
+      ;;
+    change-mail-host)
+      change_mail_host
       ;;
     add-mailbox)
       prompt email_addr "New mailbox address (e.g. user@example.com): "
@@ -1163,7 +1554,7 @@ manage_mailserver() {
 }
 
 setup_webmail_roundcube() {
-  local webmail_domain mail_host mail_domain proceed
+  local webmail_domains webmail_domain alias_domains mail_host mail_domain proceed
 
   echo ""
   echo "Webmail setup (Roundcube)"
@@ -1172,11 +1563,22 @@ setup_webmail_roundcube() {
   echo "You will need a dedicated domain like: webmail.example.com"
   echo ""
 
-  prompt webmail_domain "Webmail domain (e.g. webmail.example.com): "
+  prompt webmail_domain "Primary webmail domain (e.g. webmail.example.com): "
   webmail_domain="$(normalize_domain "$webmail_domain")"
   if ! validate_domain "$webmail_domain"; then
     echo "Invalid domain: ${webmail_domain}"
     exit 1
+  fi
+
+  prompt alias_domains "Additional webmail alias domains (comma-separated, optional): "
+  alias_domains="$(normalize_domain_csv "$alias_domains")"
+  if [ -n "$alias_domains" ] && ! validate_domain_csv "$alias_domains"; then
+    echo "Invalid alias domain list: ${alias_domains}"
+    exit 1
+  fi
+  webmail_domains="$webmail_domain"
+  if [ -n "$alias_domains" ]; then
+    webmail_domains="$(normalize_domain_csv "${webmail_domains},${alias_domains}")"
   fi
 
   prompt mail_host "IMAP/SMTP host (e.g. mail.example.com): "
@@ -1192,7 +1594,7 @@ setup_webmail_roundcube() {
   echo "DNS records you need:"
   echo "--------------------------------------------------------------"
   echo "A/AAAA:"
-  echo "  ${webmail_domain} -> YOUR_SERVER_IP"
+  print_webmail_dns_targets "$webmail_domains"
   echo "--------------------------------------------------------------"
   echo ""
 
@@ -1205,66 +1607,160 @@ setup_webmail_roundcube() {
   install_base
   ensure_proxy_stack
 
-  echo "Issuing Let's Encrypt certificate for ${webmail_domain}..."
-  write_acme_only_vhost "$webmail_domain"
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
-
-  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
-    --webroot \
-    --webroot-path=/var/www/certbot \
-    --email "admin@${mail_domain}" \
-    --agree-tos \
-    --no-eff-email \
-    -d "$webmail_domain"; then
-    echo "Failed to issue certificate for ${webmail_domain}."
+  if ! issue_webmail_certificates "$webmail_domains" "admin@${mail_domain}"; then
     exit 1
   fi
 
   echo "Creating Roundcube stack in ${WEBMAIL_BASE}..."
-  mkdir -p "${WEBMAIL_BASE}/data/db" "${WEBMAIL_BASE}/data/config" "${WEBMAIL_BASE}/data/temp"
-  chown -R 33:33 "${WEBMAIL_BASE}/data" >/dev/null 2>&1 || true
-
-  cat > "$WEBMAIL_COMPOSE" <<EOF
-services:
-  roundcube:
-    image: roundcube/roundcubemail:latest
-    container_name: roundcube-webmail
-    restart: unless-stopped
-    environment:
-      ROUNDCUBEMAIL_DEFAULT_HOST: "ssl://${mail_host}"
-      ROUNDCUBEMAIL_DEFAULT_PORT: 993
-      ROUNDCUBEMAIL_SMTP_SERVER: "tls://${mail_host}"
-      ROUNDCUBEMAIL_SMTP_PORT: 587
-      ROUNDCUBEMAIL_USERNAME_DOMAIN: "${mail_domain}"
-      ROUNDCUBEMAIL_DB_TYPE: sqlite
-      ROUNDCUBEMAIL_UPLOAD_MAX_FILESIZE: 25M
-    volumes:
-      - ./data/db:/var/roundcube/db
-      - ./data/config:/var/roundcube/config
-      - ./data/temp:/tmp/roundcube-temp
-    networks:
-      ${SHARED_NETWORK}:
-        aliases:
-          - roundcube-webmail
-
-networks:
-  ${SHARED_NETWORK}:
-    external: true
-EOF
+  write_roundcube_compose "$webmail_domain" "$webmail_domains" "$mail_host"
 
   echo "Starting Roundcube..."
   dc -f "$WEBMAIL_COMPOSE" up -d
 
   echo "Publishing webmail via reverse proxy..."
-  write_roundcube_proxy_config_https "$webmail_domain"
+  write_roundcube_proxy_configs "$webmail_domains"
   dc -f "$PROXY_COMPOSE" restart reverse-proxy
 
   echo ""
   echo "=============================================================="
   echo "WEBMAIL READY"
-  echo "URL: https://${webmail_domain}"
+  echo "Primary URL: https://${webmail_domain}"
+  if [ "$webmail_domains" != "$webmail_domain" ]; then
+    echo "Aliases: ${webmail_domains#${webmail_domain},}"
+  fi
   echo "IMAP: ${mail_host}:993 (SSL)"
   echo "SMTP: ${mail_host}:587 (STARTTLS)"
+  echo "Login format: full email address (e.g. user@example.com)"
+  echo "=============================================================="
+}
+
+modify_webmail_roundcube() {
+  local current_webmail_domain current_webmail_domains current_mail_host webmail_domains webmail_domain mail_host mail_domain proceed remove_old old_domain removed_domains part
+
+  echo ""
+  echo "Modify webmail (Roundcube)"
+  echo ""
+
+  if [ ! -f "$WEBMAIL_COMPOSE" ]; then
+    echo "Webmail stack not found."
+    echo "Run option 11 first: Setup webmail (Roundcube)."
+    exit 1
+  fi
+
+  current_webmail_domain=""
+  current_webmail_domains=""
+  current_mail_host=""
+
+  if [ -f "$WEBMAIL_META_FILE" ]; then
+    # shellcheck disable=SC1090
+    # shellcheck disable=SC1091
+    source "$WEBMAIL_META_FILE"
+    current_webmail_domain="${WEBMAIL_PRIMARY_DOMAIN:-${WEBMAIL_DOMAIN:-}}"
+    current_webmail_domains="${WEBMAIL_DOMAINS:-}"
+    current_mail_host="${MAIL_HOST:-}"
+  fi
+
+  if [ -z "$current_webmail_domain" ]; then
+    current_webmail_domain="$(awk '/server_name / {print $2}' "${PROXY_CONF_DIR}"/webmail-*.conf 2>/dev/null | sed 's/;//' | head -n 1)"
+  fi
+  if [ -z "$current_webmail_domains" ]; then
+    current_webmail_domains="$(awk '/server_name / {print $2}' "${PROXY_CONF_DIR}"/webmail-*.conf 2>/dev/null | sed 's/;//' | sort -u | paste -sd ',' -)"
+  fi
+  if [ -z "$current_webmail_domains" ] && [ -n "$current_webmail_domain" ]; then
+    current_webmail_domains="$current_webmail_domain"
+  fi
+  if [ -z "$current_mail_host" ]; then
+    current_mail_host="$(awk -F'"' '/ROUNDCUBEMAIL_DEFAULT_HOST:/ {print $2}' "$WEBMAIL_COMPOSE" | sed 's/^ssl:\/\///' | head -n 1)"
+  fi
+
+  prompt webmail_domains "Webmail domains (comma-separated, first is primary) [${current_webmail_domains}]: " "${current_webmail_domains}"
+  webmail_domains="$(normalize_domain_csv "$webmail_domains")"
+  if ! validate_domain_csv "$webmail_domains"; then
+    echo "Invalid domain list: ${webmail_domains}"
+    exit 1
+  fi
+  webmail_domain="$(csv_first_value "$webmail_domains")"
+
+  prompt mail_host "IMAP/SMTP host [${current_mail_host}]: " "${current_mail_host}"
+  mail_host="$(normalize_domain "$mail_host")"
+  if ! validate_domain "$mail_host"; then
+    echo "Invalid host: ${mail_host}"
+    exit 1
+  fi
+
+  if [ "$webmail_domains" = "$current_webmail_domains" ] && [ "$mail_host" = "$current_mail_host" ]; then
+    echo "No changes detected."
+    exit 0
+  fi
+
+  mail_domain="${mail_host#*.}"
+
+  echo ""
+  echo "Primary webmail URL: https://${webmail_domain}"
+  echo "All webmail domains: ${webmail_domains}"
+  echo "Mail host: ${mail_host}"
+  echo "Login format: full email address (multi-domain ready)"
+  echo ""
+
+  read -r -p "Ready to apply these webmail changes? (yes/no): " proceed
+  if [ "${proceed,,}" != "yes" ]; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  install_base
+  ensure_proxy_stack
+
+  if ! issue_webmail_certificates "$webmail_domains" "admin@${mail_domain}"; then
+    exit 1
+  fi
+
+  echo "Rewriting Roundcube stack..."
+  write_roundcube_compose "$webmail_domain" "$webmail_domains" "$mail_host"
+  dc -f "$WEBMAIL_COMPOSE" up -d --force-recreate
+
+  removed_domains=""
+  if [ -n "$current_webmail_domains" ]; then
+    IFS=',' read -r -a old_domains <<< "$current_webmail_domains"
+    for old_domain in "${old_domains[@]}"; do
+      if ! csv_contains_value "$webmail_domains" "$old_domain"; then
+        remove_webmail_proxy_configs "$old_domain"
+        if [ -z "$removed_domains" ]; then
+          removed_domains="$old_domain"
+        else
+          removed_domains="${removed_domains},${old_domain}"
+        fi
+      fi
+    done
+  fi
+
+  write_roundcube_proxy_configs "$webmail_domains"
+  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+  if [ -n "$removed_domains" ]; then
+    echo ""
+    prompt remove_old "Remove old certificate files for removed webmail domains (${removed_domains})? (yes/no): " "no"
+    if [ "${remove_old,,}" = "yes" ]; then
+      IFS=',' read -r -a removed_parts <<< "$removed_domains"
+      for part in "${removed_parts[@]}"; do
+        rm -rf "${PROXY_CERTBOT_CONF}/live/${part}" || true
+        rm -rf "${PROXY_CERTBOT_CONF}/archive/${part}" || true
+        rm -rf "${PROXY_CERTBOT_CONF}/renewal/${part}.conf" || true
+      done
+      echo "Old certificate files removed."
+    fi
+  fi
+
+  echo ""
+  echo "=============================================================="
+  echo "WEBMAIL UPDATED"
+  echo "Primary URL: https://${webmail_domain}"
+  if [ "$webmail_domains" != "$webmail_domain" ]; then
+    echo "All webmail domains: ${webmail_domains}"
+  fi
+  echo "IMAP: ${mail_host}:993 (SSL)"
+  echo "SMTP: ${mail_host}:587 (STARTTLS)"
+  echo "Login format: full email address (e.g. user@example.com)"
   echo "=============================================================="
 }
 
@@ -2015,6 +2511,7 @@ menu() {
   echo "10) Setup email server (docker-mailserver)"
   echo "11) Setup webmail (Roundcube)"
   echo "12) Manage email domains/mailboxes"
+  echo "13) Modify webmail (Roundcube)"
   echo ""
   read -r -p "Option: " action
 
@@ -2031,6 +2528,7 @@ menu() {
     10) setup_mailserver ;;
     11) setup_webmail_roundcube ;;
     12) manage_mailserver ;;
+    13) modify_webmail_roundcube ;;
     *) echo "Invalid option."; exit 1 ;;
   esac
 }

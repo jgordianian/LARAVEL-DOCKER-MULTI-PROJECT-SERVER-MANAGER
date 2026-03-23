@@ -54,8 +54,9 @@ The script is interactive and shows a menu.
 - `8) Manage phpMyAdmin` - enables/disables phpMyAdmin and controls exposure
 - `9) Change project domain` - updates Nginx + issues a new SSL cert for a new domain
 - `10) Setup email server (docker-mailserver)` - provisions a basic mail server stack and prints DNS instructions
-- `11) Setup webmail (Roundcube)` - provisions Roundcube webmail behind the reverse proxy
-- `12) Manage email domains/mailboxes` - add/delete mailboxes, reset mailbox passwords, manage DKIM, and print DNS help for additional domains
+- `11) Setup webmail (Roundcube)` - provisions Roundcube webmail behind the reverse proxy, with optional alias domains
+- `12) Manage email domains/mailboxes` - add domains, change the mail host, add/delete mailboxes, reset mailbox passwords, manage DKIM, and print DNS help for additional domains
+- `13) Modify webmail (Roundcube)` - change the current webmail domain list and/or mail host
 
 ## Non-interactive commands
 
@@ -278,7 +279,7 @@ High-level steps for each additional domain (example `otherdomain.com`):
 - Generate DKIM for `otherdomain.com` and add the TXT record
 - Create mailboxes like `user@otherdomain.com`
 
-Use menu option `12) Manage email domains/mailboxes` to add/delete mailboxes, reset mailbox passwords, and manage DKIM from the server.
+Use menu option `12) Manage email domains/mailboxes` to onboard a new domain in one flow (`add-domain`), change the mail host (`change-mail-host`), create mailboxes, reset mailbox passwords, and manage DKIM from the server.
 
 ## Webmail (optional)
 
@@ -288,18 +289,34 @@ Menu option `11) Setup webmail (Roundcube)` creates a Roundcube stack in:
 
 It will:
 
-- Issue a Let's Encrypt certificate for your webmail domain (example: `webmail.example.com`)
+- Issue a Let's Encrypt certificate for your primary webmail domain and any alias webmail domains
 - Start Roundcube and publish it via the existing Nginx reverse proxy
 - Connect Roundcube to the mail server over the internal Docker network
+- Accept full email addresses for login so one Roundcube instance can be used across multiple mail domains
 
-DNS record needed:
+DNS records needed:
 
-- `A/AAAA` for `webmail.example.com` -> server IP
+- `A/AAAA` for the primary webmail domain -> server IP
+- `A/AAAA` for every alias webmail domain -> server IP
 
 Roundcube will connect to your mail host via IMAPS/SMTP submission:
 
 - IMAP: `993` (SSL)
 - SMTP: `587` (STARTTLS)
+
+Login format:
+
+- Use the full email address, for example `user@example.com`
+- The same Roundcube site can be used for multiple domains on the same mail server
+- One Roundcube instance can also answer on multiple webmail URLs, for example `webmail.faceyogard.com` and `webmail.johngor.com`
+
+Setup notes:
+
+- During setup or modification, enter webmail domains as a comma-separated list
+- The first domain is treated as the primary URL
+- Additional domains are configured as aliases that point to the same Roundcube instance
+
+If you later need to change the webmail domain list or point Roundcube to a different mail host, use menu option `13) Modify webmail (Roundcube)`.
 
 ## Security notes
 
