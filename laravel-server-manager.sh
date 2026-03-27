@@ -445,6 +445,8 @@ stderr_logfile_maxbytes=0
 EOF
 
   cat > "${app_dir}/php/Dockerfile" <<EOF
+FROM composer:2 AS composer-bin
+
 FROM php:8.3-fpm-alpine
 
 RUN set -eux; \
@@ -485,6 +487,7 @@ RUN set -eux; \
     apk del .build-deps
 
 COPY supervisord.conf /etc/supervisord.conf
+COPY --from=composer-bin /usr/bin/composer /usr/local/bin/composer
 
 RUN echo "opcache.enable=1" >> /usr/local/etc/php/conf.d/opcache.ini \
  && echo "opcache.memory_consumption=${OPCACHE_MEMORY}" >> /usr/local/etc/php/conf.d/opcache.ini \
