@@ -14,6 +14,7 @@ It creates one shared reverse proxy stack in `/opt/laravel-reverse-proxy` and on
   - PHP-FPM container: `<project>-php`
   - MariaDB container: `<project>-db`
   - Redis container: `<project>-redis`
+- Composer available inside each PHP container
 - PHP extensions enabled in the image (high-level): `pdo_mysql`, `mysqli`, `opcache`, `zip`, `mbstring`, `redis`, `gd`, `intl`, `bcmath`, `exif`, `pcntl`
 - Nginx virtual hosts per project (one file per project)
 - Lets Encrypt certificates (HTTP-01 webroot challenge)
@@ -57,6 +58,7 @@ The script is interactive and shows a menu.
 - `11) Setup webmail (Roundcube)` - provisions Roundcube webmail behind the reverse proxy, with optional alias domains
 - `12) Manage email domains/mailboxes` - add domains, change the mail host, add/delete mailboxes, reset mailbox passwords, manage DKIM, and print DNS help for additional domains
 - `13) Modify webmail (Roundcube)` - change the current webmail domain list and/or mail host
+- `14) Manage Reverb` - enable/disable Reverb, change its domain/port, and control local/public exposure
 
 ## Non-interactive commands
 
@@ -169,6 +171,39 @@ Use menu option "Update project". This regenerates:
 - the Nginx vhost for the project
 
 Then it rebuilds the project containers and restarts the reverse proxy.
+
+## Reverb (optional)
+
+Menu option `14) Manage Reverb` manages Laravel Reverb for an existing project.
+
+When enabled, the script will:
+
+- add a `laravel-reverb` Supervisor program inside the PHP container
+- run Reverb on an internal port (default `8080`)
+- issue a Let's Encrypt certificate for a dedicated Reverb domain such as `ws.example.com`
+- publish that Reverb endpoint through the shared reverse proxy with websocket headers
+- support `status`, `enable`, `change-domain`, `change-port`, `exposure`, and `disable`
+
+Typical flow:
+
+- run menu option `14`
+- choose `enable`
+- enter a websocket domain such as `ws.example.com`
+- choose exposure:
+  - `local` -> only accessible from the server itself through Nginx
+  - `public` -> accessible publicly on the configured Reverb domain
+- rebuild the PHP container
+- update your app with:
+  - `composer require laravel/reverb`
+  - `php artisan reverb:install`
+
+Recommended DNS:
+
+- `A/AAAA` for `ws.example.com` -> server IP
+
+The script does not install the Laravel Reverb package into your app automatically. It prepares the container and proxy so your Laravel project can run it cleanly.
+
+If you enable `local` exposure, the TLS certificate is still issued for the Reverb domain, but requests are restricted to localhost at the reverse proxy layer.
 
 ## Deleting a project
 

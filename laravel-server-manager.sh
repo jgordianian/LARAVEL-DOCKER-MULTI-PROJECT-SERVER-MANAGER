@@ -32,6 +32,10 @@ REDIS_CONTAINER=""
 APP_DIR=""
 PMA_PORT=""
 PMA_BIND_IP=""
+REVERB_ENABLED=""
+REVERB_DOMAIN=""
+REVERB_PORT=""
+REVERB_EXPOSURE=""
 
 banner() {
   echo "=============================================================="
@@ -91,6 +95,12 @@ tcp_port_in_use() {
   fi
 
   return 1
+}
+
+validate_port_number() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
 set_project_meta_var() {
@@ -393,6 +403,10 @@ write_project_files() {
   local db_root_password="$7"
   local pma_port="${8:-}"
   local pma_bind_ip="${9:-}"
+  local reverb_enabled="${10:-no}"
+  local reverb_domain="${11:-}"
+  local reverb_port="${12:-8080}"
+  local reverb_exposure="${13:-local}"
 
   local php_container="${project_name}-php"
   local db_container="${project_name}-db"
@@ -416,7 +430,7 @@ innodb_log_file_size=128M
 max_connections=100
 EOF
 
-  cat > "${app_dir}/php/supervisord.conf" <<'EOF'
+  cat > "${app_dir}/php/supervisord.conf" <<EOF
 [supervisord]
 nodaemon=true
 logfile=/dev/null
@@ -443,6 +457,22 @@ stdout_logfile_maxbytes=0
 stderr_logfile=/dev/stderr
 stderr_logfile_maxbytes=0
 EOF
+
+  if [ "${reverb_enabled}" = "yes" ]; then
+    cat >> "${app_dir}/php/supervisord.conf" <<EOF
+
+[program:laravel-reverb]
+command=/bin/sh -c "while [ ! -f /var/www/artisan ]; do echo 'Waiting for /var/www/artisan...'; sleep 10; done; php /var/www/artisan reverb:start --host=0.0.0.0 --port=${reverb_port}"
+autostart=true
+autorestart=true
+priority=30
+startsecs=5
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+EOF
+  fi
 
   cat > "${app_dir}/php/Dockerfile" <<EOF
 FROM composer:2 AS composer-bin
@@ -600,6 +630,10 @@ EOF
     printf 'APP_DIR=%q\n' "$app_dir"
     printf 'PMA_PORT=%q\n' "$pma_port"
     printf 'PMA_BIND_IP=%q\n' "$pma_bind_ip"
+    printf 'REVERB_ENABLED=%q\n' "$reverb_enabled"
+    printf 'REVERB_DOMAIN=%q\n' "$reverb_domain"
+    printf 'REVERB_PORT=%q\n' "$reverb_port"
+    printf 'REVERB_EXPOSURE=%q\n' "$reverb_exposure"
   } > "${app_dir}/.project-meta"
 }
 
@@ -689,6 +723,82 @@ server {
     }
 }
 EOF
+}
+
+write_reverb_proxy_config_http() {
+  local project_name="$1"
+  local reverb_domain="$2"
+
+  cat > "${PROXY_CONF_DIR}/reverb-${project_name}.conf" <<EOF
+server {
+    listen 80;
+    server_name ${reverb_domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+EOF
+}
+
+write_reverb_proxy_config_https() {
+  local project_name="$1"
+  local reverb_domain="$2"
+  local php_container="${project_name}-php"
+  local reverb_port="$3"
+  local reverb_exposure="${4:-local}"
+  local access_block=""
+
+  if [ "$reverb_exposure" = "local" ]; then
+    access_block=$'        allow 127.0.0.1;\n        allow ::1;\n        deny all;\n'
+  fi
+
+  cat > "${PROXY_CONF_DIR}/reverb-${project_name}.conf" <<EOF
+server {
+    listen 80;
+    server_name ${reverb_domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${reverb_domain};
+
+    ssl_certificate /etc/letsencrypt/live/${reverb_domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${reverb_domain}/privkey.pem;
+
+    client_max_body_size 20M;
+
+    location / {
+${access_block}        proxy_pass http://${php_container}:${reverb_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+}
+EOF
+}
+
+remove_reverb_proxy_config() {
+  local project_name="$1"
+  rm -f "${PROXY_CONF_DIR}/reverb-${project_name}.conf" || true
 }
 
 setup_ssl_renew_cron() {
@@ -955,6 +1065,8 @@ issue_webmail_certificate() {
     --email "$cert_email" \
     --agree-tos \
     --no-eff-email \
+    --non-interactive \
+    --keep-until-expiring \
     -d "$webmail_domain"; then
     echo "Failed to issue certificate for ${webmail_domain}."
     return 1
@@ -962,6 +1074,31 @@ issue_webmail_certificate() {
 
   rm -f "${PROXY_CONF_DIR}/acme-$(safe_domain_name "$webmail_domain").conf" || true
 
+  return 0
+}
+
+issue_reverb_certificate() {
+  local reverb_domain="$1"
+  local cert_email="$2"
+
+  echo "Issuing Let's Encrypt certificate for ${reverb_domain}..."
+  write_acme_only_vhost "$reverb_domain"
+  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+    --webroot \
+    --webroot-path=/var/www/certbot \
+    --email "$cert_email" \
+    --agree-tos \
+    --no-eff-email \
+    --non-interactive \
+    --keep-until-expiring \
+    -d "$reverb_domain"; then
+    echo "Failed to issue certificate for ${reverb_domain}."
+    return 1
+  fi
+
+  rm -f "${PROXY_CONF_DIR}/acme-$(safe_domain_name "$reverb_domain").conf" || true
   return 0
 }
 
@@ -990,6 +1127,8 @@ issue_mail_host_certificate() {
     --email "$cert_email" \
     --agree-tos \
     --no-eff-email \
+    --non-interactive \
+    --keep-until-expiring \
     -d "$mail_host"; then
     echo "Failed to issue certificate for ${mail_host}."
     return 1
@@ -1136,6 +1275,8 @@ setup_mailserver() {
     --email "admin@${mail_domain}" \
     --agree-tos \
     --no-eff-email \
+    --non-interactive \
+    --keep-until-expiring \
     -d "$mail_host"; then
     echo "Failed to issue certificate for ${mail_host}."
     exit 1
@@ -1840,6 +1981,8 @@ create_project() {
     --email "$email" \
     --agree-tos \
     --no-eff-email \
+    --non-interactive \
+    --keep-until-expiring \
     -d "$domain"
 
   write_proxy_config_https "$project_name" "$domain"
@@ -1896,6 +2039,7 @@ change_project_domain() {
 
   app_dir="$(resolve_project_dir "$project_name")"
   ensure_project_exists "$project_name" "$app_dir"
+  detect_tuning
 
   if [ ! -f "${app_dir}/.project-meta" ]; then
     echo "Project metadata not found at ${app_dir}/.project-meta"
@@ -1943,6 +2087,8 @@ change_project_domain() {
     --email "$email" \
     --agree-tos \
     --no-eff-email \
+    --non-interactive \
+    --keep-until-expiring \
     -d "$new_domain"; then
     echo "Failed to issue certificate. Restoring previous HTTPS config..."
     write_proxy_config_https "$PROJECT_NAME" "$old_domain"
@@ -1969,7 +2115,7 @@ change_project_domain() {
 }
 
 delete_project() {
-  local project_slug project_name app_dir domain
+  local project_slug project_name app_dir domain reverb_domain
   echo ""
   echo "Existing projects:"
   print_existing_projects
@@ -1992,6 +2138,7 @@ delete_project() {
     # shellcheck disable=SC1091
     source "${app_dir}/.project-meta"
     domain="${DOMAIN:-}"
+    reverb_domain="${REVERB_DOMAIN:-}"
   fi
 
   echo ""
@@ -2024,12 +2171,18 @@ delete_project() {
 
   echo "Removing Nginx configuration..."
   rm -f "${PROXY_CONF_DIR}/${project_name}.conf"
+  remove_reverb_proxy_config "$project_name"
 
   if [ -n "$domain" ]; then
     echo "Removing SSL certificates..."
     rm -rf "${PROXY_CERTBOT_CONF}/live/${domain}" || true
     rm -rf "${PROXY_CERTBOT_CONF}/archive/${domain}" || true
     rm -rf "${PROXY_CERTBOT_CONF}/renewal/${domain}.conf" || true
+  fi
+  if [ -n "$reverb_domain" ]; then
+    rm -rf "${PROXY_CERTBOT_CONF}/live/${reverb_domain}" || true
+    rm -rf "${PROXY_CERTBOT_CONF}/archive/${reverb_domain}" || true
+    rm -rf "${PROXY_CERTBOT_CONF}/renewal/${reverb_domain}.conf" || true
   fi
 
   echo "Removing project..."
@@ -2263,7 +2416,7 @@ restore_project() {
 }
 
 update_project() {
-  local project_slug project_name app_dir pma_port pma_bind_ip
+  local project_slug project_name app_dir pma_port pma_bind_ip reverb_enabled reverb_domain reverb_port reverb_exposure
   echo ""
   echo "Existing projects:"
   print_existing_projects
@@ -2292,10 +2445,19 @@ update_project() {
 
   pma_port="${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}"
   pma_bind_ip="${PMA_BIND_IP:-127.0.0.1}"
+  reverb_enabled="${REVERB_ENABLED:-no}"
+  reverb_domain="${REVERB_DOMAIN:-}"
+  reverb_port="${REVERB_PORT:-8080}"
+  reverb_exposure="${REVERB_EXPOSURE:-local}"
 
   echo "Regenerating project configuration..."
-  write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip"
+  write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure"
   write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+  if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
+    write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+  else
+    remove_reverb_proxy_config "$PROJECT_NAME"
+  fi
 
   cd "$app_dir"
   dc up -d --build
@@ -2321,6 +2483,7 @@ phpmyadmin_manage() {
 
   app_dir="$(resolve_project_dir "$project_name")"
   ensure_project_exists "$project_name" "$app_dir"
+  detect_tuning
 
   if [ ! -f "${app_dir}/.project-meta" ]; then
     echo "Project metadata not found at ${app_dir}/.project-meta"
@@ -2499,6 +2662,254 @@ phpmyadmin_manage() {
   esac
 }
 
+manage_reverb() {
+  local project_slug project_name app_dir action reverb_enabled reverb_domain reverb_port reverb_exposure cert_email remove_old suggested_domain
+  local new_reverb_domain new_reverb_port new_reverb_exposure
+
+  echo ""
+  echo "Existing projects:"
+  print_existing_projects
+  echo ""
+  prompt project_slug "Project short name (Reverb): "
+  project_name="$(slug_to_name "$project_slug")"
+  if [ -z "$project_name" ]; then
+    echo "Invalid project short name."
+    exit 1
+  fi
+
+  app_dir="$(resolve_project_dir "$project_name")"
+  ensure_project_exists "$project_name" "$app_dir"
+  detect_tuning
+
+  if [ ! -f "${app_dir}/.project-meta" ]; then
+    echo "Project metadata not found at ${app_dir}/.project-meta"
+    echo "Run 'Update project' once to regenerate project files."
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
+  source "${app_dir}/.project-meta"
+  require_nonempty "PROJECT_NAME" "${PROJECT_NAME}"
+  require_nonempty "DOMAIN" "${DOMAIN}"
+  require_nonempty "DB_NAME" "${DB_NAME}"
+  require_nonempty "DB_USER" "${DB_USER}"
+  require_nonempty "DB_PASSWORD" "${DB_PASSWORD}"
+  require_nonempty "DB_ROOT_PASSWORD" "${DB_ROOT_PASSWORD}"
+
+  reverb_enabled="${REVERB_ENABLED:-no}"
+  reverb_domain="${REVERB_DOMAIN:-}"
+  reverb_port="${REVERB_PORT:-8080}"
+  reverb_exposure="${REVERB_EXPOSURE:-local}"
+
+  echo ""
+  echo "Reverb"
+  echo "Status : ${reverb_enabled}"
+  if [ -n "$reverb_domain" ]; then
+    echo "Domain : ${reverb_domain}"
+  fi
+  echo "Port   : ${reverb_port}"
+  echo "Scope  : ${reverb_exposure}"
+  echo ""
+
+  prompt action "Action [status/enable/change-domain/change-port/exposure/disable]: " "status"
+
+  case "${action,,}" in
+    status)
+      return 0
+      ;;
+    enable)
+      suggested_domain="${DOMAIN}"
+      if [[ "$suggested_domain" == www.* ]]; then
+        suggested_domain="ws.${suggested_domain#www.}"
+      else
+        suggested_domain="ws.${suggested_domain}"
+      fi
+      if [ -n "$reverb_domain" ]; then
+        suggested_domain="$reverb_domain"
+      fi
+
+      prompt reverb_domain "Reverb domain (e.g. ws.example.com) [${suggested_domain}]: " "${suggested_domain}"
+      reverb_domain="$(normalize_domain "$reverb_domain")"
+      if ! validate_domain "$reverb_domain"; then
+        echo "Invalid domain: ${reverb_domain}"
+        exit 1
+      fi
+
+      prompt reverb_port "Reverb port inside PHP container [${reverb_port}]: " "${reverb_port}"
+      if ! validate_port_number "$reverb_port"; then
+        echo "Invalid port: ${reverb_port}"
+        exit 1
+      fi
+
+      prompt reverb_exposure "Exposure [local/public]: " "${reverb_exposure}"
+      case "${reverb_exposure,,}" in
+        local|public) reverb_exposure="${reverb_exposure,,}" ;;
+        *) echo "Invalid exposure: ${reverb_exposure}"; exit 1 ;;
+      esac
+
+      prompt cert_email "Email for Let's Encrypt: "
+      if [ -z "$cert_email" ]; then
+        echo "Email is required."
+        exit 1
+      fi
+
+      ensure_proxy_stack
+
+      if ! issue_reverb_certificate "$reverb_domain" "$cert_email"; then
+        exit 1
+      fi
+
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+
+      cd "$app_dir"
+      dc up -d --build php
+      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+      echo ""
+      echo "Reverb enabled: https://${reverb_domain}"
+      echo "Exposure: ${reverb_exposure}"
+      echo "Update your Laravel app if needed:"
+      echo "  composer require laravel/reverb"
+      echo "  php artisan reverb:install"
+      echo "  REVERB_SERVER_HOST=0.0.0.0"
+      echo "  REVERB_SERVER_PORT=${reverb_port}"
+      ;;
+    change-domain)
+      if [ "$reverb_enabled" != "yes" ]; then
+        echo "Reverb is not enabled."
+        exit 1
+      fi
+
+      prompt new_reverb_domain "New Reverb domain [${reverb_domain}]: " "${reverb_domain}"
+      new_reverb_domain="$(normalize_domain "$new_reverb_domain")"
+      if ! validate_domain "$new_reverb_domain"; then
+        echo "Invalid domain: ${new_reverb_domain}"
+        exit 1
+      fi
+
+      if [ "$new_reverb_domain" = "$reverb_domain" ]; then
+        echo "No changes detected."
+        exit 0
+      fi
+
+      prompt cert_email "Email for Let's Encrypt: "
+      if [ -z "$cert_email" ]; then
+        echo "Email is required."
+        exit 1
+      fi
+
+      ensure_proxy_stack
+      if ! issue_reverb_certificate "$new_reverb_domain" "$cert_email"; then
+        exit 1
+      fi
+
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$new_reverb_domain" "$reverb_port" "$reverb_exposure"
+      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_reverb_proxy_config_https "$PROJECT_NAME" "$new_reverb_domain" "$reverb_port" "$reverb_exposure"
+
+      cd "$app_dir"
+      dc up -d --build php
+      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+      prompt remove_old "Remove old certificate files for ${reverb_domain}? (yes/no): " "no"
+      if [ "${remove_old,,}" = "yes" ]; then
+        rm -rf "${PROXY_CERTBOT_CONF}/live/${reverb_domain}" || true
+        rm -rf "${PROXY_CERTBOT_CONF}/archive/${reverb_domain}" || true
+        rm -rf "${PROXY_CERTBOT_CONF}/renewal/${reverb_domain}.conf" || true
+        echo "Old certificate files removed."
+      fi
+
+      echo "Reverb domain updated: https://${new_reverb_domain}"
+      ;;
+    change-port)
+      if [ "$reverb_enabled" != "yes" ]; then
+        echo "Reverb is not enabled."
+        exit 1
+      fi
+
+      prompt new_reverb_port "New Reverb port [${reverb_port}]: " "${reverb_port}"
+      if ! validate_port_number "$new_reverb_port"; then
+        echo "Invalid port: ${new_reverb_port}"
+        exit 1
+      fi
+
+      if [ "$new_reverb_port" = "$reverb_port" ]; then
+        echo "No changes detected."
+        exit 0
+      fi
+
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$new_reverb_port" "$reverb_exposure"
+      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$new_reverb_port" "$reverb_exposure"
+
+      cd "$app_dir"
+      dc up -d --build php
+      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+      echo "Reverb port updated to ${new_reverb_port}."
+      ;;
+    exposure)
+      if [ "$reverb_enabled" != "yes" ]; then
+        echo "Reverb is not enabled."
+        exit 1
+      fi
+
+      prompt new_reverb_exposure "Exposure [local/public]: " "${reverb_exposure}"
+      case "${new_reverb_exposure,,}" in
+        local|public) new_reverb_exposure="${new_reverb_exposure,,}" ;;
+        *) echo "Invalid exposure: ${new_reverb_exposure}"; exit 1 ;;
+      esac
+
+      if [ "$new_reverb_exposure" = "$reverb_exposure" ]; then
+        echo "No changes detected."
+        exit 0
+      fi
+
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$new_reverb_exposure"
+      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$new_reverb_exposure"
+
+      cd "$app_dir"
+      dc up -d --build php
+      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+      echo "Reverb exposure updated: ${new_reverb_exposure}."
+      ;;
+    disable)
+      if [ "$reverb_enabled" != "yes" ]; then
+        echo "Reverb is already disabled."
+        exit 0
+      fi
+
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "no" "" "${reverb_port}" "${reverb_exposure}"
+      remove_reverb_proxy_config "$PROJECT_NAME"
+
+      cd "$app_dir"
+      dc up -d --build php
+      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+      if [ -n "$reverb_domain" ]; then
+        prompt remove_old "Remove old certificate files for ${reverb_domain}? (yes/no): " "no"
+        if [ "${remove_old,,}" = "yes" ]; then
+          rm -rf "${PROXY_CERTBOT_CONF}/live/${reverb_domain}" || true
+          rm -rf "${PROXY_CERTBOT_CONF}/archive/${reverb_domain}" || true
+          rm -rf "${PROXY_CERTBOT_CONF}/renewal/${reverb_domain}.conf" || true
+          echo "Old certificate files removed."
+        fi
+      fi
+
+      echo "Reverb disabled."
+      ;;
+    *)
+      echo "Invalid option."
+      exit 1
+      ;;
+  esac
+}
+
 menu() {
   echo ""
   echo "Select an option:"
@@ -2515,6 +2926,7 @@ menu() {
   echo "11) Setup webmail (Roundcube)"
   echo "12) Manage email domains/mailboxes"
   echo "13) Modify webmail (Roundcube)"
+  echo "14) Manage Reverb"
   echo ""
   read -r -p "Option: " action
 
@@ -2532,6 +2944,7 @@ menu() {
     11) setup_webmail_roundcube ;;
     12) manage_mailserver ;;
     13) modify_webmail_roundcube ;;
+    14) manage_reverb ;;
     *) echo "Invalid option."; exit 1 ;;
   esac
 }
