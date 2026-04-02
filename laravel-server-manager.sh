@@ -831,6 +831,28 @@ remove_reverb_proxy_config() {
   rm -f "${PROXY_CONF_DIR}/reverb-${project_name}.conf" || true
 }
 
+print_reverb_env_block() {
+  local reverb_exposure="$1"
+  local reverb_domain="$2"
+  local reverb_port="$3"
+
+  echo "Use this Laravel env block:"
+  echo "--------------------------------------------------------------"
+  echo "REVERB_SERVER_HOST=0.0.0.0"
+  echo "REVERB_SERVER_PORT=${reverb_port}"
+  echo ""
+  if [ "$reverb_exposure" = "public" ]; then
+    echo "REVERB_HOST=${reverb_domain}"
+    echo "REVERB_PORT=443"
+    echo "REVERB_SCHEME=https"
+  else
+    echo "REVERB_HOST=127.0.0.1"
+    echo "REVERB_PORT=${reverb_port}"
+    echo "REVERB_SCHEME=http"
+  fi
+  echo "--------------------------------------------------------------"
+}
+
 setup_ssl_renew_cron() {
   local compose_cmd
   compose_cmd="$(compose_cmd_for_cron)"
@@ -2960,8 +2982,7 @@ manage_reverb() {
       echo "Update your Laravel app if needed:"
       echo "  composer require laravel/reverb"
       echo "  php artisan reverb:install"
-      echo "  REVERB_SERVER_HOST=0.0.0.0"
-      echo "  REVERB_SERVER_PORT=${reverb_port}"
+      print_reverb_env_block "$reverb_exposure" "$reverb_domain" "$reverb_port"
       ;;
     change-domain)
       if [ "$reverb_enabled" != "yes" ]; then
