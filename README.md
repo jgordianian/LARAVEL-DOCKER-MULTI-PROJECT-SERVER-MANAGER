@@ -14,7 +14,8 @@ It creates one shared reverse proxy stack in `/opt/laravel-reverse-proxy` and on
   - PHP-FPM container: `<project>-php`
   - MariaDB container: `<project>-db`
   - Redis container: `<project>-redis`
-- Composer available inside each PHP container
+- Composer, Node.js, and npm available inside each PHP container
+- Default PHP upload limit set to 5 GB, with matching project Nginx body size
 - PHP extensions enabled in the image (high-level): `pdo_mysql`, `mysqli`, `opcache`, `zip`, `mbstring`, `redis`, `gd`, `intl`, `bcmath`, `exif`, `pcntl`
 - Nginx virtual hosts per project (one file per project)
 - Lets Encrypt certificates (HTTP-01 webroot challenge)
@@ -59,6 +60,7 @@ The script is interactive and shows a menu.
 - `12) Manage email domains/mailboxes` - add domains, change the mail host, add/delete mailboxes, reset mailbox passwords, manage DKIM, and print DNS help for additional domains
 - `13) Modify webmail (Roundcube)` - change the current webmail domain list and/or mail host
 - `14) Manage Reverb` - enable/disable Reverb, change its domain/port, and control local/public exposure
+- `15) Reset database passwords` - rotate the project DB user password, MariaDB root password, or both
 
 ## Non-interactive commands
 
@@ -171,6 +173,23 @@ Use menu option "Update project". This regenerates:
 - the Nginx vhost for the project
 
 Then it rebuilds the project containers and restarts the reverse proxy.
+
+## Resetting database passwords
+
+Use menu option `15) Reset database passwords` to rotate:
+
+- the application DB user password
+- the MariaDB root password
+- or both in one run
+
+The script will:
+
+- connect to the project's MariaDB container with the current root password
+- update the MariaDB account(s)
+- regenerate the project's saved metadata and `docker-compose.yml`
+- recreate the MariaDB container so healthchecks use the updated root password
+
+If you change the application DB user password, you still need to update your app `.env` or other secret storage manually.
 
 ## Reverb (optional)
 

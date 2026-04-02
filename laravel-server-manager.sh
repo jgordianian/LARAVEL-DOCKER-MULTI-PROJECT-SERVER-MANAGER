@@ -103,6 +103,32 @@ validate_port_number() {
   [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
+sql_escape_literal() {
+  printf '%s' "${1:-}" | sed "s/'/''/g"
+}
+
+sql_escape_identifier() {
+  printf '%s' "${1:-}" | sed 's/`/``/g'
+}
+
+wait_for_mariadb_root() {
+  local db_container="$1"
+  local root_password="$2"
+  local attempt
+
+  for attempt in $(seq 1 30); do
+    if docker exec -e MYSQL_PWD="$root_password" "$db_container" mariadb-admin ping -h localhost -u root >/dev/null 2>&1; then
+      return 0
+    fi
+    if docker exec -e MYSQL_PWD="$root_password" "$db_container" mysqladmin ping -h localhost -u root >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  return 1
+}
+
 set_project_meta_var() {
   local meta_file="$1"
   local key="$2"
@@ -483,6 +509,8 @@ RUN set -eux; \
     apk add --no-cache \
       curl \
       git \
+      nodejs \
+      npm \
       supervisor \
       zip \
       unzip \
@@ -525,7 +553,9 @@ RUN echo "opcache.enable=1" >> /usr/local/etc/php/conf.d/opcache.ini \
  && echo "opcache.max_accelerated_files=20000" >> /usr/local/etc/php/conf.d/opcache.ini \
  && echo "opcache.validate_timestamps=0" >> /usr/local/etc/php/conf.d/opcache.ini \
  && echo "opcache.revalidate_freq=0" >> /usr/local/etc/php/conf.d/opcache.ini \
- && echo "opcache.fast_shutdown=1" >> /usr/local/etc/php/conf.d/opcache.ini
+ && echo "opcache.fast_shutdown=1" >> /usr/local/etc/php/conf.d/opcache.ini \
+ && echo "upload_max_filesize=5120M" >> /usr/local/etc/php/conf.d/uploads.ini \
+ && echo "post_max_size=5120M" >> /usr/local/etc/php/conf.d/uploads.ini
 
 RUN echo "pm = dynamic" >> /usr/local/etc/php-fpm.d/www.conf \
  && echo "pm.max_children=${PHP_FPM_CHILDREN}" >> /usr/local/etc/php-fpm.d/www.conf \
@@ -600,7 +630,7 @@ services:
       PMA_HOST: mariadb
       PMA_PORT: 3306
       PMA_ARBITRARY: 0
-      UPLOAD_LIMIT: 256M
+      UPLOAD_LIMIT: 5G
     ports:
       - "${pma_bind_ip}:${pma_port}:80"
     depends_on:
@@ -649,7 +679,7 @@ server {
 
     root /projects/${project_name}/public;
     index index.php index.html;
-    client_max_body_size 100M;
+    client_max_body_size 5G;
 
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
@@ -703,7 +733,7 @@ server {
 
     root /projects/${project_name}/public;
     index index.php index.html;
-    client_max_body_size 100M;
+    client_max_body_size 5G;
 
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
@@ -2662,6 +2692,162 @@ phpmyadmin_manage() {
   esac
 }
 
+reset_database_passwords() {
+  local project_slug project_name app_dir scope
+  local new_db_password new_root_password confirm
+  local db_user_sql db_password_sql root_password_sql db_name_sql
+  local pma_port pma_bind_ip reverb_enabled reverb_domain reverb_port reverb_exposure
+
+  echo ""
+  echo "Existing projects:"
+  print_existing_projects
+  echo ""
+  prompt project_slug "Project short name (database passwords): "
+  project_name="$(slug_to_name "$project_slug")"
+  if [ -z "$project_name" ]; then
+    echo "Invalid project short name."
+    exit 1
+  fi
+
+  app_dir="$(resolve_project_dir "$project_name")"
+  ensure_project_exists "$project_name" "$app_dir"
+  detect_tuning
+
+  if [ ! -f "${app_dir}/.project-meta" ]; then
+    echo "Project metadata not found at ${app_dir}/.project-meta"
+    echo "Run 'Update project' once to regenerate project files."
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
+  source "${app_dir}/.project-meta"
+  require_nonempty "PROJECT_NAME" "${PROJECT_NAME}"
+  require_nonempty "DOMAIN" "${DOMAIN}"
+  require_nonempty "DB_NAME" "${DB_NAME}"
+  require_nonempty "DB_USER" "${DB_USER}"
+  require_nonempty "DB_PASSWORD" "${DB_PASSWORD}"
+  require_nonempty "DB_ROOT_PASSWORD" "${DB_ROOT_PASSWORD}"
+  require_nonempty "DB_CONTAINER" "${DB_CONTAINER}"
+
+  pma_port="${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}"
+  pma_bind_ip="${PMA_BIND_IP:-127.0.0.1}"
+  reverb_enabled="${REVERB_ENABLED:-no}"
+  reverb_domain="${REVERB_DOMAIN:-}"
+  reverb_port="${REVERB_PORT:-8080}"
+  reverb_exposure="${REVERB_EXPOSURE:-local}"
+
+  echo ""
+  echo "Database password reset"
+  echo "Project : ${PROJECT_NAME}"
+  echo "Database: ${DB_NAME}"
+  echo "DB user : ${DB_USER}"
+  echo ""
+
+  prompt scope "Reset which password [app/root/both]: " "app"
+  scope="${scope,,}"
+  case "$scope" in
+    app|root|both) ;;
+    *)
+      echo "Invalid option: ${scope}"
+      exit 1
+      ;;
+  esac
+
+  new_db_password="${DB_PASSWORD}"
+  new_root_password="${DB_ROOT_PASSWORD}"
+
+  if [ "$scope" = "app" ] || [ "$scope" = "both" ]; then
+    prompt_secret new_db_password "New password for DB user ${DB_USER}: "
+    if [ -z "$new_db_password" ]; then
+      echo "DB user password is required."
+      exit 1
+    fi
+  fi
+
+  if [ "$scope" = "root" ] || [ "$scope" = "both" ]; then
+    prompt_secret new_root_password "New MariaDB root password: "
+    if [ -z "$new_root_password" ]; then
+      echo "Root password is required."
+      exit 1
+    fi
+  fi
+
+  echo ""
+  echo "This will update MariaDB credentials and regenerate project configuration."
+  if [ "$scope" = "app" ] || [ "$scope" = "both" ]; then
+    echo "  - Application DB user password"
+  fi
+  if [ "$scope" = "root" ] || [ "$scope" = "both" ]; then
+    echo "  - MariaDB root password"
+  fi
+  read -r -p "Type YES to continue: " confirm
+  if [ "$confirm" != "YES" ]; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  cd "$app_dir"
+  dc up -d mariadb >/dev/null
+
+  echo "Waiting for MariaDB..."
+  if ! docker_container_exists "${DB_CONTAINER}" || ! wait_for_mariadb_root "${DB_CONTAINER}" "${DB_ROOT_PASSWORD}"; then
+    echo "Failed to connect to MariaDB with the current root password from project metadata."
+    exit 1
+  fi
+
+  db_user_sql="$(sql_escape_literal "$DB_USER")"
+  db_password_sql="$(sql_escape_literal "$new_db_password")"
+  root_password_sql="$(sql_escape_literal "$new_root_password")"
+  db_name_sql="$(sql_escape_identifier "$DB_NAME")"
+
+  echo "Updating MariaDB credentials..."
+  if ! docker exec -e MYSQL_PWD="${DB_ROOT_PASSWORD}" -i "${DB_CONTAINER}" mariadb -u root <<EOF
+$( [ "$scope" = "app" ] || [ "$scope" = "both" ] && cat <<SQL
+CREATE USER IF NOT EXISTS '${db_user_sql}'@'%' IDENTIFIED BY '${db_password_sql}';
+ALTER USER '${db_user_sql}'@'%' IDENTIFIED BY '${db_password_sql}';
+GRANT ALL PRIVILEGES ON \`${db_name_sql}\`.* TO '${db_user_sql}'@'%';
+SQL
+)
+$( [ "$scope" = "root" ] || [ "$scope" = "both" ] && cat <<SQL
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${root_password_sql}';
+SQL
+)
+FLUSH PRIVILEGES;
+EOF
+  then
+    echo "Failed to update database credentials."
+    exit 1
+  fi
+
+  if [ "$scope" = "app" ] || [ "$scope" = "both" ]; then
+    DB_PASSWORD="$new_db_password"
+  fi
+  if [ "$scope" = "root" ] || [ "$scope" = "both" ]; then
+    DB_ROOT_PASSWORD="$new_root_password"
+  fi
+
+  echo "Regenerating project configuration..."
+  write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+  write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+  if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
+    write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+  else
+    remove_reverb_proxy_config "$PROJECT_NAME"
+  fi
+
+  dc up -d --force-recreate mariadb >/dev/null
+  if grep -q "^[[:space:]]*phpmyadmin:" "${app_dir}/docker-compose.yml"; then
+    dc up -d phpmyadmin >/dev/null 2>&1 || true
+  fi
+  dc -f "$PROXY_COMPOSE" restart reverse-proxy >/dev/null 2>&1 || true
+
+  echo "Database password reset completed."
+  if [ "$scope" = "app" ] || [ "$scope" = "both" ]; then
+    echo "Update your app .env / secrets with the new DB user password."
+  fi
+}
+
 manage_reverb() {
   local project_slug project_name app_dir action reverb_enabled reverb_domain reverb_port reverb_exposure cert_email remove_old suggested_domain
   local new_reverb_domain new_reverb_port new_reverb_exposure
@@ -2927,6 +3113,7 @@ menu() {
   echo "12) Manage email domains/mailboxes"
   echo "13) Modify webmail (Roundcube)"
   echo "14) Manage Reverb"
+  echo "15) Reset database passwords"
   echo ""
   read -r -p "Option: " action
 
@@ -2945,6 +3132,7 @@ menu() {
     12) manage_mailserver ;;
     13) modify_webmail_roundcube ;;
     14) manage_reverb ;;
+    15) reset_database_passwords ;;
     *) echo "Invalid option."; exit 1 ;;
   esac
 }
