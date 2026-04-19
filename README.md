@@ -80,11 +80,30 @@ It does not automatically add or redirect between `www` and apex.
 
 ## Where to upload website files
 
-For a project named `myproject`, the public web root is:
+For a project named `myproject`, the project root is:
+
+- `/var/www/projects/myproject/`
+
+Nginx serves this document root by default:
 
 - `/var/www/projects/myproject/public/`
 
-This folder is what Nginx serves and what PHP-FPM executes as the document root.
+This is what Nginx serves and what PHP-FPM executes as the document root.
+
+### Laravel apps
+
+Upload the full Laravel application into:
+
+- `/var/www/projects/<project>/`
+
+The expected layout is:
+
+- `/var/www/projects/<project>/artisan`
+- `/var/www/projects/<project>/public/index.php`
+
+Do not upload the whole Laravel app into `/var/www/projects/<project>/public/`, or you will end up with `public/public/index.php` and Nginx can return `403 Forbidden` until the project config is regenerated.
+
+If you already uploaded a Laravel app one level too deep, the current script can detect that nested layout when you run `6) Update project` and regenerate the proxy config for it.
 
 ### WordPress (Duplicator) example
 
@@ -112,6 +131,12 @@ Note: `127.0.0.1` will not work from inside the PHP container (it points to the 
 ## phpMyAdmin (optional)
 
 The script can run phpMyAdmin per project. By default it is bound to **localhost only** for safety, but you can optionally expose it publicly from the menu (not recommended).
+
+Generated phpMyAdmin containers default to:
+
+- `UPLOAD_LIMIT=5G`
+- `MEMORY_LIMIT=1G`
+- `MAX_EXECUTION_TIME=0` (no phpMyAdmin/PHP execution timeout)
 
 - URL on the server: `http://127.0.0.1:<port>/`
 
@@ -287,6 +312,21 @@ If Duplicator fails with host `127.0.0.1`, use:
 Duplicator may warn if the source was MySQL and the target is MariaDB. This is often fine for WordPress restores.
 
 If you hit SQL import errors and need full compatibility, switch your DB image to MySQL 8.4 in the project `docker-compose.yml` and recreate the DB container/volume.
+
+### Large SQL imports in phpMyAdmin
+
+If browser imports time out on very large `.sql` files, first regenerate the project with the latest script so it rewrites:
+
+- `docker-compose.yml` for phpMyAdmin `UPLOAD_LIMIT`, `MEMORY_LIMIT`, and `MAX_EXECUTION_TIME`
+- `mariadb/my.cnf` for a larger `max_allowed_packet` and longer DB stream timeouts
+
+Then rebuild the project from the menu with `6) Update project`.
+
+For multi-hundred-MB or multi-GB dumps, importing directly into MariaDB is still more reliable than a browser upload. Example:
+
+```bash
+docker exec -i <project>-db sh -c "exec mariadb -u root -p'<root-password>' '<db-name>'" < /path/to/dump.sql
+```
 
 ## Email server (optional)
 

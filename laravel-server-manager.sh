@@ -18,6 +18,12 @@ MAIL_ENV_FILE="${MAIL_BASE}/mailserver.env"
 WEBMAIL_BASE="/opt/webmail-roundcube"
 WEBMAIL_COMPOSE="${WEBMAIL_BASE}/compose.yaml"
 WEBMAIL_META_FILE="${WEBMAIL_BASE}/.webmail-meta"
+PMA_UPLOAD_LIMIT="5G"
+PMA_MEMORY_LIMIT="1G"
+PMA_MAX_EXECUTION_TIME="0"
+MARIADB_MAX_ALLOWED_PACKET="1G"
+MARIADB_NET_READ_TIMEOUT="600"
+MARIADB_NET_WRITE_TIMEOUT="600"
 
 # Values loaded from "${app_dir}/.project-meta" (declared to keep shellcheck happy)
 PROJECT_NAME=""
@@ -272,6 +278,31 @@ resolve_project_dir() {
   echo "${PROJECTS_BASE}/${project_name}"
 }
 
+detect_project_docroot_rel() {
+  local app_dir="$1"
+
+  if [ -f "${app_dir}/public/index.php" ]; then
+    echo "public"
+    return 0
+  fi
+
+  if [ -f "${app_dir}/public/public/index.php" ]; then
+    echo "public/public"
+    return 0
+  fi
+
+  echo "public"
+}
+
+project_container_docroot() {
+  local project_name="$1"
+  local app_dir="${2:-$(resolve_project_dir "$project_name")}"
+  local docroot_rel
+
+  docroot_rel="$(detect_project_docroot_rel "$app_dir")"
+  echo "/projects/${project_name}/${docroot_rel}"
+}
+
 print_existing_projects() {
   if [ -d "$PROXY_PROJECTS_DIR" ] && [ -n "$(ls -A "$PROXY_PROJECTS_DIR" 2>/dev/null)" ]; then
     ls "$PROXY_PROJECTS_DIR" 2>/dev/null
@@ -454,6 +485,9 @@ write_project_files() {
 innodb_buffer_pool_size=${MYSQL_BUFFER}
 innodb_log_file_size=128M
 max_connections=100
+max_allowed_packet=${MARIADB_MAX_ALLOWED_PACKET}
+net_read_timeout=${MARIADB_NET_READ_TIMEOUT}
+net_write_timeout=${MARIADB_NET_WRITE_TIMEOUT}
 EOF
 
   cat > "${app_dir}/php/supervisord.conf" <<EOF
@@ -630,7 +664,9 @@ services:
       PMA_HOST: mariadb
       PMA_PORT: 3306
       PMA_ARBITRARY: 0
-      UPLOAD_LIMIT: 5G
+      UPLOAD_LIMIT: ${PMA_UPLOAD_LIMIT}
+      MEMORY_LIMIT: ${PMA_MEMORY_LIMIT}
+      MAX_EXECUTION_TIME: ${PMA_MAX_EXECUTION_TIME}
     ports:
       - "${pma_bind_ip}:${pma_port}:80"
     depends_on:
@@ -671,13 +707,18 @@ write_proxy_config_http() {
   local project_name="$1"
   local domain="$2"
   local php_container="${project_name}-php"
+  local app_dir
+  local docroot
+
+  app_dir="$(resolve_project_dir "$project_name")"
+  docroot="$(project_container_docroot "$project_name" "$app_dir")"
 
   cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
 server {
     listen 80;
     server_name ${domain};
 
-    root /projects/${project_name}/public;
+    root ${docroot};
     index index.php index.html;
     client_max_body_size 5G;
 
@@ -693,8 +734,8 @@ server {
         include fastcgi_params;
         fastcgi_pass ${php_container}:9000;
         fastcgi_index index.php;
-        fastcgi_param SCRIPT_FILENAME /projects/${project_name}/public\$fastcgi_script_name;
-        fastcgi_param DOCUMENT_ROOT /projects/${project_name}/public;
+        fastcgi_param SCRIPT_FILENAME ${docroot}\$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT ${docroot};
         fastcgi_param PATH_INFO \$fastcgi_path_info;
     }
 
@@ -709,6 +750,11 @@ write_proxy_config_https() {
   local project_name="$1"
   local domain="$2"
   local php_container="${project_name}-php"
+  local app_dir
+  local docroot
+
+  app_dir="$(resolve_project_dir "$project_name")"
+  docroot="$(project_container_docroot "$project_name" "$app_dir")"
 
   cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
 server {
@@ -731,7 +777,7 @@ server {
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
 
-    root /projects/${project_name}/public;
+    root ${docroot};
     index index.php index.html;
     client_max_body_size 5G;
 
@@ -743,8 +789,8 @@ server {
         include fastcgi_params;
         fastcgi_pass ${php_container}:9000;
         fastcgi_index index.php;
-        fastcgi_param SCRIPT_FILENAME /projects/${project_name}/public\$fastcgi_script_name;
-        fastcgi_param DOCUMENT_ROOT /projects/${project_name}/public;
+        fastcgi_param SCRIPT_FILENAME ${docroot}\$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT ${docroot};
         fastcgi_param PATH_INFO \$fastcgi_path_info;
     }
 
@@ -2048,6 +2094,9 @@ create_project() {
   echo "Project: ${project_name}"
   echo "Domain: https://${domain}"
   echo "Project path: ${app_dir}"
+  echo "Laravel apps belong in ${app_dir}/ so ${app_dir}/public/index.php exists."
+  echo "Document-root apps like WordPress belong in ${app_dir}/public/."
+  echo "If you change the uploaded layout later, run 'Update project' to regenerate Nginx."
   echo "Applied profile based on RAM: ${RAM_MB} MB"
   echo ""
   echo "CONFIGURE YOUR .env LIKE THIS:"
