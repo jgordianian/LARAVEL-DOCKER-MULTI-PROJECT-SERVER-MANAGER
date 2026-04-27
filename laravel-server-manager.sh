@@ -42,6 +42,7 @@ REVERB_ENABLED=""
 REVERB_DOMAIN=""
 REVERB_PORT=""
 REVERB_EXPOSURE=""
+APP_PROFILE=""
 
 banner() {
   echo "=============================================================="
@@ -278,8 +279,123 @@ resolve_project_dir() {
   echo "${PROJECTS_BASE}/${project_name}"
 }
 
+detect_project_artisan_rel() {
+  local app_dir="$1"
+  local candidate_dir=""
+
+  if [ -f "${app_dir}/artisan" ] && [ -f "${app_dir}/bootstrap/app.php" ]; then
+    echo "artisan"
+    return 0
+  fi
+
+  # Common "one folder too deep" layouts:
+  if [ -f "${app_dir}/public/artisan" ] && [ -f "${app_dir}/public/bootstrap/app.php" ]; then
+    echo "public/artisan"
+    return 0
+  fi
+
+  if [ -f "${app_dir}/public/public/artisan" ] && [ -f "${app_dir}/public/public/bootstrap/app.php" ]; then
+    echo "public/public/artisan"
+    return 0
+  fi
+
+  if command -v find >/dev/null 2>&1 && [ -d "${app_dir}/public" ]; then
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      candidate_dir="$(dirname "$candidate")"
+      if [ -f "${candidate_dir}/bootstrap/app.php" ]; then
+        echo "${candidate#${app_dir}/}"
+        return 0
+      fi
+    done < <(find "${app_dir}/public" -maxdepth 6 -type f -name artisan 2>/dev/null || true)
+  fi
+
+  return 1
+}
+
+normalize_project_profile() {
+  local profile="${1:-}"
+  profile="${profile,,}"
+  profile="${profile//_/-}"
+
+  case "$profile" in
+    laravel|"")
+      echo "laravel"
+      ;;
+    thinkphp|fastadmin|thinkphp-fastadmin)
+      echo "thinkphp-fastadmin"
+      ;;
+    php|generic|generic-php|wordpress)
+      echo "generic-php"
+      ;;
+    *)
+      echo ""
+      return 1
+      ;;
+  esac
+}
+
+detect_project_profile() {
+  local app_dir="$1"
+  local saved_profile=""
+
+  if [ -f "${app_dir}/.project-meta" ]; then
+    saved_profile="$(
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "${app_dir}/.project-meta" >/dev/null 2>&1
+      normalize_project_profile "${APP_PROFILE:-}" 2>/dev/null || true
+    )"
+    if [ -n "$saved_profile" ]; then
+      echo "$saved_profile"
+      return 0
+    fi
+  fi
+
+  if [ -f "${app_dir}/composer.json" ] \
+    && grep -Eq '"(karsonzhang/fastadmin|topthink/framework)"' "${app_dir}/composer.json" \
+    && [ -f "${app_dir}/public/index.php" ]; then
+    echo "thinkphp-fastadmin"
+    return 0
+  fi
+
+  if [ -f "${app_dir}/public/index.php" ] && ls "${app_dir}"/public/admin_*.php >/dev/null 2>&1; then
+    echo "thinkphp-fastadmin"
+    return 0
+  fi
+
+  if detect_project_artisan_rel "$app_dir" >/dev/null 2>&1; then
+    echo "laravel"
+    return 0
+  fi
+
+  echo "laravel"
+}
+
+project_php_image_tag() {
+  local app_profile="$1"
+
+  case "$app_profile" in
+    thinkphp-fastadmin)
+      echo "8.0-fpm-alpine"
+      ;;
+    *)
+      echo "8.3-fpm-alpine"
+      ;;
+  esac
+}
+
+project_has_laravel_runtime() {
+  local app_profile="$1"
+  local app_dir="$2"
+
+  [ "$app_profile" = "laravel" ] || return 1
+  detect_project_artisan_rel "$app_dir" >/dev/null 2>&1
+}
+
 detect_project_docroot_rel() {
   local app_dir="$1"
+  local artisan_rel artisan_dir_rel
 
   if [ -f "${app_dir}/public/index.php" ]; then
     echo "public"
@@ -289,6 +405,15 @@ detect_project_docroot_rel() {
   if [ -f "${app_dir}/public/public/index.php" ]; then
     echo "public/public"
     return 0
+  fi
+
+  artisan_rel="$(detect_project_artisan_rel "$app_dir" || true)"
+  if [ -n "$artisan_rel" ] && [ "$artisan_rel" != "artisan" ]; then
+    artisan_dir_rel="${artisan_rel%/artisan}"
+    if [ -n "$artisan_dir_rel" ]; then
+      echo "${artisan_dir_rel}/public"
+      return 0
+    fi
   fi
 
   echo "public"
@@ -464,11 +589,13 @@ write_project_files() {
   local reverb_domain="${11:-}"
   local reverb_port="${12:-8080}"
   local reverb_exposure="${13:-local}"
+  local app_profile="${14:-}"
 
   local php_container="${project_name}-php"
   local db_container="${project_name}-db"
   local redis_container="${project_name}-redis"
   local pma_container="${project_name}-phpmyadmin"
+  local php_image_tag redis_command redis_healthcheck mysql_sql_mode_line
 
   if [ -z "$pma_port" ]; then
     pma_port="$(pma_default_port "$project_name")"
@@ -476,6 +603,25 @@ write_project_files() {
 
   if [ -z "$pma_bind_ip" ]; then
     pma_bind_ip="127.0.0.1"
+  fi
+
+  if [ -z "$app_profile" ]; then
+    app_profile="$(detect_project_profile "$app_dir")"
+  else
+    if ! app_profile="$(normalize_project_profile "$app_profile")"; then
+      echo "Invalid app profile. Use one of: laravel, thinkphp, generic."
+      exit 1
+    fi
+  fi
+
+  php_image_tag="$(project_php_image_tag "$app_profile")"
+  redis_command="redis-server --appendonly yes --maxmemory ${REDIS_MEMORY} --maxmemory-policy allkeys-lru"
+  redis_healthcheck="redis-cli ping"
+  mysql_sql_mode_line=""
+  if [ "$app_profile" = "thinkphp-fastadmin" ]; then
+    redis_command="redis-server --appendonly yes --requirepass Yunbao123 --maxmemory ${REDIS_MEMORY} --maxmemory-policy allkeys-lru"
+    redis_healthcheck="redis-cli -a Yunbao123 ping"
+    mysql_sql_mode_line="sql_mode=NO_ENGINE_SUBSTITUTION"
   fi
 
   mkdir -p "${app_dir}/php" "${app_dir}/mariadb"
@@ -488,13 +634,32 @@ max_connections=100
 max_allowed_packet=${MARIADB_MAX_ALLOWED_PACKET}
 net_read_timeout=${MARIADB_NET_READ_TIMEOUT}
 net_write_timeout=${MARIADB_NET_WRITE_TIMEOUT}
+${mysql_sql_mode_line}
 EOF
+
+  local artisan_rel_detected artisan_rel artisan_path
+  artisan_rel="artisan"
+  artisan_rel_detected="$(detect_project_artisan_rel "$app_dir" || true)"
+  if [ -n "$artisan_rel_detected" ]; then
+    artisan_rel="$artisan_rel_detected"
+  fi
+  artisan_path="/var/www/${artisan_rel}"
 
   cat > "${app_dir}/php/supervisord.conf" <<EOF
 [supervisord]
 nodaemon=true
 logfile=/dev/null
 pidfile=/tmp/supervisord.pid
+
+[unix_http_server]
+file=/tmp/supervisor.sock
+chmod=0700
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix:///tmp/supervisor.sock
 
 [program:php-fpm]
 command=php-fpm -F
@@ -505,9 +670,13 @@ stdout_logfile=/dev/stdout
 stdout_logfile_maxbytes=0
 stderr_logfile=/dev/stderr
 stderr_logfile_maxbytes=0
+EOF
+
+  if project_has_laravel_runtime "$app_profile" "$app_dir"; then
+    cat >> "${app_dir}/php/supervisord.conf" <<EOF
 
 [program:laravel-worker]
-command=/bin/sh -c "while [ ! -f /var/www/artisan ]; do echo 'Waiting for /var/www/artisan...'; sleep 10; done; php /var/www/artisan queue:work --sleep=3 --tries=3 --timeout=90"
+command=/bin/sh -c "while [ ! -f ${artisan_path} ]; do echo 'Waiting for ${artisan_path}...'; sleep 10; done; php ${artisan_path} queue:work --sleep=3 --tries=3 --timeout=90"
 autostart=true
 autorestart=true
 priority=20
@@ -517,12 +686,13 @@ stdout_logfile_maxbytes=0
 stderr_logfile=/dev/stderr
 stderr_logfile_maxbytes=0
 EOF
+  fi
 
-  if [ "${reverb_enabled}" = "yes" ]; then
+  if [ "$app_profile" = "laravel" ] && [ "${reverb_enabled}" = "yes" ]; then
     cat >> "${app_dir}/php/supervisord.conf" <<EOF
 
 [program:laravel-reverb]
-command=/bin/sh -c "while [ ! -f /var/www/artisan ]; do echo 'Waiting for /var/www/artisan...'; sleep 10; done; php /var/www/artisan reverb:start --host=0.0.0.0 --port=${reverb_port}"
+command=/bin/sh -c "while [ ! -f ${artisan_path} ]; do echo 'Waiting for ${artisan_path}...'; sleep 10; done; php ${artisan_path} reverb:start --host=0.0.0.0 --port=${reverb_port}"
 autostart=true
 autorestart=true
 priority=30
@@ -537,7 +707,7 @@ EOF
   cat > "${app_dir}/php/Dockerfile" <<EOF
 FROM composer:2 AS composer-bin
 
-FROM php:8.3-fpm-alpine
+FROM php:${php_image_tag}
 
 RUN set -eux; \
     apk add --no-cache \
@@ -545,6 +715,7 @@ RUN set -eux; \
       git \
       nodejs \
       npm \
+      ffmpeg \
       supervisor \
       zip \
       unzip \
@@ -555,6 +726,7 @@ RUN set -eux; \
       libzip; \
     apk add --no-cache --virtual .build-deps \
       \$PHPIZE_DEPS \
+      curl-dev \
       freetype-dev \
       libjpeg-turbo-dev \
       libpng-dev \
@@ -564,6 +736,7 @@ RUN set -eux; \
     docker-php-ext-configure gd --with-freetype --with-jpeg; \
     docker-php-ext-install -j"$(nproc)" \
       bcmath \
+      curl \
       exif \
       gd \
       intl \
@@ -645,9 +818,9 @@ services:
     image: redis:alpine
     container_name: ${redis_container}
     restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory ${REDIS_MEMORY} --maxmemory-policy allkeys-lru
+    command: ${redis_command}
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "${redis_healthcheck}"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -700,6 +873,7 @@ EOF
     printf 'REVERB_DOMAIN=%q\n' "$reverb_domain"
     printf 'REVERB_PORT=%q\n' "$reverb_port"
     printf 'REVERB_EXPOSURE=%q\n' "$reverb_exposure"
+    printf 'APP_PROFILE=%q\n' "$app_profile"
   } > "${app_dir}/.project-meta"
 }
 
@@ -730,11 +904,14 @@ server {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
-    location ~ \.php$ {
+    location ~ \.php(?:/|$) {
+        fastcgi_split_path_info ^(.+?\.php)(/.*)$;
+        try_files \$fastcgi_script_name =404;
         include fastcgi_params;
         fastcgi_pass ${php_container}:9000;
         fastcgi_index index.php;
         fastcgi_param SCRIPT_FILENAME ${docroot}\$fastcgi_script_name;
+        fastcgi_param SCRIPT_NAME \$fastcgi_script_name;
         fastcgi_param DOCUMENT_ROOT ${docroot};
         fastcgi_param PATH_INFO \$fastcgi_path_info;
     }
@@ -785,11 +962,14 @@ server {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
-    location ~ \.php$ {
+    location ~ \.php(?:/|$) {
+        fastcgi_split_path_info ^(.+?\.php)(/.*)$;
+        try_files \$fastcgi_script_name =404;
         include fastcgi_params;
         fastcgi_pass ${php_container}:9000;
         fastcgi_index index.php;
         fastcgi_param SCRIPT_FILENAME ${docroot}\$fastcgi_script_name;
+        fastcgi_param SCRIPT_NAME \$fastcgi_script_name;
         fastcgi_param DOCUMENT_ROOT ${docroot};
         fastcgi_param PATH_INFO \$fastcgi_path_info;
     }
@@ -877,6 +1057,62 @@ remove_reverb_proxy_config() {
   rm -f "${PROXY_CONF_DIR}/reverb-${project_name}.conf" || true
 }
 
+print_project_env_template() {
+  local app_profile="$1"
+  local db_name="$2"
+  local db_user="$3"
+
+  case "$app_profile" in
+    thinkphp-fastadmin)
+      echo "CONFIGURE YOUR ThinkPHP .env LIKE THIS:"
+      echo "--------------------------------------------------------------"
+      echo "[app]"
+      echo "debug = false"
+      echo "trace = false"
+      echo ""
+      echo "[database]"
+      echo "type = mysql"
+      echo "hostname = mariadb"
+      echo "database = ${db_name}"
+      echo "username = ${db_user}"
+      echo "password = *****"
+      echo "hostport = 3306"
+      echo "charset = utf8mb4"
+      echo "prefix = b_"
+      echo "debug = false"
+      echo ""
+      echo "[redis]"
+      echo "host = redis"
+      echo "port = 6379"
+      echo "password = Yunbao123"
+      echo "--------------------------------------------------------------"
+      echo "Import the project SQL after upload, for example:"
+      echo "docker exec -i <project>-db sh -c \"exec mariadb -u root -p'<root-password>' '${db_name}'\" < xianxian.sql"
+      ;;
+    *)
+      echo "CONFIGURE YOUR .env LIKE THIS:"
+      echo "--------------------------------------------------------------"
+      echo "APP_ENV=production"
+      echo "APP_DEBUG=false"
+      echo ""
+      echo "DB_CONNECTION=mysql"
+      echo "DB_HOST=mariadb"
+      echo "DB_PORT=3306"
+      echo "DB_DATABASE=${db_name}"
+      echo "DB_USERNAME=${db_user}"
+      echo "DB_PASSWORD=*****"
+      echo ""
+      echo "CACHE_STORE=redis"
+      echo "CACHE_DRIVER=redis"
+      echo "SESSION_DRIVER=redis"
+      echo "QUEUE_CONNECTION=redis"
+      echo "REDIS_HOST=redis"
+      echo "REDIS_PORT=6379"
+      echo "--------------------------------------------------------------"
+      ;;
+  esac
+}
+
 print_reverb_env_block() {
   local reverb_exposure="$1"
   local reverb_domain="$2"
@@ -896,6 +1132,89 @@ print_reverb_env_block() {
     echo "REVERB_PORT=${reverb_port}"
     echo "REVERB_SCHEME=http"
   fi
+  echo "--------------------------------------------------------------"
+}
+
+print_reverb_runtime_diagnostics() {
+  local project_name="$1"
+  local reverb_port="$2"
+  local reverb_domain="${3:-}"
+  local app_dir artisan_rel artisan_path
+  local php_container="${project_name}-php"
+  local vhost_conf="${PROXY_CONF_DIR}/reverb-${project_name}.conf"
+
+  app_dir="$(resolve_project_dir "$project_name")"
+  artisan_rel="$(detect_project_artisan_rel "$app_dir" || true)"
+  artisan_path="/var/www/artisan"
+  if [ -n "$artisan_rel" ]; then
+    artisan_path="/var/www/${artisan_rel}"
+  fi
+
+  echo ""
+  echo "Runtime diagnostics"
+  echo "--------------------------------------------------------------"
+
+  if [ -f "$vhost_conf" ]; then
+    echo "Proxy vhost: ${vhost_conf}"
+    grep -E 'server_name|proxy_pass' "$vhost_conf" || true
+  else
+    echo "Proxy vhost not found: ${vhost_conf}"
+  fi
+
+  if ! docker_container_exists "$php_container"; then
+    echo "PHP container not found: ${php_container}"
+    echo "--------------------------------------------------------------"
+    return 1
+  fi
+
+  echo ""
+  echo "PHP container: ${php_container}"
+
+  echo ""
+  echo "Artisan: ${artisan_path}"
+
+  echo ""
+  echo "Supervisor status:"
+  if docker exec "$php_container" supervisorctl -c /etc/supervisord.conf status laravel-reverb >/dev/null 2>&1; then
+    docker exec "$php_container" supervisorctl -c /etc/supervisord.conf status laravel-reverb || true
+  else
+    echo "Unable to query supervisor program status (supervisorctl failed)."
+    echo "Tip: rebuild the PHP container so supervisord.conf includes a unix socket for supervisorctl."
+  fi
+
+  echo ""
+  echo "Reverb command availability:"
+  if docker exec "$php_container" sh -c "php ${artisan_path} reverb:start --help >/dev/null 2>&1"; then
+    echo "OK: artisan reverb:start exists"
+  else
+    echo "FAIL: artisan reverb:start not available"
+    echo "Tip: install Reverb in the app: composer require laravel/reverb && php artisan reverb:install"
+  fi
+
+  echo ""
+  echo "Internal HTTP health check:"
+  if docker exec "$php_container" sh -c "curl -fsS --max-time 3 http://127.0.0.1:${reverb_port}/up >/dev/null"; then
+    echo "OK: http://127.0.0.1:${reverb_port}/up"
+  else
+    echo "FAIL: http://127.0.0.1:${reverb_port}/up"
+    echo "Tip: docker logs ${php_container} --tail 200"
+  fi
+
+  if [ -n "$reverb_domain" ]; then
+    echo ""
+    echo "External proxy check (from host):"
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fsS --max-time 5 "https://${reverb_domain}/up" >/dev/null; then
+        echo "OK: https://${reverb_domain}/up"
+      else
+        echo "FAIL: https://${reverb_domain}/up"
+        echo "Tip: docker logs laravel-reverse-proxy --tail 200"
+      fi
+    else
+      echo "curl not found on host."
+    fi
+  fi
+
   echo "--------------------------------------------------------------"
 }
 
@@ -2007,7 +2326,7 @@ modify_webmail_roundcube() {
 }
 
 create_project() {
-  local project_slug domain email db_name db_user db_password db_root_password app_dir project_name pma_port pma_bind_ip
+  local project_slug domain email db_name db_user db_password db_root_password app_dir project_name pma_port pma_bind_ip app_profile detected_profile
 
   prompt project_slug "Project short name (e.g. ferretiq): "
   project_name="$(slug_to_name "$project_slug")"
@@ -2035,6 +2354,12 @@ create_project() {
   prompt_secret db_password "Database password: "
   prompt_secret db_root_password "MariaDB root password: "
   prompt app_dir "Project directory [${PROJECTS_BASE}/${project_name}]: " "${PROJECTS_BASE}/${project_name}"
+  detected_profile="$(detect_project_profile "$app_dir")"
+  prompt app_profile "App profile [laravel/thinkphp/generic] [${detected_profile}]: " "$detected_profile"
+  if ! app_profile="$(normalize_project_profile "$app_profile")"; then
+    echo "Invalid app profile. Use one of: laravel, thinkphp, generic."
+    exit 1
+  fi
 
   if [ -z "$email" ] || [ -z "$db_name" ] || [ -z "$db_user" ] || [ -z "$db_password" ] || [ -z "$db_root_password" ]; then
     echo "All fields are required."
@@ -2060,7 +2385,7 @@ create_project() {
 
   pma_port="$(pma_default_port "$project_name")"
   pma_bind_ip="127.0.0.1"
-  write_project_files "$app_dir" "$project_name" "$domain" "$db_name" "$db_user" "$db_password" "$db_root_password" "$pma_port" "$pma_bind_ip"
+  write_project_files "$app_dir" "$project_name" "$domain" "$db_name" "$db_user" "$db_password" "$db_root_password" "$pma_port" "$pma_bind_ip" "no" "" "8080" "local" "$app_profile"
   write_proxy_config_http "$project_name" "$domain"
 
   echo "Starting project containers..."
@@ -2092,34 +2417,20 @@ create_project() {
   echo "=============================================================="
   echo "INSTALLATION COMPLETE"
   echo "Project: ${project_name}"
+  echo "Profile: ${app_profile}"
   echo "Domain: https://${domain}"
   echo "Project path: ${app_dir}"
   echo "Laravel apps belong in ${app_dir}/ so ${app_dir}/public/index.php exists."
+  echo "ThinkPHP/FastAdmin apps belong in ${app_dir}/ so ${app_dir}/public/index.php exists."
   echo "Document-root apps like WordPress belong in ${app_dir}/public/."
   echo "If you change the uploaded layout later, run 'Update project' to regenerate Nginx."
   echo "Applied profile based on RAM: ${RAM_MB} MB"
   echo ""
-  echo "CONFIGURE YOUR .env LIKE THIS:"
-  echo "--------------------------------------------------------------"
-  echo "APP_ENV=production"
-  echo "APP_DEBUG=false"
+  print_project_env_template "$app_profile" "$db_name" "$db_user"
   echo ""
-  echo "DB_CONNECTION=mysql"
-  echo "DB_HOST=mariadb"
-  echo "DB_PORT=3306"
-  echo "DB_DATABASE=${db_name}"
-  echo "DB_USERNAME=${db_user}"
-  echo "DB_PASSWORD=*****"
-  echo ""
-  echo "CACHE_STORE=redis"
-  echo "CACHE_DRIVER=redis"
-  echo "SESSION_DRIVER=redis"
-  echo "QUEUE_CONNECTION=redis"
-  echo "REDIS_HOST=redis"
-  echo "REDIS_PORT=6379"
-  echo "--------------------------------------------------------------"
-  echo ""
-  echo "The queue worker runs under Supervisor inside the PHP container."
+  if [ "$app_profile" = "laravel" ]; then
+    echo "The queue worker runs under Supervisor inside the PHP container."
+  fi
   echo "Daily automatic backup scheduled at 02:30."
   echo "=============================================================="
 }
@@ -2318,6 +2629,7 @@ list_projects() {
         # shellcheck disable=SC1091
         source "${dir}/.project-meta"
         echo "Project: ${project_name}"
+        echo "Profile: ${APP_PROFILE:-$(detect_project_profile "$dir")}"
         echo "Domain : ${DOMAIN}"
         echo "Path   : ${APP_DIR}"
         echo "DB      : ${DB_NAME}"
@@ -2346,6 +2658,7 @@ list_projects() {
       # shellcheck disable=SC1091
       source "${dir}/.project-meta"
       echo "Project: ${project_name}"
+      echo "Profile: ${APP_PROFILE:-$(detect_project_profile "$dir")}"
       echo "Domain : ${DOMAIN}"
       echo "Path   : ${APP_DIR}"
       echo "DB      : ${DB_NAME}"
@@ -2517,7 +2830,7 @@ restore_project() {
 }
 
 update_project() {
-  local project_slug project_name app_dir pma_port pma_bind_ip reverb_enabled reverb_domain reverb_port reverb_exposure
+  local project_slug project_name app_dir pma_port pma_bind_ip reverb_enabled reverb_domain reverb_port reverb_exposure app_profile
   echo ""
   echo "Existing projects:"
   print_existing_projects
@@ -2550,9 +2863,10 @@ update_project() {
   reverb_domain="${REVERB_DOMAIN:-}"
   reverb_port="${REVERB_PORT:-8080}"
   reverb_exposure="${REVERB_EXPOSURE:-local}"
+  app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
 
   echo "Regenerating project configuration..."
-  write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+  write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile"
   write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
   if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
     write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
@@ -2922,6 +3236,7 @@ EOF
 manage_reverb() {
   local project_slug project_name app_dir action reverb_enabled reverb_domain reverb_port reverb_exposure cert_email remove_old suggested_domain
   local new_reverb_domain new_reverb_port new_reverb_exposure
+  local app_profile
 
   echo ""
   echo "Existing projects:"
@@ -2954,6 +3269,13 @@ manage_reverb() {
   require_nonempty "DB_PASSWORD" "${DB_PASSWORD}"
   require_nonempty "DB_ROOT_PASSWORD" "${DB_ROOT_PASSWORD}"
 
+  app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
+  if [ "$app_profile" != "laravel" ]; then
+    echo "Reverb management is only supported for Laravel projects."
+    echo "Current profile: ${app_profile}"
+    exit 1
+  fi
+
   reverb_enabled="${REVERB_ENABLED:-no}"
   reverb_domain="${REVERB_DOMAIN:-}"
   reverb_port="${REVERB_PORT:-8080}"
@@ -2969,11 +3291,33 @@ manage_reverb() {
   echo "Scope  : ${reverb_exposure}"
   echo ""
 
-  prompt action "Action [status/enable/change-domain/change-port/exposure/disable]: " "status"
+  prompt action "Action [status/enable/change-domain/change-port/exposure/restart/disable]: " "status"
 
   case "${action,,}" in
     status)
+      if [ "$reverb_enabled" = "yes" ]; then
+        print_reverb_runtime_diagnostics "$PROJECT_NAME" "$reverb_port" "$reverb_domain" || true
+      fi
       return 0
+      ;;
+    restart)
+      if [ "$reverb_enabled" != "yes" ]; then
+        echo "Reverb is not enabled."
+        exit 1
+      fi
+
+      echo "Rebuilding PHP container and restarting reverse proxy..."
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      if [ -n "$reverb_domain" ]; then
+        write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+      fi
+
+      cd "$app_dir"
+      dc up -d --build php
+      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+      print_reverb_runtime_diagnostics "$PROJECT_NAME" "$reverb_port" "$reverb_domain" || true
       ;;
     enable)
       suggested_domain="${DOMAIN}"

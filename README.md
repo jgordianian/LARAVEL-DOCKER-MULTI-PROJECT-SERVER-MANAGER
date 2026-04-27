@@ -16,7 +16,8 @@ It creates one shared reverse proxy stack in `/opt/laravel-reverse-proxy` and on
   - Redis container: `<project>-redis`
 - Composer, Node.js, and npm available inside each PHP container
 - Default PHP upload limit set to 5 GB, with matching project Nginx body size
-- PHP extensions enabled in the image (high-level): `pdo_mysql`, `mysqli`, `opcache`, `zip`, `mbstring`, `redis`, `gd`, `intl`, `bcmath`, `exif`, `pcntl`
+- PHP extensions enabled in the image (high-level): `curl`, `pdo_mysql`, `mysqli`, `opcache`, `zip`, `mbstring`, `redis`, `gd`, `intl`, `bcmath`, `exif`, `pcntl`
+- Project profiles for Laravel, generic PHP, and ThinkPHP/FastAdmin apps
 - Nginx virtual hosts per project (one file per project)
 - Lets Encrypt certificates (HTTP-01 webroot challenge)
 - Daily cron jobs for SSL renewal and backups
@@ -104,6 +105,61 @@ The expected layout is:
 Do not upload the whole Laravel app into `/var/www/projects/<project>/public/`, or you will end up with `public/public/index.php` and Nginx can return `403 Forbidden` until the project config is regenerated.
 
 If you already uploaded a Laravel app one level too deep, the current script can detect that nested layout when you run `6) Update project` and regenerate the proxy config for it.
+
+### ThinkPHP / FastAdmin apps
+
+When creating a project for a ThinkPHP/FastAdmin app, select:
+
+- `App profile`: `thinkphp`
+
+The generated stack changes from the Laravel defaults:
+
+- PHP image: `php:8.0-fpm-alpine`
+- No Laravel queue worker is generated
+- PHP extensions include `curl`, `pdo_mysql`, `mysqli`, `redis`, `gd`, `mbstring`, `intl`, `zip`, `bcmath`, `exif`, and `pcntl`
+- MariaDB SQL mode includes `NO_ENGINE_SUBSTITUTION` for legacy zero-date/table imports
+- Redis is started with the expected password `Yunbao123`
+- Nginx supports ThinkPHP/FastAdmin entry URLs like `/admin_xxx.php/index/login`
+
+Upload the full app into:
+
+- `/var/www/projects/<project>/`
+
+The expected layout is:
+
+- `/var/www/projects/<project>/composer.json`
+- `/var/www/projects/<project>/public/index.php`
+- `/var/www/projects/<project>/public/admin_*.php`
+
+Use a ThinkPHP `.env` like:
+
+```ini
+[app]
+debug = false
+trace = false
+
+[database]
+type = mysql
+hostname = mariadb
+database = xianxian
+username = YOUR_DB_USER
+password = YOUR_DB_PASSWORD
+hostport = 3306
+charset = utf8mb4
+prefix = b_
+debug = false
+
+[redis]
+host = redis
+port = 6379
+password = Yunbao123
+```
+
+Import the database after the project container is created:
+
+```bash
+docker exec -i <project>-db sh -c "exec mariadb -u root -p'<root-password>' '<db-name>'" < /var/www/projects/<project>/xianxian.sql
+```
 
 ### WordPress (Duplicator) example
 
