@@ -33,6 +33,7 @@ DB_USER=""
 DB_PASSWORD=""
 DB_ROOT_PASSWORD=""
 PHP_CONTAINER=""
+NODE_CONTAINER=""
 DB_CONTAINER=""
 REDIS_CONTAINER=""
 APP_DIR=""
@@ -328,6 +329,9 @@ normalize_project_profile() {
     php|generic|generic-php|wordpress)
       echo "generic-php"
       ;;
+    node|nodejs|node-js)
+      echo "node"
+      ;;
     *)
       echo ""
       return 1
@@ -350,6 +354,11 @@ detect_project_profile() {
       echo "$saved_profile"
       return 0
     fi
+  fi
+
+  if [ -f "${app_dir}/server.js" ] && [ -f "${app_dir}/package.json" ]; then
+    echo "node"
+    return 0
   fi
 
   if [ -f "${app_dir}/composer.json" ] \
@@ -609,9 +618,80 @@ write_project_files() {
     app_profile="$(detect_project_profile "$app_dir")"
   else
     if ! app_profile="$(normalize_project_profile "$app_profile")"; then
-      echo "Invalid app profile. Use one of: laravel, thinkphp, generic."
+      echo "Invalid app profile. Use one of: laravel, thinkphp, generic, node."
       exit 1
     fi
+  fi
+
+  if [ "$app_profile" = "node" ]; then
+    local node_container="${project_name}-node"
+
+    mkdir -p "${app_dir}/node" "${app_dir}/data"
+
+    cat > "${app_dir}/node/Dockerfile" <<EOF
+FROM node:20-alpine
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV HTTP_PORT=8080
+ENV WS_PORT=3533
+ENV USERS_FILE=/app/data/users.txt
+
+EXPOSE 8080 3533
+
+CMD ["sh","-lc","while [ ! -f server.js ]; do echo 'Waiting for /app/server.js...'; sleep 10; done; if [ -f package-lock.json ]; then npm ci --omit=dev || npm install --omit=dev; elif [ -f package.json ]; then npm install --omit=dev; fi; node server.js"]
+EOF
+
+    cat > "${app_dir}/docker-compose.yml" <<EOF
+version: "3.9"
+services:
+  node:
+    build: ./node
+    container_name: ${node_container}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HTTP_PORT: "8080"
+      WS_PORT: "3533"
+      USERS_FILE: /app/data/users.txt
+    volumes:
+      - ./:/app
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/login.html >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - ${SHARED_NETWORK}
+
+networks:
+  ${SHARED_NETWORK}:
+    external: true
+EOF
+
+    {
+      printf 'PROJECT_NAME=%q\n' "$project_name"
+      printf 'DOMAIN=%q\n' "$domain"
+      printf 'DB_NAME=%q\n' ""
+      printf 'DB_USER=%q\n' ""
+      printf 'DB_PASSWORD=%q\n' ""
+      printf 'DB_ROOT_PASSWORD=%q\n' ""
+      printf 'PHP_CONTAINER=%q\n' ""
+      printf 'NODE_CONTAINER=%q\n' "$node_container"
+      printf 'DB_CONTAINER=%q\n' ""
+      printf 'REDIS_CONTAINER=%q\n' ""
+      printf 'APP_DIR=%q\n' "$app_dir"
+      printf 'PMA_PORT=%q\n' ""
+      printf 'PMA_BIND_IP=%q\n' ""
+      printf 'REVERB_ENABLED=%q\n' "no"
+      printf 'REVERB_DOMAIN=%q\n' ""
+      printf 'REVERB_PORT=%q\n' ""
+      printf 'REVERB_EXPOSURE=%q\n' ""
+      printf 'APP_PROFILE=%q\n' "$app_profile"
+    } > "${app_dir}/.project-meta"
+
+    return 0
   fi
 
   php_image_tag="$(project_php_image_tag "$app_profile")"
@@ -864,6 +944,7 @@ EOF
     printf 'DB_PASSWORD=%q\n' "$db_password"
     printf 'DB_ROOT_PASSWORD=%q\n' "$db_root_password"
     printf 'PHP_CONTAINER=%q\n' "$php_container"
+    printf 'NODE_CONTAINER=%q\n' ""
     printf 'DB_CONTAINER=%q\n' "$db_container"
     printf 'REDIS_CONTAINER=%q\n' "$redis_container"
     printf 'APP_DIR=%q\n' "$app_dir"
@@ -881,10 +962,56 @@ write_proxy_config_http() {
   local project_name="$1"
   local domain="$2"
   local php_container="${project_name}-php"
+  local node_container="${project_name}-node"
   local app_dir
   local docroot
+  local app_profile
 
   app_dir="$(resolve_project_dir "$project_name")"
+  app_profile="$(detect_project_profile "$app_dir")"
+
+  if [ "$app_profile" = "node" ]; then
+    cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
+server {
+    listen 80;
+    server_name ${domain};
+
+    client_max_body_size 100M;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location /ws/ {
+        proxy_pass http://${node_container}:3533;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+    location / {
+        proxy_pass http://${node_container}:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+}
+EOF
+    return 0
+  fi
+
   docroot="$(project_container_docroot "$project_name" "$app_dir")"
 
   cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
@@ -927,10 +1054,68 @@ write_proxy_config_https() {
   local project_name="$1"
   local domain="$2"
   local php_container="${project_name}-php"
+  local node_container="${project_name}-node"
   local app_dir
   local docroot
+  local app_profile
 
   app_dir="$(resolve_project_dir "$project_name")"
+  app_profile="$(detect_project_profile "$app_dir")"
+
+  if [ "$app_profile" = "node" ]; then
+    cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
+server {
+    listen 80;
+    server_name ${domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${domain};
+
+    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+
+    client_max_body_size 100M;
+
+    location /ws/ {
+        proxy_pass http://${node_container}:3533;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+    location / {
+        proxy_pass http://${node_container}:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+}
+EOF
+    return 0
+  fi
+
   docroot="$(project_container_docroot "$project_name" "$app_dir")"
 
   cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
@@ -1063,6 +1248,15 @@ print_project_env_template() {
   local db_user="$3"
 
   case "$app_profile" in
+    node)
+      echo "NODE GAME PROFILE"
+      echo "--------------------------------------------------------------"
+      echo "Upload the game files so server.js and package.json are in the project root."
+      echo "The container runs: npm install --omit=dev && node server.js"
+      echo "The reverse proxy publishes HTTPS traffic to HTTP_PORT=8080 and /ws/ to WS_PORT=3533."
+      echo "Game user data is stored at data/users.txt inside the project folder."
+      echo "--------------------------------------------------------------"
+      ;;
     thinkphp-fastadmin)
       echo "CONFIGURE YOUR ThinkPHP .env LIKE THIS:"
       echo "--------------------------------------------------------------"
@@ -2349,20 +2543,33 @@ create_project() {
   fi
 
   prompt email "Email for Let's Encrypt: "
-  prompt db_name "Database name: "
-  prompt db_user "Database user: "
-  prompt_secret db_password "Database password: "
-  prompt_secret db_root_password "MariaDB root password: "
   prompt app_dir "Project directory [${PROJECTS_BASE}/${project_name}]: " "${PROJECTS_BASE}/${project_name}"
   detected_profile="$(detect_project_profile "$app_dir")"
-  prompt app_profile "App profile [laravel/thinkphp/generic] [${detected_profile}]: " "$detected_profile"
+  prompt app_profile "App profile [laravel/thinkphp/generic/node] [${detected_profile}]: " "$detected_profile"
   if ! app_profile="$(normalize_project_profile "$app_profile")"; then
-    echo "Invalid app profile. Use one of: laravel, thinkphp, generic."
+    echo "Invalid app profile. Use one of: laravel, thinkphp, generic, node."
     exit 1
   fi
 
-  if [ -z "$email" ] || [ -z "$db_name" ] || [ -z "$db_user" ] || [ -z "$db_password" ] || [ -z "$db_root_password" ]; then
-    echo "All fields are required."
+  if [ "$app_profile" = "node" ]; then
+    db_name=""
+    db_user=""
+    db_password=""
+    db_root_password=""
+  else
+    prompt db_name "Database name: "
+    prompt db_user "Database user: "
+    prompt_secret db_password "Database password: "
+    prompt_secret db_root_password "MariaDB root password: "
+  fi
+
+  if [ -z "$email" ]; then
+    echo "Email is required."
+    exit 1
+  fi
+
+  if [ "$app_profile" != "node" ] && { [ -z "$db_name" ] || [ -z "$db_user" ] || [ -z "$db_password" ] || [ -z "$db_root_password" ]; }; then
+    echo "All database fields are required."
     exit 1
   fi
 
@@ -2420,9 +2627,13 @@ create_project() {
   echo "Profile: ${app_profile}"
   echo "Domain: https://${domain}"
   echo "Project path: ${app_dir}"
-  echo "Laravel apps belong in ${app_dir}/ so ${app_dir}/public/index.php exists."
-  echo "ThinkPHP/FastAdmin apps belong in ${app_dir}/ so ${app_dir}/public/index.php exists."
-  echo "Document-root apps like WordPress belong in ${app_dir}/public/."
+  if [ "$app_profile" = "node" ]; then
+    echo "Node apps belong in ${app_dir}/ so ${app_dir}/server.js and ${app_dir}/package.json exist."
+  else
+    echo "Laravel apps belong in ${app_dir}/ so ${app_dir}/public/index.php exists."
+    echo "ThinkPHP/FastAdmin apps belong in ${app_dir}/ so ${app_dir}/public/index.php exists."
+    echo "Document-root apps like WordPress belong in ${app_dir}/public/."
+  fi
   echo "If you change the uploaded layout later, run 'Update project' to regenerate Nginx."
   echo "Applied profile based on RAM: ${RAM_MB} MB"
   echo ""
@@ -2578,6 +2789,7 @@ delete_project() {
   cd "$app_dir"
   dc down -v 2>/dev/null || true
   if [ -n "${PHP_CONTAINER:-}" ]; then docker rm -f "${PHP_CONTAINER}" 2>/dev/null || true; fi
+  if [ -n "${NODE_CONTAINER:-}" ]; then docker rm -f "${NODE_CONTAINER}" 2>/dev/null || true; fi
   if [ -n "${DB_CONTAINER:-}" ]; then docker rm -f "${DB_CONTAINER}" 2>/dev/null || true; fi
   if [ -n "${REDIS_CONTAINER:-}" ]; then docker rm -f "${REDIS_CONTAINER}" 2>/dev/null || true; fi
 
@@ -2632,7 +2844,9 @@ list_projects() {
         echo "Profile: ${APP_PROFILE:-$(detect_project_profile "$dir")}"
         echo "Domain : ${DOMAIN}"
         echo "Path   : ${APP_DIR}"
-        echo "DB      : ${DB_NAME}"
+        if [ -n "${DB_NAME:-}" ]; then
+          echo "DB      : ${DB_NAME}"
+        fi
         echo "--------------------------------------------------------------"
       else
         echo "Project: ${project_name}"
@@ -2661,7 +2875,9 @@ list_projects() {
       echo "Profile: ${APP_PROFILE:-$(detect_project_profile "$dir")}"
       echo "Domain : ${DOMAIN}"
       echo "Path   : ${APP_DIR}"
-      echo "DB      : ${DB_NAME}"
+      if [ -n "${DB_NAME:-}" ]; then
+        echo "DB      : ${DB_NAME}"
+      fi
       echo "--------------------------------------------------------------"
     else
       echo "Project: ${project_name}"
@@ -2682,9 +2898,14 @@ backup_project_internal() {
   # shellcheck disable=SC1090
   # shellcheck disable=SC1091
   source "${app_dir}/.project-meta"
-  require_nonempty "DB_CONTAINER" "${DB_CONTAINER}"
-  require_nonempty "DB_ROOT_PASSWORD" "${DB_ROOT_PASSWORD}"
-  require_nonempty "DB_NAME" "${DB_NAME}"
+  local app_profile
+  app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
+
+  if [ "$app_profile" != "node" ]; then
+    require_nonempty "DB_CONTAINER" "${DB_CONTAINER}"
+    require_nonempty "DB_ROOT_PASSWORD" "${DB_ROOT_PASSWORD}"
+    require_nonempty "DB_NAME" "${DB_NAME}"
+  fi
 
   local timestamp backup_dir tmp_sql archive_name archive_path
   timestamp="$(date +%Y%m%d-%H%M%S)"
@@ -2696,12 +2917,16 @@ backup_project_internal() {
   mkdir -p "$backup_dir"
   : > "$tmp_sql"
 
-  echo "Exporting database..."
-  if docker_container_exists "${DB_CONTAINER}"; then
-    docker exec "${DB_CONTAINER}" sh -c \
-      "exec mariadb-dump -u root -p'${DB_ROOT_PASSWORD}' '${DB_NAME}'" > "$tmp_sql"
+  if [ "$app_profile" = "node" ]; then
+    echo "Skipping database export for node project."
   else
-    echo "Warning: DB container does not exist (${DB_CONTAINER}). Backup without database."
+    echo "Exporting database..."
+    if docker_container_exists "${DB_CONTAINER}"; then
+      docker exec "${DB_CONTAINER}" sh -c \
+        "exec mariadb-dump -u root -p'${DB_ROOT_PASSWORD}' '${DB_NAME}'" > "$tmp_sql"
+    else
+      echo "Warning: DB container does not exist (${DB_CONTAINER}). Backup without database."
+    fi
   fi
 
   echo "Copying project files..."
@@ -2802,9 +3027,14 @@ restore_project() {
   # shellcheck disable=SC1090
   # shellcheck disable=SC1091
   source "${app_dir}/.project-meta"
-  require_nonempty "DB_CONTAINER" "${DB_CONTAINER}"
-  require_nonempty "DB_ROOT_PASSWORD" "${DB_ROOT_PASSWORD}"
-  require_nonempty "DB_NAME" "${DB_NAME}"
+  local app_profile
+  app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
+
+  if [ "$app_profile" != "node" ]; then
+    require_nonempty "DB_CONTAINER" "${DB_CONTAINER}"
+    require_nonempty "DB_ROOT_PASSWORD" "${DB_ROOT_PASSWORD}"
+    require_nonempty "DB_NAME" "${DB_NAME}"
+  fi
 
   echo "Stopping project services..."
   cd "$app_dir"
@@ -2818,9 +3048,13 @@ restore_project() {
 
   sleep 10
 
-  echo "Restoring database..."
-  docker exec -i "${DB_CONTAINER}" sh -c \
-    "exec mariadb -u root -p'${DB_ROOT_PASSWORD}' '${DB_NAME}'" < "${tmp_restore}/database.sql"
+  if [ "$app_profile" = "node" ]; then
+    echo "Skipping database restore for node project."
+  else
+    echo "Restoring database..."
+    docker exec -i "${DB_CONTAINER}" sh -c \
+      "exec mariadb -u root -p'${DB_ROOT_PASSWORD}' '${DB_NAME}'" < "${tmp_restore}/database.sql"
+  fi
 
   dc -f "$PROXY_COMPOSE" restart reverse-proxy
 
@@ -2852,10 +3086,13 @@ update_project() {
   source "${app_dir}/.project-meta"
   require_nonempty "PROJECT_NAME" "${PROJECT_NAME}"
   require_nonempty "DOMAIN" "${DOMAIN}"
-  require_nonempty "DB_NAME" "${DB_NAME}"
-  require_nonempty "DB_USER" "${DB_USER}"
-  require_nonempty "DB_PASSWORD" "${DB_PASSWORD}"
-  require_nonempty "DB_ROOT_PASSWORD" "${DB_ROOT_PASSWORD}"
+  app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
+  if [ "$app_profile" != "node" ]; then
+    require_nonempty "DB_NAME" "${DB_NAME}"
+    require_nonempty "DB_USER" "${DB_USER}"
+    require_nonempty "DB_PASSWORD" "${DB_PASSWORD}"
+    require_nonempty "DB_ROOT_PASSWORD" "${DB_ROOT_PASSWORD}"
+  fi
 
   pma_port="${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}"
   pma_bind_ip="${PMA_BIND_IP:-127.0.0.1}"
@@ -2863,7 +3100,6 @@ update_project() {
   reverb_domain="${REVERB_DOMAIN:-}"
   reverb_port="${REVERB_PORT:-8080}"
   reverb_exposure="${REVERB_EXPOSURE:-local}"
-  app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
 
   echo "Regenerating project configuration..."
   write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile"
@@ -3081,7 +3317,7 @@ reset_database_passwords() {
   local project_slug project_name app_dir scope
   local new_db_password new_root_password confirm
   local db_user_sql db_password_sql root_password_sql db_name_sql
-  local pma_port pma_bind_ip reverb_enabled reverb_domain reverb_port reverb_exposure
+  local pma_port pma_bind_ip reverb_enabled reverb_domain reverb_port reverb_exposure app_profile
 
   echo ""
   echo "Existing projects:"
@@ -3109,6 +3345,11 @@ reset_database_passwords() {
   source "${app_dir}/.project-meta"
   require_nonempty "PROJECT_NAME" "${PROJECT_NAME}"
   require_nonempty "DOMAIN" "${DOMAIN}"
+  app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
+  if [ "$app_profile" = "node" ]; then
+    echo "Node projects do not have a managed MariaDB database."
+    exit 1
+  fi
   require_nonempty "DB_NAME" "${DB_NAME}"
   require_nonempty "DB_USER" "${DB_USER}"
   require_nonempty "DB_PASSWORD" "${DB_PASSWORD}"

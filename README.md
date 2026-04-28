@@ -1,6 +1,6 @@
 # Laravel Server Manager (Docker, Multi-Project) for Ubuntu 22.04
 
-`laravel-server-manager.sh` is a single Bash script that provisions a Docker-based reverse proxy (Nginx + Certbot) and lets you create, update, backup, restore, list, and delete multiple PHP projects (Laravel, WordPress, or any PHP app) on the same Ubuntu Server 22.04 host.
+`laravel-server-manager.sh` is a single Bash script that provisions a Docker-based reverse proxy (Nginx + Certbot) and lets you create, update, backup, restore, list, and delete multiple PHP projects (Laravel, WordPress, or any PHP app) and Node game projects on the same Ubuntu Server 22.04 host.
 
 It creates one shared reverse proxy stack in `/opt/laravel-reverse-proxy` and one Docker Compose stack per project in `/var/www/projects/<project>`.
 
@@ -14,10 +14,11 @@ It creates one shared reverse proxy stack in `/opt/laravel-reverse-proxy` and on
   - PHP-FPM container: `<project>-php`
   - MariaDB container: `<project>-db`
   - Redis container: `<project>-redis`
+  - or Node container for `node` profile projects: `<project>-node`
 - Composer, Node.js, and npm available inside each PHP container
 - Default PHP upload limit set to 5 GB, with matching project Nginx body size
 - PHP extensions enabled in the image (high-level): `curl`, `pdo_mysql`, `mysqli`, `opcache`, `zip`, `mbstring`, `redis`, `gd`, `intl`, `bcmath`, `exif`, `pcntl`
-- Project profiles for Laravel, generic PHP, and ThinkPHP/FastAdmin apps
+- Project profiles for Laravel, generic PHP, ThinkPHP/FastAdmin apps, and Node games/apps
 - Nginx virtual hosts per project (one file per project)
 - Lets Encrypt certificates (HTTP-01 webroot challenge)
 - Daily cron jobs for SSL renewal and backups
@@ -51,7 +52,7 @@ The script is interactive and shows a menu.
 - `2) Delete existing project` - removes containers/volumes/vhost/project files/backups
 - `3) List projects` - shows known projects and their saved metadata
 - `4) Manual project backup` - creates a backup archive for one project
-- `5) Restore project from backup` - restores files and DB from an archive
+- `5) Restore project from backup` - restores files and DB when the profile has a database
 - `6) Update project` - regenerates config and rebuilds containers
 - `7) Run backup for all projects now` - runs backups for all projects
 - `8) Manage phpMyAdmin` - enables/disables phpMyAdmin and controls exposure
@@ -90,6 +91,32 @@ Nginx serves this document root by default:
 - `/var/www/projects/myproject/public/`
 
 This is what Nginx serves and what PHP-FPM executes as the document root.
+
+For a Node profile project, Nginx does not serve files directly. It reverse-proxies the project container:
+
+- HTTP app traffic -> `<project>-node:8080`
+- WebSocket traffic under `/ws/` -> `<project>-node:3533`
+
+### Node game apps
+
+Use this profile for the fish game.
+
+When creating the project, select:
+
+- `App profile`: `node`
+
+Upload the game files into:
+
+- `/var/www/projects/<project>/`
+
+The expected layout is:
+
+- `/var/www/projects/<project>/server.js`
+- `/var/www/projects/<project>/package.json`
+- `/var/www/projects/<project>/index.html`
+- `/var/www/projects/<project>/data/users.txt` (created automatically by the game server if missing)
+
+The generated container runs `npm install --omit=dev` and then `node server.js`. The generated Nginx config supports HTTPS and WebSocket upgrade headers, so the game can use `wss://your-domain/ws/` in production.
 
 ### Laravel apps
 
