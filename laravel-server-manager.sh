@@ -18,6 +18,13 @@ MAIL_ENV_FILE="${MAIL_BASE}/mailserver.env"
 WEBMAIL_BASE="/opt/webmail-roundcube"
 WEBMAIL_COMPOSE="${WEBMAIL_BASE}/compose.yaml"
 WEBMAIL_META_FILE="${WEBMAIL_BASE}/.webmail-meta"
+GUACAMOLE_BASE="/opt/apache-guacamole"
+GUACAMOLE_COMPOSE="${GUACAMOLE_BASE}/compose.yaml"
+GUACAMOLE_META_FILE="${GUACAMOLE_BASE}/.guacamole-meta"
+GUACAMOLE_DEFAULT_UPSTREAM="guacamole-web:8080"
+GUACAMOLE_DEFAULT_VERSION="1.6.0"
+GUACAMOLE_WEB_CONTAINER_NAME="guacamole-web"
+GUACAMOLE_GUACD_CONTAINER_NAME="guacd"
 PMA_UPLOAD_LIMIT="5G"
 PMA_MEMORY_LIMIT="1G"
 PMA_MAX_EXECUTION_TIME="0"
@@ -43,6 +50,10 @@ REVERB_ENABLED=""
 REVERB_DOMAIN=""
 REVERB_PORT=""
 REVERB_EXPOSURE=""
+GUACAMOLE_PROXY_ENABLED=""
+GUACAMOLE_PROXY_UPSTREAM=""
+GUACAMOLE_STACK_VERSION=""
+GUACAMOLE_JSON_SECRET_KEY=""
 APP_PROFILE=""
 
 banner() {
@@ -72,6 +83,13 @@ docker_container_exists() {
   local container_name="${1:-}"
   [ -n "$container_name" ] || return 1
   docker container inspect "$container_name" >/dev/null 2>&1
+}
+
+docker_container_running() {
+  local container_name="${1:-}"
+  [ -n "$container_name" ] || return 1
+  docker_container_exists "$container_name" || return 1
+  [ "$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || echo false)" = "true" ]
 }
 
 pma_default_port() {
@@ -156,6 +174,30 @@ set_project_meta_var() {
   fi
 }
 
+sed_escape_replacement() {
+  printf '%s' "${1:-}" | sed 's/[&|]/\\&/g'
+}
+
+set_env_file_var() {
+  local env_file="$1"
+  local key="$2"
+  local value="$3"
+  local escaped
+
+  escaped="$(sed_escape_replacement "$value")"
+
+  if [ ! -f "$env_file" ]; then
+    printf '%s=%s\n' "$key" "$value" > "$env_file"
+    return 0
+  fi
+
+  if grep -q "^${key}=" "$env_file"; then
+    sed -i "s|^${key}=.*|${key}=${escaped}|" "$env_file"
+  else
+    printf '\n%s=%s\n' "$key" "$value" >> "$env_file"
+  fi
+}
+
 set_phpmyadmin_portspec_in_compose() {
   local compose_file="$1"
   local bind_ip="$2"
@@ -191,6 +233,181 @@ dc() {
 
   echo "Docker Compose is not installed."
   exit 1
+}
+
+random_hex_16() {
+  head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+guacamole_saved_secret() {
+  [ -f "$GUACAMOLE_META_FILE" ] || return 0
+  (
+    # shellcheck disable=SC1090
+    # shellcheck disable=SC1091
+    source "$GUACAMOLE_META_FILE"
+    printf '%s' "${GUACAMOLE_JSON_SECRET_KEY:-}"
+  )
+}
+
+guacamole_saved_version() {
+  [ -f "$GUACAMOLE_META_FILE" ] || return 0
+  (
+    # shellcheck disable=SC1090
+    # shellcheck disable=SC1091
+    source "$GUACAMOLE_META_FILE"
+    printf '%s' "${GUACAMOLE_STACK_VERSION:-}"
+  )
+}
+
+write_guacamole_meta() {
+  local guacamole_version="$1"
+  local json_secret_key="$2"
+
+  mkdir -p "$GUACAMOLE_BASE"
+  {
+    printf 'GUACAMOLE_STACK_VERSION=%q\n' "$guacamole_version"
+    printf 'GUACAMOLE_JSON_SECRET_KEY=%q\n' "$json_secret_key"
+    printf 'GUACAMOLE_STACK_UPSTREAM=%q\n' "$GUACAMOLE_DEFAULT_UPSTREAM"
+    printf 'GUACAMOLE_WEB_CONTAINER_NAME=%q\n' "$GUACAMOLE_WEB_CONTAINER_NAME"
+    printf 'GUACAMOLE_GUACD_CONTAINER_NAME=%q\n' "$GUACAMOLE_GUACD_CONTAINER_NAME"
+  } > "$GUACAMOLE_META_FILE"
+}
+
+write_guacamole_compose() {
+  local guacamole_version="$1"
+  local json_secret_key="$2"
+
+  mkdir -p "$GUACAMOLE_BASE"
+
+  cat > "$GUACAMOLE_COMPOSE" <<EOF
+services:
+  guacd:
+    image: guacamole/guacd:${guacamole_version}
+    container_name: ${GUACAMOLE_GUACD_CONTAINER_NAME}
+    restart: unless-stopped
+    networks:
+      ${SHARED_NETWORK}:
+        aliases:
+          - ${GUACAMOLE_GUACD_CONTAINER_NAME}
+
+  guacamole:
+    image: guacamole/guacamole:${guacamole_version}
+    container_name: ${GUACAMOLE_WEB_CONTAINER_NAME}
+    restart: unless-stopped
+    environment:
+      GUACD_HOSTNAME: ${GUACAMOLE_GUACD_CONTAINER_NAME}
+      JSON_ENABLED: "true"
+      JSON_SECRET_KEY: "${json_secret_key}"
+      EXTENSION_PRIORITY: "json"
+    depends_on:
+      - guacd
+    networks:
+      ${SHARED_NETWORK}:
+        aliases:
+          - ${GUACAMOLE_WEB_CONTAINER_NAME}
+
+networks:
+  ${SHARED_NETWORK}:
+    external: true
+EOF
+}
+
+ensure_managed_guacamole_stack() {
+  local guacamole_version="${1:-$GUACAMOLE_DEFAULT_VERSION}"
+  local json_secret_key="${2:-}"
+  local saved_version saved_secret
+
+  install_base
+  ensure_proxy_stack
+
+  saved_version="$(guacamole_saved_version)"
+  saved_secret="$(guacamole_saved_secret)"
+
+  if [ -z "$guacamole_version" ]; then
+    guacamole_version="${saved_version:-$GUACAMOLE_DEFAULT_VERSION}"
+  fi
+
+  if [ -z "$json_secret_key" ]; then
+    json_secret_key="${saved_secret:-}"
+  fi
+
+  if [ -z "$json_secret_key" ]; then
+    json_secret_key="$(random_hex_16)"
+  fi
+
+  write_guacamole_compose "$guacamole_version" "$json_secret_key"
+  write_guacamole_meta "$guacamole_version" "$json_secret_key"
+  dc -f "$GUACAMOLE_COMPOSE" up -d --force-recreate --remove-orphans
+}
+
+detect_project_env_path() {
+  local app_dir="$1"
+  local candidate=""
+
+  if [ -f "${app_dir}/.env" ]; then
+    echo "${app_dir}/.env"
+    return 0
+  fi
+
+  if [ -f "${app_dir}/public/.env" ]; then
+    echo "${app_dir}/public/.env"
+    return 0
+  fi
+
+  if [ -d "${app_dir}/public" ] && command -v find >/dev/null 2>&1; then
+    while IFS= read -r -d '' candidate; do
+      [ -n "$candidate" ] || continue
+      echo "$candidate"
+      return 0
+    done < <(find "${app_dir}/public" -mindepth 2 -type f -name '.env' -print0 2>/dev/null)
+  fi
+
+  return 1
+}
+
+sync_project_guacamole_env() {
+  local app_dir="$1"
+  local domain="$2"
+  local json_secret_key="$3"
+  local env_file=""
+
+  [ -n "$json_secret_key" ] || return 1
+  env_file="$(detect_project_env_path "$app_dir" || true)"
+  [ -n "$env_file" ] || return 1
+
+  set_env_file_var "$env_file" "GUACAMOLE_ENABLED" "true"
+  set_env_file_var "$env_file" "GUACAMOLE_BASE_URL" "https://${domain}/guacamole"
+  set_env_file_var "$env_file" "GUACAMOLE_JSON_SECRET_KEY" "$json_secret_key"
+  set_env_file_var "$env_file" "GUACAMOLE_EMBED_ALLOWED" "true"
+}
+
+disable_project_guacamole_env() {
+  local app_dir="$1"
+  local env_file=""
+
+  env_file="$(detect_project_env_path "$app_dir" || true)"
+  [ -n "$env_file" ] || return 1
+  set_env_file_var "$env_file" "GUACAMOLE_ENABLED" "false"
+}
+
+refresh_project_runtime_after_env_change() {
+  local app_dir="$1"
+  local project_name="$2"
+  local php_container="${project_name}-php"
+  local artisan_rel artisan_path
+
+  [ -f "${app_dir}/docker-compose.yml" ] || return 1
+  docker_container_exists "$php_container" || return 1
+
+  artisan_rel="$(detect_project_artisan_rel "$app_dir" || true)"
+
+  cd "$app_dir"
+  if [ -n "$artisan_rel" ]; then
+    artisan_path="/var/www/${artisan_rel}"
+    dc exec -T php php "$artisan_path" optimize:clear >/dev/null 2>&1 || true
+  fi
+
+  dc restart php >/dev/null 2>&1
 }
 
 recreate_phpmyadmin() {
@@ -337,6 +554,77 @@ normalize_project_profile() {
       return 1
       ;;
   esac
+}
+
+normalize_yes_no() {
+  local value="${1:-}"
+  value="${value,,}"
+
+  case "$value" in
+    yes|y|true|1|on|enabled)
+      echo "yes"
+      ;;
+    no|n|false|0|off|disabled|"")
+      echo "no"
+      ;;
+    *)
+      echo ""
+      return 1
+      ;;
+  esac
+}
+
+normalize_guacamole_upstream() {
+  local upstream="${1:-}"
+  upstream="${upstream#http://}"
+  upstream="${upstream#https://}"
+  upstream="${upstream%%/*}"
+  echo "$upstream"
+}
+
+validate_guacamole_upstream() {
+  local upstream="${1:-}"
+
+  [[ "$upstream" =~ ^[A-Za-z0-9._-]+:[0-9]+$ ]] || return 1
+
+  local port="${upstream##*:}"
+  validate_port_number "$port"
+}
+
+build_guacamole_proxy_block() {
+  local guacamole_proxy_enabled="${1:-no}"
+  local guacamole_proxy_upstream="${2:-$GUACAMOLE_DEFAULT_UPSTREAM}"
+
+  if [ "$guacamole_proxy_enabled" != "yes" ]; then
+    return 0
+  fi
+
+  cat <<EOF
+    location = /guacamole {
+        return 301 /guacamole/;
+    }
+
+    location /guacamole/ {
+        # Resolve the upstream through Docker DNS at request time so a missing
+        # Guacamole container returns 502 only for /guacamole instead of
+        # preventing nginx from starting for the whole reverse proxy.
+        resolver 127.0.0.11 ipv6=off valid=30s;
+        resolver_timeout 5s;
+        set \$guacamole_upstream "${guacamole_proxy_upstream}";
+        proxy_pass http://\$guacamole_upstream;
+        proxy_buffering off;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+EOF
 }
 
 detect_project_profile() {
@@ -599,6 +887,8 @@ write_project_files() {
   local reverb_port="${12:-8080}"
   local reverb_exposure="${13:-local}"
   local app_profile="${14:-}"
+  local guacamole_proxy_enabled="${15:-no}"
+  local guacamole_proxy_upstream="${16:-$GUACAMOLE_DEFAULT_UPSTREAM}"
 
   local php_container="${project_name}-php"
   local db_container="${project_name}-db"
@@ -621,6 +911,18 @@ write_project_files() {
       echo "Invalid app profile. Use one of: laravel, thinkphp, generic, node."
       exit 1
     fi
+  fi
+
+  if ! guacamole_proxy_enabled="$(normalize_yes_no "$guacamole_proxy_enabled")"; then
+    echo "Invalid Guacamole proxy setting. Use yes or no."
+    exit 1
+  fi
+
+  guacamole_proxy_upstream="$(normalize_guacamole_upstream "$guacamole_proxy_upstream")"
+  if [ "$guacamole_proxy_enabled" = "yes" ] && ! validate_guacamole_upstream "$guacamole_proxy_upstream"; then
+    echo "Invalid Guacamole upstream: ${guacamole_proxy_upstream}"
+    echo "Use host:port, for example guacamole-web:8080"
+    exit 1
   fi
 
   if [ "$app_profile" = "node" ]; then
@@ -688,6 +990,8 @@ EOF
       printf 'REVERB_DOMAIN=%q\n' ""
       printf 'REVERB_PORT=%q\n' ""
       printf 'REVERB_EXPOSURE=%q\n' ""
+      printf 'GUACAMOLE_PROXY_ENABLED=%q\n' "$guacamole_proxy_enabled"
+      printf 'GUACAMOLE_PROXY_UPSTREAM=%q\n' "$guacamole_proxy_upstream"
       printf 'APP_PROFILE=%q\n' "$app_profile"
     } > "${app_dir}/.project-meta"
 
@@ -954,6 +1258,8 @@ EOF
     printf 'REVERB_DOMAIN=%q\n' "$reverb_domain"
     printf 'REVERB_PORT=%q\n' "$reverb_port"
     printf 'REVERB_EXPOSURE=%q\n' "$reverb_exposure"
+    printf 'GUACAMOLE_PROXY_ENABLED=%q\n' "$guacamole_proxy_enabled"
+    printf 'GUACAMOLE_PROXY_UPSTREAM=%q\n' "$guacamole_proxy_upstream"
     printf 'APP_PROFILE=%q\n' "$app_profile"
   } > "${app_dir}/.project-meta"
 }
@@ -966,9 +1272,28 @@ write_proxy_config_http() {
   local app_dir
   local docroot
   local app_profile
+  local guacamole_proxy_enabled="no"
+  local guacamole_proxy_upstream="$GUACAMOLE_DEFAULT_UPSTREAM"
+  local guacamole_proxy_block=""
 
   app_dir="$(resolve_project_dir "$project_name")"
   app_profile="$(detect_project_profile "$app_dir")"
+  if [ -f "${app_dir}/.project-meta" ]; then
+    guacamole_proxy_enabled="$(
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "${app_dir}/.project-meta" >/dev/null 2>&1
+      printf '%s' "${GUACAMOLE_PROXY_ENABLED:-no}"
+    )"
+    guacamole_proxy_upstream="$(
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "${app_dir}/.project-meta" >/dev/null 2>&1
+      printf '%s' "${GUACAMOLE_PROXY_UPSTREAM:-$GUACAMOLE_DEFAULT_UPSTREAM}"
+    )"
+    guacamole_proxy_upstream="$(normalize_guacamole_upstream "$guacamole_proxy_upstream")"
+  fi
+  guacamole_proxy_block="$(build_guacamole_proxy_block "$guacamole_proxy_enabled" "$guacamole_proxy_upstream")"
 
   if [ "$app_profile" = "node" ]; then
     cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
@@ -982,7 +1307,7 @@ server {
         root /var/www/certbot;
     }
 
-    location /ws/ {
+${guacamole_proxy_block}    location /ws/ {
         proxy_pass http://${node_container}:3533;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
@@ -1027,7 +1352,7 @@ server {
         root /var/www/certbot;
     }
 
-    location / {
+${guacamole_proxy_block}    location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
@@ -1058,9 +1383,28 @@ write_proxy_config_https() {
   local app_dir
   local docroot
   local app_profile
+  local guacamole_proxy_enabled="no"
+  local guacamole_proxy_upstream="$GUACAMOLE_DEFAULT_UPSTREAM"
+  local guacamole_proxy_block=""
 
   app_dir="$(resolve_project_dir "$project_name")"
   app_profile="$(detect_project_profile "$app_dir")"
+  if [ -f "${app_dir}/.project-meta" ]; then
+    guacamole_proxy_enabled="$(
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "${app_dir}/.project-meta" >/dev/null 2>&1
+      printf '%s' "${GUACAMOLE_PROXY_ENABLED:-no}"
+    )"
+    guacamole_proxy_upstream="$(
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "${app_dir}/.project-meta" >/dev/null 2>&1
+      printf '%s' "${GUACAMOLE_PROXY_UPSTREAM:-$GUACAMOLE_DEFAULT_UPSTREAM}"
+    )"
+    guacamole_proxy_upstream="$(normalize_guacamole_upstream "$guacamole_proxy_upstream")"
+  fi
+  guacamole_proxy_block="$(build_guacamole_proxy_block "$guacamole_proxy_enabled" "$guacamole_proxy_upstream")"
 
   if [ "$app_profile" = "node" ]; then
     cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
@@ -1070,6 +1414,10 @@ server {
 
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
+    }
+
+    location = /guacamole {
+        return 301 https://\$host/guacamole/;
     }
 
     location / {
@@ -1086,7 +1434,7 @@ server {
 
     client_max_body_size 100M;
 
-    location /ws/ {
+${guacamole_proxy_block}    location /ws/ {
         proxy_pass http://${node_container}:3533;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
@@ -1127,6 +1475,10 @@ server {
         root /var/www/certbot;
     }
 
+    location = /guacamole {
+        return 301 https://\$host/guacamole/;
+    }
+
     location / {
         return 301 https://\$host\$request_uri;
     }
@@ -1143,7 +1495,7 @@ server {
     index index.php index.html;
     client_max_body_size 5G;
 
-    location / {
+${guacamole_proxy_block}    location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
@@ -3065,6 +3417,7 @@ restore_project() {
 
 update_project() {
   local project_slug project_name app_dir pma_port pma_bind_ip reverb_enabled reverb_domain reverb_port reverb_exposure app_profile
+  local guacamole_proxy_enabled guacamole_proxy_upstream
   echo ""
   echo "Existing projects:"
   print_existing_projects
@@ -3100,9 +3453,14 @@ update_project() {
   reverb_domain="${REVERB_DOMAIN:-}"
   reverb_port="${REVERB_PORT:-8080}"
   reverb_exposure="${REVERB_EXPOSURE:-local}"
+  guacamole_proxy_enabled="${GUACAMOLE_PROXY_ENABLED:-no}"
+  if ! guacamole_proxy_enabled="$(normalize_yes_no "$guacamole_proxy_enabled")"; then
+    guacamole_proxy_enabled="no"
+  fi
+  guacamole_proxy_upstream="$(normalize_guacamole_upstream "${GUACAMOLE_PROXY_UPSTREAM:-$GUACAMOLE_DEFAULT_UPSTREAM}")"
 
   echo "Regenerating project configuration..."
-  write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile"
+  write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
   write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
   if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
     write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
@@ -3318,6 +3676,7 @@ reset_database_passwords() {
   local new_db_password new_root_password confirm
   local db_user_sql db_password_sql root_password_sql db_name_sql
   local pma_port pma_bind_ip reverb_enabled reverb_domain reverb_port reverb_exposure app_profile
+  local guacamole_proxy_enabled guacamole_proxy_upstream
 
   echo ""
   echo "Existing projects:"
@@ -3362,6 +3721,11 @@ reset_database_passwords() {
   reverb_domain="${REVERB_DOMAIN:-}"
   reverb_port="${REVERB_PORT:-8080}"
   reverb_exposure="${REVERB_EXPOSURE:-local}"
+  guacamole_proxy_enabled="${GUACAMOLE_PROXY_ENABLED:-no}"
+  if ! guacamole_proxy_enabled="$(normalize_yes_no "$guacamole_proxy_enabled")"; then
+    guacamole_proxy_enabled="no"
+  fi
+  guacamole_proxy_upstream="$(normalize_guacamole_upstream "${GUACAMOLE_PROXY_UPSTREAM:-$GUACAMOLE_DEFAULT_UPSTREAM}")"
 
   echo ""
   echo "Database password reset"
@@ -3454,7 +3818,7 @@ EOF
   fi
 
   echo "Regenerating project configuration..."
-  write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+  write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
   write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
   if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
     write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
@@ -3477,7 +3841,7 @@ EOF
 manage_reverb() {
   local project_slug project_name app_dir action reverb_enabled reverb_domain reverb_port reverb_exposure cert_email remove_old suggested_domain
   local new_reverb_domain new_reverb_port new_reverb_exposure
-  local app_profile
+  local app_profile guacamole_proxy_enabled guacamole_proxy_upstream
 
   echo ""
   echo "Existing projects:"
@@ -3521,6 +3885,11 @@ manage_reverb() {
   reverb_domain="${REVERB_DOMAIN:-}"
   reverb_port="${REVERB_PORT:-8080}"
   reverb_exposure="${REVERB_EXPOSURE:-local}"
+  guacamole_proxy_enabled="${GUACAMOLE_PROXY_ENABLED:-no}"
+  if ! guacamole_proxy_enabled="$(normalize_yes_no "$guacamole_proxy_enabled")"; then
+    guacamole_proxy_enabled="no"
+  fi
+  guacamole_proxy_upstream="$(normalize_guacamole_upstream "${GUACAMOLE_PROXY_UPSTREAM:-$GUACAMOLE_DEFAULT_UPSTREAM}")"
 
   echo ""
   echo "Reverb"
@@ -3548,7 +3917,7 @@ manage_reverb() {
       fi
 
       echo "Rebuilding PHP container and restarting reverse proxy..."
-      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
       write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
       if [ -n "$reverb_domain" ]; then
         write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
@@ -3602,7 +3971,7 @@ manage_reverb() {
         exit 1
       fi
 
-      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
       write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
       write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
 
@@ -3647,7 +4016,7 @@ manage_reverb() {
         exit 1
       fi
 
-      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$new_reverb_domain" "$reverb_port" "$reverb_exposure"
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$new_reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
       write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
       write_reverb_proxy_config_https "$PROJECT_NAME" "$new_reverb_domain" "$reverb_port" "$reverb_exposure"
 
@@ -3682,7 +4051,7 @@ manage_reverb() {
         exit 0
       fi
 
-      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$new_reverb_port" "$reverb_exposure"
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$new_reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
       write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
       write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$new_reverb_port" "$reverb_exposure"
 
@@ -3709,7 +4078,7 @@ manage_reverb() {
         exit 0
       fi
 
-      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$new_reverb_exposure"
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$new_reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
       write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
       write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$new_reverb_exposure"
 
@@ -3725,7 +4094,7 @@ manage_reverb() {
         exit 0
       fi
 
-      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "no" "" "${reverb_port}" "${reverb_exposure}"
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "no" "" "${reverb_port}" "${reverb_exposure}" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
       remove_reverb_proxy_config "$PROJECT_NAME"
 
       cd "$app_dir"
@@ -3743,6 +4112,278 @@ manage_reverb() {
       fi
 
       echo "Reverb disabled."
+      ;;
+    *)
+      echo "Invalid option."
+      exit 1
+      ;;
+  esac
+}
+
+manage_guacamole_proxy() {
+  local project_slug project_name app_dir action app_profile
+  local db_name db_user db_password db_root_password
+  local pma_port pma_bind_ip reverb_enabled reverb_domain reverb_port reverb_exposure
+  local guacamole_proxy_enabled guacamole_proxy_upstream new_guacamole_proxy_upstream
+  local stack_present web_running guacd_running managed_guacamole_secret managed_guacamole_version project_env_path
+
+  echo ""
+  echo "Existing projects:"
+  print_existing_projects
+  echo ""
+  prompt project_slug "Project short name (Guacamole proxy): "
+  project_name="$(slug_to_name "$project_slug")"
+  if [ -z "$project_name" ]; then
+    echo "Invalid project short name."
+    exit 1
+  fi
+
+  app_dir="$(resolve_project_dir "$project_name")"
+  ensure_project_exists "$project_name" "$app_dir"
+  detect_tuning
+
+  if [ ! -f "${app_dir}/.project-meta" ]; then
+    echo "Project metadata not found at ${app_dir}/.project-meta"
+    echo "Run 'Update project' once to regenerate project files."
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
+  source "${app_dir}/.project-meta"
+  require_nonempty "PROJECT_NAME" "${PROJECT_NAME}"
+  require_nonempty "DOMAIN" "${DOMAIN}"
+
+  app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
+  db_name="${DB_NAME:-}"
+  db_user="${DB_USER:-}"
+  db_password="${DB_PASSWORD:-}"
+  db_root_password="${DB_ROOT_PASSWORD:-}"
+  if [ "$app_profile" != "node" ]; then
+    require_nonempty "DB_NAME" "${db_name}"
+    require_nonempty "DB_USER" "${db_user}"
+    require_nonempty "DB_PASSWORD" "${db_password}"
+    require_nonempty "DB_ROOT_PASSWORD" "${db_root_password}"
+  fi
+
+  pma_port="${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}"
+  pma_bind_ip="${PMA_BIND_IP:-127.0.0.1}"
+  reverb_enabled="${REVERB_ENABLED:-no}"
+  reverb_domain="${REVERB_DOMAIN:-}"
+  reverb_port="${REVERB_PORT:-8080}"
+  reverb_exposure="${REVERB_EXPOSURE:-local}"
+  guacamole_proxy_enabled="${GUACAMOLE_PROXY_ENABLED:-no}"
+  if ! guacamole_proxy_enabled="$(normalize_yes_no "$guacamole_proxy_enabled")"; then
+    guacamole_proxy_enabled="no"
+  fi
+  guacamole_proxy_upstream="$(normalize_guacamole_upstream "${GUACAMOLE_PROXY_UPSTREAM:-$GUACAMOLE_DEFAULT_UPSTREAM}")"
+  managed_guacamole_secret="$(guacamole_saved_secret)"
+  managed_guacamole_version="$(guacamole_saved_version)"
+  project_env_path="$(detect_project_env_path "$app_dir" || true)"
+  [ -n "$managed_guacamole_version" ] || managed_guacamole_version="$GUACAMOLE_DEFAULT_VERSION"
+
+  stack_present="no"
+  [ -f "$GUACAMOLE_COMPOSE" ] && stack_present="yes"
+  web_running="no"
+  docker_container_running "$GUACAMOLE_WEB_CONTAINER_NAME" && web_running="yes"
+  guacd_running="no"
+  docker_container_running "$GUACAMOLE_GUACD_CONTAINER_NAME" && guacd_running="yes"
+
+  echo ""
+  echo "Guacamole"
+  echo "Proxy status : ${guacamole_proxy_enabled}"
+  echo "Upstream     : ${guacamole_proxy_upstream}"
+  echo "Shared stack : ${stack_present} (web=${web_running}, guacd=${guacd_running})"
+  echo "Project      : https://${DOMAIN}"
+  echo "Proxy URL    : https://${DOMAIN}/guacamole/"
+  echo ""
+  echo "If you keep the default upstream (${GUACAMOLE_DEFAULT_UPSTREAM}), this"
+  echo "manager can provision and maintain the shared Apache Guacamole stack."
+  echo ""
+
+  prompt action "Action [status/install-stack/enable/change-upstream/disable]: " "status"
+
+  case "${action,,}" in
+    status)
+      echo ""
+      echo "Managed stack path : ${GUACAMOLE_BASE}"
+      echo "Managed compose    : ${GUACAMOLE_COMPOSE}"
+      echo "Managed version    : ${managed_guacamole_version}"
+      if [ -n "$managed_guacamole_secret" ]; then
+        echo "Managed JSON secret: ${managed_guacamole_secret}"
+      else
+        echo "Managed JSON secret: not generated yet"
+      fi
+      echo ""
+      echo "Project .env values:"
+      if [ -n "$managed_guacamole_secret" ] && [ "$guacamole_proxy_upstream" = "$GUACAMOLE_DEFAULT_UPSTREAM" ]; then
+        echo "  GUACAMOLE_ENABLED=true"
+        echo "  GUACAMOLE_BASE_URL=https://${DOMAIN}/guacamole"
+        echo "  GUACAMOLE_JSON_SECRET_KEY=${managed_guacamole_secret}"
+        echo "  GUACAMOLE_EMBED_ALLOWED=true"
+      else
+        echo "  GUACAMOLE_ENABLED=true"
+        echo "  GUACAMOLE_BASE_URL=https://${DOMAIN}/guacamole"
+        echo "  GUACAMOLE_JSON_SECRET_KEY=YOUR_GUACAMOLE_JSON_SECRET_KEY"
+        echo "  GUACAMOLE_EMBED_ALLOWED=true"
+      fi
+      if [ -n "$project_env_path" ]; then
+        echo ""
+        echo "Detected app env   : ${project_env_path}"
+      else
+        echo ""
+        echo "Detected app env   : not found (checked project root, public/.env, and public/**/.env)"
+      fi
+      return 0
+      ;;
+    install-stack)
+      ensure_managed_guacamole_stack "$managed_guacamole_version"
+      managed_guacamole_secret="$(guacamole_saved_secret)"
+
+      echo ""
+      echo "Managed Apache Guacamole stack is installed."
+      echo "Upstream: ${GUACAMOLE_DEFAULT_UPSTREAM}"
+      echo "JSON secret: ${managed_guacamole_secret}"
+
+      if sync_project_guacamole_env "$app_dir" "$DOMAIN" "$managed_guacamole_secret"; then
+        echo "Updated ${project_env_path:-${app_dir}/.env} with GUACAMOLE_* values."
+        if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME"; then
+          echo "Restarted the PHP container so the new GUACAMOLE_* values take effect."
+        fi
+      else
+        echo "Project .env not found. Set these values manually:"
+        echo "  GUACAMOLE_ENABLED=true"
+        echo "  GUACAMOLE_BASE_URL=https://${DOMAIN}/guacamole"
+        echo "  GUACAMOLE_JSON_SECRET_KEY=${managed_guacamole_secret}"
+        echo "  GUACAMOLE_EMBED_ALLOWED=true"
+      fi
+      return 0
+      ;;
+    enable)
+      prompt new_guacamole_proxy_upstream "Guacamole upstream [${guacamole_proxy_upstream}]: " "${guacamole_proxy_upstream}"
+      new_guacamole_proxy_upstream="$(normalize_guacamole_upstream "$new_guacamole_proxy_upstream")"
+      if ! validate_guacamole_upstream "$new_guacamole_proxy_upstream"; then
+        echo "Invalid Guacamole upstream: ${new_guacamole_proxy_upstream}"
+        echo "Use host:port, for example guacamole-web:8080"
+        exit 1
+      fi
+
+      if [ "$new_guacamole_proxy_upstream" = "$GUACAMOLE_DEFAULT_UPSTREAM" ]; then
+        ensure_managed_guacamole_stack "$managed_guacamole_version"
+        managed_guacamole_secret="$(guacamole_saved_secret)"
+      else
+        managed_guacamole_secret=""
+      fi
+
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$db_name" "$db_user" "$db_password" "$db_root_password" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "yes" "$new_guacamole_proxy_upstream"
+      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
+        write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+      else
+        remove_reverb_proxy_config "$PROJECT_NAME"
+      fi
+
+      ensure_proxy_stack
+      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+      echo ""
+      echo "Guacamole proxy enabled: https://${DOMAIN}/guacamole/"
+      echo "Upstream: ${new_guacamole_proxy_upstream}"
+      if [ "$new_guacamole_proxy_upstream" = "$GUACAMOLE_DEFAULT_UPSTREAM" ] && [ -n "$managed_guacamole_secret" ]; then
+        if sync_project_guacamole_env "$app_dir" "$DOMAIN" "$managed_guacamole_secret"; then
+          echo "Updated ${project_env_path:-${app_dir}/.env} with GUACAMOLE_* values."
+          if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME"; then
+            echo "Restarted the PHP container so the new GUACAMOLE_* values take effect."
+          fi
+        else
+          echo "Project .env not found. Set these values manually:"
+          echo "  GUACAMOLE_ENABLED=true"
+          echo "  GUACAMOLE_BASE_URL=https://${DOMAIN}/guacamole"
+          echo "  GUACAMOLE_JSON_SECRET_KEY=${managed_guacamole_secret}"
+          echo "  GUACAMOLE_EMBED_ALLOWED=true"
+        fi
+      else
+        echo "Update your app .env with the matching Guacamole JSON secret:"
+        echo "  GUACAMOLE_ENABLED=true"
+        echo "  GUACAMOLE_BASE_URL=https://${DOMAIN}/guacamole"
+        echo "  GUACAMOLE_JSON_SECRET_KEY=YOUR_GUACAMOLE_JSON_SECRET_KEY"
+        echo "  GUACAMOLE_EMBED_ALLOWED=true"
+      fi
+      ;;
+    change-upstream)
+      if [ "$guacamole_proxy_enabled" != "yes" ]; then
+        echo "Guacamole proxy is not enabled."
+        exit 1
+      fi
+
+      prompt new_guacamole_proxy_upstream "New Guacamole upstream [${guacamole_proxy_upstream}]: " "${guacamole_proxy_upstream}"
+      new_guacamole_proxy_upstream="$(normalize_guacamole_upstream "$new_guacamole_proxy_upstream")"
+      if ! validate_guacamole_upstream "$new_guacamole_proxy_upstream"; then
+        echo "Invalid Guacamole upstream: ${new_guacamole_proxy_upstream}"
+        echo "Use host:port, for example guacamole-web:8080"
+        exit 1
+      fi
+
+      if [ "$new_guacamole_proxy_upstream" = "$guacamole_proxy_upstream" ]; then
+        echo "No changes detected."
+        exit 0
+      fi
+
+      if [ "$new_guacamole_proxy_upstream" = "$GUACAMOLE_DEFAULT_UPSTREAM" ]; then
+        ensure_managed_guacamole_stack "$managed_guacamole_version"
+        managed_guacamole_secret="$(guacamole_saved_secret)"
+      else
+        managed_guacamole_secret=""
+      fi
+
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$db_name" "$db_user" "$db_password" "$db_root_password" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "yes" "$new_guacamole_proxy_upstream"
+      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
+        write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+      else
+        remove_reverb_proxy_config "$PROJECT_NAME"
+      fi
+
+      ensure_proxy_stack
+      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+      echo "Guacamole upstream updated to ${new_guacamole_proxy_upstream}."
+      if [ "$new_guacamole_proxy_upstream" = "$GUACAMOLE_DEFAULT_UPSTREAM" ] && [ -n "$managed_guacamole_secret" ]; then
+        if sync_project_guacamole_env "$app_dir" "$DOMAIN" "$managed_guacamole_secret"; then
+          echo "Updated ${project_env_path:-${app_dir}/.env} with GUACAMOLE_* values."
+          if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME"; then
+            echo "Restarted the PHP container so the new GUACAMOLE_* values take effect."
+          fi
+        fi
+      else
+        echo "If this upstream uses a different JSON secret, update your app .env manually."
+      fi
+      ;;
+    disable)
+      if [ "$guacamole_proxy_enabled" != "yes" ]; then
+        echo "Guacamole proxy is already disabled."
+        exit 0
+      fi
+
+      write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$db_name" "$db_user" "$db_password" "$db_root_password" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "no" "$guacamole_proxy_upstream"
+      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
+        write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
+      else
+        remove_reverb_proxy_config "$PROJECT_NAME"
+      fi
+
+      ensure_proxy_stack
+      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+
+      if disable_project_guacamole_env "$app_dir"; then
+        echo "Updated ${project_env_path:-${app_dir}/.env}: GUACAMOLE_ENABLED=false"
+        if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME"; then
+          echo "Restarted the PHP container so the Guacamole env change takes effect."
+        fi
+      fi
+
+      echo "Guacamole proxy disabled."
       ;;
     *)
       echo "Invalid option."
@@ -3769,6 +4410,7 @@ menu() {
   echo "13) Modify webmail (Roundcube)"
   echo "14) Manage Reverb"
   echo "15) Reset database passwords"
+  echo "16) Manage Guacamole (stack + proxy)"
   echo ""
   read -r -p "Option: " action
 
@@ -3788,6 +4430,7 @@ menu() {
     13) modify_webmail_roundcube ;;
     14) manage_reverb ;;
     15) reset_database_passwords ;;
+    16) manage_guacamole_proxy ;;
     *) echo "Invalid option."; exit 1 ;;
   esac
 }

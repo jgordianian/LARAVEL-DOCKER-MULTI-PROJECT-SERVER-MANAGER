@@ -63,6 +63,7 @@ The script is interactive and shows a menu.
 - `13) Modify webmail (Roundcube)` - change the current webmail domain list and/or mail host
 - `14) Manage Reverb` - enable/disable Reverb, change its domain/port, and control local/public exposure
 - `15) Reset database passwords` - rotate the project DB user password, MariaDB root password, or both
+- `16) Manage Guacamole (stack + proxy)` - provision the shared Apache Guacamole stack, expose or remove `/guacamole/` on an existing project, and control the upstream host:port
 
 ## Non-interactive commands
 
@@ -282,6 +283,8 @@ Use menu option "Update project". This regenerates:
 
 Then it rebuilds the project containers and restarts the reverse proxy.
 
+If you enabled the Guacamole proxy for the project, the saved `/guacamole/` reverse-proxy settings are preserved when you run `Update project`.
+
 ## Resetting database passwords
 
 Use menu option `15) Reset database passwords` to rotate:
@@ -332,6 +335,75 @@ The script does not install the Laravel Reverb package into your app automatical
 
 If you enable `local` exposure, the TLS certificate is still issued for the Reverb domain, but requests are restricted to localhost at the reverse proxy layer.
 
+## Guacamole (optional)
+
+Menu option `16) Manage Guacamole (stack + proxy)` manages Apache Guacamole for an existing project.
+
+If you keep the default upstream `guacamole-web:8080`, the script can provision and maintain a shared Guacamole stack for you in:
+
+- `/opt/apache-guacamole`
+
+The managed stack includes:
+
+- `guacd`
+- `guacamole-web`
+- the shared Docker network attachment to `laravel-shared`
+- a generated JSON auth secret saved in `/opt/apache-guacamole/.guacamole-meta`
+
+When you use the managed stack, the script will:
+
+- create or update the shared Apache Guacamole containers
+- store the Guacamole proxy settings in the project's `.project-meta`
+- regenerate the project vhost with a `/guacamole/` reverse-proxy block
+- preserve that block when you later run `6) Update project`
+- update the project's `.env` with `GUACAMOLE_*` values when the file exists
+- clear Laravel config cache and restart the project's PHP container after `.env` changes when possible
+- restart only the shared reverse proxy stack after proxy changes
+
+Available actions in menu option `16`:
+
+- `status`
+- `install-stack`
+- `enable`
+- `change-upstream`
+- `disable`
+
+Typical flow:
+
+- run menu option `16`
+- choose `enable`
+- keep the default upstream `guacamole-web:8080`
+- let the script provision the shared Guacamole stack
+- use the generated `/guacamole/` URL from the selected project domain
+
+Recommended URL for apps:
+
+- `https://your-project-domain/guacamole`
+
+If the project has an `.env`, the script will try to write:
+
+```ini
+GUACAMOLE_ENABLED=true
+GUACAMOLE_BASE_URL=https://your-project-domain/guacamole
+GUACAMOLE_JSON_SECRET_KEY=<generated-by-manager>
+GUACAMOLE_EMBED_ALLOWED=true
+```
+
+The manager looks for the app env file in this order:
+
+- `/var/www/projects/<project>/.env`
+- `/var/www/projects/<project>/public/.env`
+- the first `.env` found recursively under `/var/www/projects/<project>/public/`
+
+If you use a custom upstream instead of the managed stack, the script can still proxy `/guacamole/`, but you must supply the matching `GUACAMOLE_JSON_SECRET_KEY` to your app yourself.
+
+Notes:
+
+- The default upstream assumes the managed Guacamole web container hostname `guacamole-web` and port `8080`.
+- The generated vhost resolves the Guacamole upstream through Docker DNS at request time. If the Guacamole container is down or the hostname is wrong, `/guacamole/` should return `502 Bad Gateway` without taking the whole reverse proxy offline.
+- Your Guacamole web container must be attached to the shared Docker network `laravel-shared` for the reverse proxy to reach it by container hostname.
+- If you disable the proxy, the saved upstream is kept in `.project-meta` so you can re-enable it later without retyping the host.
+
 ## Deleting a project
 
 Use menu option "Delete existing project". The script removes:
@@ -353,6 +425,9 @@ It attempts a "final backup" first; if the DB container does not exist, it will 
   - `/opt/laravel-reverse-proxy/certbot/conf/` (Lets Encrypt data)
   - `/opt/laravel-reverse-proxy/certbot/www/` (ACME webroot)
   - `/opt/laravel-reverse-proxy/projects/` (symlinks to project dirs)
+- Apache Guacamole stack:
+  - `/opt/apache-guacamole/compose.yaml`
+  - `/opt/apache-guacamole/.guacamole-meta`
 - Projects:
   - `/var/www/projects/<project>/`
   - `/var/www/projects/<project>/public/` (web root)
