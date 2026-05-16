@@ -1146,7 +1146,10 @@ RUN echo "opcache.enable=1" >> /usr/local/etc/php/conf.d/opcache.ini \
  && echo "opcache.revalidate_freq=0" >> /usr/local/etc/php/conf.d/opcache.ini \
  && echo "opcache.fast_shutdown=1" >> /usr/local/etc/php/conf.d/opcache.ini \
  && echo "upload_max_filesize=5120M" >> /usr/local/etc/php/conf.d/uploads.ini \
- && echo "post_max_size=5120M" >> /usr/local/etc/php/conf.d/uploads.ini
+ && echo "post_max_size=5120M" >> /usr/local/etc/php/conf.d/uploads.ini \
+ && echo "max_execution_time=600" >> /usr/local/etc/php/conf.d/uploads.ini \
+ && echo "max_input_time=600" >> /usr/local/etc/php/conf.d/uploads.ini \
+ && echo "memory_limit=1024M" >> /usr/local/etc/php/conf.d/uploads.ini
 
 RUN echo "pm = dynamic" >> /usr/local/etc/php-fpm.d/www.conf \
  && echo "pm.max_children=${PHP_FPM_CHILDREN}" >> /usr/local/etc/php-fpm.d/www.conf \
@@ -1301,7 +1304,7 @@ server {
     listen 80;
     server_name ${domain};
 
-    client_max_body_size 100M;
+    client_max_body_size 5G;
 
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
@@ -1366,6 +1369,8 @@ ${guacamole_proxy_block}    location / {
         fastcgi_param SCRIPT_NAME \$fastcgi_script_name;
         fastcgi_param DOCUMENT_ROOT ${docroot};
         fastcgi_param PATH_INFO \$fastcgi_path_info;
+        fastcgi_read_timeout 600s;
+        fastcgi_send_timeout 600s;
     }
 
     location ~ /\.ht {
@@ -1432,7 +1437,7 @@ server {
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
 
-    client_max_body_size 100M;
+    client_max_body_size 5G;
 
 ${guacamole_proxy_block}    location /ws/ {
         proxy_pass http://${node_container}:3533;
@@ -1509,6 +1514,8 @@ ${guacamole_proxy_block}    location / {
         fastcgi_param SCRIPT_NAME \$fastcgi_script_name;
         fastcgi_param DOCUMENT_ROOT ${docroot};
         fastcgi_param PATH_INFO \$fastcgi_path_info;
+        fastcgi_read_timeout 600s;
+        fastcgi_send_timeout 600s;
     }
 
     location ~ /\.ht {
@@ -1571,7 +1578,7 @@ server {
     ssl_certificate /etc/letsencrypt/live/${reverb_domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${reverb_domain}/privkey.pem;
 
-    client_max_body_size 20M;
+    client_max_body_size 5G;
 
     location / {
 ${access_block}        proxy_pass http://${php_container}:${reverb_port};
@@ -1918,7 +1925,7 @@ server {
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
 
-    client_max_body_size 50M;
+    client_max_body_size 5G;
 
     location / {
         proxy_pass http://${upstream_name}:80;

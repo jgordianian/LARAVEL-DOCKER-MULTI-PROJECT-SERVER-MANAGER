@@ -16,7 +16,7 @@ It creates one shared reverse proxy stack in `/opt/laravel-reverse-proxy` and on
   - Redis container: `<project>-redis`
   - or Node container for `node` profile projects: `<project>-node`
 - Composer, Node.js, and npm available inside each PHP container
-- Default PHP upload limit set to 5 GB, with matching project Nginx body size
+- Default PHP upload limit set to 5 GB, with matching Nginx body size and 600-second PHP/FastCGI upload timeouts
 - PHP extensions enabled in the image (high-level): `curl`, `pdo_mysql`, `mysqli`, `opcache`, `zip`, `mbstring`, `redis`, `gd`, `intl`, `bcmath`, `exif`, `pcntl`
 - Project profiles for Laravel, generic PHP, ThinkPHP/FastAdmin apps, and Node games/apps
 - Nginx virtual hosts per project (one file per project)
