@@ -64,6 +64,7 @@ The script is interactive and shows a menu.
 - `14) Manage Reverb` - enable/disable Reverb, change its domain/port, and control local/public exposure
 - `15) Reset database passwords` - rotate the project DB user password, MariaDB root password, or both
 - `16) Manage Guacamole (stack + proxy)` - provision the shared Apache Guacamole stack, expose or remove `/guacamole/` on an existing project, and control the upstream host:port
+- `17) Manage VNC Server (TigerVNC)` - install and control a managed TigerVNC server on the Ubuntu host
 
 ## Non-interactive commands
 
@@ -71,6 +72,8 @@ The script is interactive and shows a menu.
   - `sudo /root/laravel-server-manager.sh backup-all`
 - (Re)install cron jobs:
   - `sudo /root/laravel-server-manager.sh setup-cron`
+- Open the VNC manager directly:
+  - `sudo /root/laravel-server-manager.sh manage-vnc`
 
 ## Domain handling (important)
 
@@ -403,6 +406,62 @@ Notes:
 - The generated vhost resolves the Guacamole upstream through Docker DNS at request time. If the Guacamole container is down or the hostname is wrong, `/guacamole/` should return `502 Bad Gateway` without taking the whole reverse proxy offline.
 - Your Guacamole web container must be attached to the shared Docker network `laravel-shared` for the reverse proxy to reach it by container hostname.
 - If you disable the proxy, the saved upstream is kept in `.project-meta` so you can re-enable it later without retyping the host.
+
+## Managed VNC Server (optional)
+
+Menu option `17) Manage VNC Server (TigerVNC)` installs and controls a VNC server on the Ubuntu host.
+
+This is a VNC **server** target, not a VNC viewer. Apache Guacamole provides the browser viewer. The managed VNC server gives Guacamole something to connect to when you want a VNC desktop on the server itself.
+
+The installer uses Ubuntu packages:
+
+- `tigervnc-standalone-server`
+- `tigervnc-common`
+- `xfce4`
+- `xfce4-goodies`
+- `dbus-x11`
+- `xterm`
+
+The manager creates:
+
+- a Linux user for the VNC desktop, default `servicedesk-vnc`
+- `~/.vnc/passwd` for that user's VNC password
+- `~/.vnc/xstartup` to launch XFCE
+- `/etc/systemd/system/servicedesk-vnc.service`
+- `/opt/managed-vnc-server/.vnc-meta`
+
+Available actions:
+
+- `status`
+- `install`
+- `start`
+- `stop`
+- `restart`
+- `remove`
+
+Typical values:
+
+- Display: `:1`
+- Port: `5901`
+- Geometry: `1366x768`
+- Color depth: `24`
+- Listen scope: `network` if Guacamole/guacd must reach it from Docker; `localhost` if you only use SSH tunneling or local access.
+
+Use these values in Guacamole:
+
+```text
+Protocol: VNC
+Host: server IP address or Docker host gateway
+Port: 5901
+Username: leave blank
+Password: the VNC password configured during install
+```
+
+Security notes:
+
+- VNC password authentication is not a substitute for network access control.
+- If you choose `network` listen scope, restrict access to the VNC port with your firewall/security group.
+- Do not expose VNC ports directly to the public internet unless you have a separate hardened access layer.
 
 ## Deleting a project
 

@@ -25,6 +25,13 @@ GUACAMOLE_DEFAULT_UPSTREAM="guacamole-web:8080"
 GUACAMOLE_DEFAULT_VERSION="1.6.0"
 GUACAMOLE_WEB_CONTAINER_NAME="guacamole-web"
 GUACAMOLE_GUACD_CONTAINER_NAME="guacd"
+VNC_BASE="/opt/managed-vnc-server"
+VNC_META_FILE="${VNC_BASE}/.vnc-meta"
+VNC_SERVICE_NAME="servicedesk-vnc"
+VNC_DEFAULT_USER="servicedesk-vnc"
+VNC_DEFAULT_DISPLAY="1"
+VNC_DEFAULT_GEOMETRY="1366x768"
+VNC_DEFAULT_DEPTH="24"
 PMA_UPLOAD_LIMIT="5G"
 PMA_MEMORY_LIMIT="1G"
 PMA_MAX_EXECUTION_TIME="0"
@@ -4399,6 +4406,297 @@ manage_guacamole_proxy() {
   esac
 }
 
+vnc_port_for_display() {
+  local display="${1:-$VNC_DEFAULT_DISPLAY}"
+  echo $((5900 + display))
+}
+
+validate_vnc_display() {
+  local display="${1:-}"
+  [[ "$display" =~ ^[0-9]+$ ]] || return 1
+  [ "$display" -ge 1 ] && [ "$display" -le 99 ]
+}
+
+validate_vnc_geometry() {
+  local geometry="${1:-}"
+  [[ "$geometry" =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]]
+}
+
+vnc_saved_value() {
+  local key="$1"
+  [ -f "$VNC_META_FILE" ] || return 0
+  (
+    # shellcheck disable=SC1090
+    # shellcheck disable=SC1091
+    source "$VNC_META_FILE"
+    printf '%s' "${!key:-}"
+  )
+}
+
+write_vnc_meta() {
+  local vnc_user="$1"
+  local display="$2"
+  local geometry="$3"
+  local depth="$4"
+  local listen_scope="$5"
+
+  mkdir -p "$VNC_BASE"
+  {
+    printf 'VNC_USER=%q\n' "$vnc_user"
+    printf 'VNC_DISPLAY=%q\n' "$display"
+    printf 'VNC_PORT=%q\n' "$(vnc_port_for_display "$display")"
+    printf 'VNC_GEOMETRY=%q\n' "$geometry"
+    printf 'VNC_DEPTH=%q\n' "$depth"
+    printf 'VNC_LISTEN_SCOPE=%q\n' "$listen_scope"
+    printf 'VNC_SERVICE_NAME=%q\n' "$VNC_SERVICE_NAME"
+  } > "$VNC_META_FILE"
+}
+
+ensure_vnc_user() {
+  local vnc_user="$1"
+
+  if id "$vnc_user" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  useradd --create-home --shell /bin/bash "$vnc_user"
+}
+
+write_vnc_password() {
+  local vnc_user="$1"
+  local vnc_password="$2"
+  local home_dir
+
+  home_dir="$(getent passwd "$vnc_user" | cut -d: -f6)"
+  require_nonempty "VNC user home" "$home_dir"
+
+  install -d -m 700 -o "$vnc_user" -g "$vnc_user" "${home_dir}/.vnc"
+  printf '%s\n' "$vnc_password" | vncpasswd -f > "${home_dir}/.vnc/passwd"
+  chown "$vnc_user:$vnc_user" "${home_dir}/.vnc/passwd"
+  chmod 600 "${home_dir}/.vnc/passwd"
+}
+
+write_vnc_xstartup() {
+  local vnc_user="$1"
+  local home_dir
+
+  home_dir="$(getent passwd "$vnc_user" | cut -d: -f6)"
+  require_nonempty "VNC user home" "$home_dir"
+
+  install -d -m 700 -o "$vnc_user" -g "$vnc_user" "${home_dir}/.vnc"
+  cat > "${home_dir}/.vnc/xstartup" <<'EOF'
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+exec startxfce4
+EOF
+  chown "$vnc_user:$vnc_user" "${home_dir}/.vnc/xstartup"
+  chmod 755 "${home_dir}/.vnc/xstartup"
+}
+
+write_vnc_systemd_service() {
+  local vnc_user="$1"
+  local display="$2"
+  local geometry="$3"
+  local depth="$4"
+  local listen_scope="$5"
+  local localhost_arg="-localhost yes"
+
+  if [ "$listen_scope" = "network" ]; then
+    localhost_arg="-localhost no"
+  fi
+
+  cat > "/etc/systemd/system/${VNC_SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Managed TigerVNC server for Guacamole
+After=network.target
+
+[Service]
+Type=simple
+User=${vnc_user}
+PAMName=login
+ExecStartPre=-/usr/bin/vncserver -kill :${display}
+ExecStart=/usr/bin/vncserver :${display} -fg ${localhost_arg} -geometry ${geometry} -depth ${depth}
+ExecStop=/usr/bin/vncserver -kill :${display}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_managed_vnc_server() {
+  local vnc_user="$1"
+  local display="$2"
+  local geometry="$3"
+  local depth="$4"
+  local listen_scope="$5"
+  local vnc_password="$6"
+
+  install_base
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    tigervnc-standalone-server \
+    tigervnc-common \
+    xfce4 \
+    xfce4-goodies \
+    dbus-x11 \
+    xterm
+
+  ensure_vnc_user "$vnc_user"
+  write_vnc_password "$vnc_user" "$vnc_password"
+  write_vnc_xstartup "$vnc_user"
+  write_vnc_systemd_service "$vnc_user" "$display" "$geometry" "$depth" "$listen_scope"
+  write_vnc_meta "$vnc_user" "$display" "$geometry" "$depth" "$listen_scope"
+
+  systemctl daemon-reload
+  systemctl enable --now "${VNC_SERVICE_NAME}.service"
+}
+
+manage_vnc_server() {
+  local action saved_user saved_display saved_geometry saved_depth saved_scope
+  local vnc_user display geometry depth listen_scope vnc_password confirm port bind_hint
+
+  saved_user="$(vnc_saved_value VNC_USER)"
+  saved_display="$(vnc_saved_value VNC_DISPLAY)"
+  saved_geometry="$(vnc_saved_value VNC_GEOMETRY)"
+  saved_depth="$(vnc_saved_value VNC_DEPTH)"
+  saved_scope="$(vnc_saved_value VNC_LISTEN_SCOPE)"
+
+  saved_user="${saved_user:-$VNC_DEFAULT_USER}"
+  saved_display="${saved_display:-$VNC_DEFAULT_DISPLAY}"
+  saved_geometry="${saved_geometry:-$VNC_DEFAULT_GEOMETRY}"
+  saved_depth="${saved_depth:-$VNC_DEFAULT_DEPTH}"
+  saved_scope="${saved_scope:-network}"
+
+  echo ""
+  echo "Managed VNC Server"
+  echo "Service       : ${VNC_SERVICE_NAME}.service"
+  echo "Meta file     : ${VNC_META_FILE}"
+  echo "Saved user    : ${saved_user}"
+  echo "Saved display : :${saved_display} (port $(vnc_port_for_display "$saved_display"))"
+  echo "Saved geometry: ${saved_geometry}"
+  echo "Saved scope   : ${saved_scope}"
+  echo ""
+  echo "Guacamole provides the browser viewer. This installs a VNC server"
+  echo "on the Ubuntu host so Guacamole can connect to it by host and port."
+  echo ""
+
+  prompt action "Action [status/install/start/stop/restart/remove]: " "status"
+
+  case "${action,,}" in
+    status)
+      echo ""
+      systemctl status "${VNC_SERVICE_NAME}.service" --no-pager || true
+      echo ""
+      if [ -f "$VNC_META_FILE" ]; then
+        echo "Connection values for Guacamole:"
+        echo "  Protocol: VNC"
+        echo "  Host    : <this-server-ip-or-docker-host-gateway>"
+        echo "  Port    : $(vnc_port_for_display "$saved_display")"
+        echo "  Username: leave blank"
+        echo "  Password: the VNC password configured during install"
+      else
+        echo "Managed VNC server is not installed yet."
+      fi
+      ;;
+    install)
+      prompt vnc_user "Linux user for VNC session [${saved_user}]: " "$saved_user"
+      if ! [[ "$vnc_user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
+        echo "Invalid Linux user name: ${vnc_user}"
+        exit 1
+      fi
+
+      prompt display "VNC display number [${saved_display}]: " "$saved_display"
+      if ! validate_vnc_display "$display"; then
+        echo "Invalid VNC display. Use a number from 1 to 99."
+        exit 1
+      fi
+
+      prompt geometry "Desktop geometry [${saved_geometry}]: " "$saved_geometry"
+      if ! validate_vnc_geometry "$geometry"; then
+        echo "Invalid geometry. Use WIDTHxHEIGHT, for example 1366x768."
+        exit 1
+      fi
+
+      prompt depth "Color depth [${saved_depth}]: " "$saved_depth"
+      if ! [[ "$depth" =~ ^(16|24|32)$ ]]; then
+        echo "Invalid color depth. Use 16, 24, or 32."
+        exit 1
+      fi
+
+      prompt listen_scope "Listen scope [network/localhost] [${saved_scope}]: " "$saved_scope"
+      listen_scope="${listen_scope,,}"
+      case "$listen_scope" in
+        network|localhost) ;;
+        *) echo "Invalid listen scope. Use network or localhost."; exit 1 ;;
+      esac
+
+      prompt_secret vnc_password "VNC password: "
+      if [ "${#vnc_password}" -lt 6 ]; then
+        echo "VNC password must be at least 6 characters."
+        exit 1
+      fi
+
+      port="$(vnc_port_for_display "$display")"
+      if tcp_port_in_use "$port"; then
+        prompt confirm "Port ${port} appears to be in use. Continue and let vncserver decide? (yes/no): " "no"
+        if [ "${confirm,,}" != "yes" ]; then
+          exit 1
+        fi
+      fi
+
+      install_managed_vnc_server "$vnc_user" "$display" "$geometry" "$depth" "$listen_scope" "$vnc_password"
+
+      bind_hint="localhost only"
+      if [ "$listen_scope" = "network" ]; then
+        bind_hint="network reachable"
+      fi
+
+      echo ""
+      echo "Managed VNC server installed and started."
+      echo "Service : ${VNC_SERVICE_NAME}.service"
+      echo "Display : :${display}"
+      echo "Port    : ${port}"
+      echo "Scope   : ${bind_hint}"
+      echo ""
+      echo "Use these values in Guacamole:"
+      echo "  Protocol: VNC"
+      echo "  Host    : server IP address or Docker host gateway"
+      echo "  Port    : ${port}"
+      echo "  Password: the password entered above"
+      ;;
+    start)
+      systemctl start "${VNC_SERVICE_NAME}.service"
+      echo "Managed VNC server started."
+      ;;
+    stop)
+      systemctl stop "${VNC_SERVICE_NAME}.service"
+      echo "Managed VNC server stopped."
+      ;;
+    restart)
+      systemctl restart "${VNC_SERVICE_NAME}.service"
+      echo "Managed VNC server restarted."
+      ;;
+    remove)
+      prompt confirm "Stop and remove managed VNC service metadata? Packages are kept installed. (yes/no): " "no"
+      if [ "${confirm,,}" != "yes" ]; then
+        exit 0
+      fi
+      systemctl disable --now "${VNC_SERVICE_NAME}.service" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/${VNC_SERVICE_NAME}.service"
+      systemctl daemon-reload
+      rm -f "$VNC_META_FILE"
+      echo "Managed VNC service removed. Installed packages and Linux user were left in place."
+      ;;
+    *)
+      echo "Invalid option."
+      exit 1
+      ;;
+  esac
+}
+
 menu() {
   echo ""
   echo "Select an option:"
@@ -4418,6 +4716,7 @@ menu() {
   echo "14) Manage Reverb"
   echo "15) Reset database passwords"
   echo "16) Manage Guacamole (stack + proxy)"
+  echo "17) Manage VNC Server (TigerVNC)"
   echo ""
   read -r -p "Option: " action
 
@@ -4438,6 +4737,7 @@ menu() {
     14) manage_reverb ;;
     15) reset_database_passwords ;;
     16) manage_guacamole_proxy ;;
+    17) manage_vnc_server ;;
     *) echo "Invalid option."; exit 1 ;;
   esac
 }
@@ -4452,6 +4752,12 @@ fi
 if [ "${1:-}" = "setup-cron" ]; then
   ensure_cron_jobs
   echo "Cron jobs installed/updated."
+  exit 0
+fi
+
+if [ "${1:-}" = "manage-vnc" ]; then
+  banner
+  manage_vnc_server
   exit 0
 fi
 
