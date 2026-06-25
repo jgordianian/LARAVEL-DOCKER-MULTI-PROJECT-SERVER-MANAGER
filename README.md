@@ -65,6 +65,9 @@ The script is interactive and shows a menu.
 - `15) Reset database passwords` - rotate the project DB user password, MariaDB root password, or both
 - `16) Manage Guacamole (stack + proxy)` - provision the shared Apache Guacamole stack, expose or remove `/guacamole/` on an existing project, and control the upstream host:port
 - `17) Manage VNC Server (TigerVNC)` - install and control a managed TigerVNC server on the Ubuntu host
+- `18) Backup settings` - configure per-project backup retention days
+- `19) Manage project UFW` - configure project-specific UFW rules for direct project ports
+- `20) Project access settings` - restrict normal project website access by IP/CIDR in Nginx
 
 ## Non-interactive commands
 
@@ -244,6 +247,60 @@ If you choose to expose phpMyAdmin publicly, restrict it with a firewall (exampl
 - Or close it again:
   - `sudo ufw delete allow from YOUR_PUBLIC_IP to any port <port> proto tcp`
 
+## Project UFW settings
+
+Use menu option `19) Manage project UFW` to manage firewall rules tied to a specific project.
+
+Normal websites are published through the shared reverse proxy on ports `80` and `443`, so UFW cannot allow or deny individual project domains separately at the firewall layer. Per-project UFW settings apply to direct project ports. Currently, the script manages the project's phpMyAdmin port.
+
+Available actions:
+
+- `status` - show the project phpMyAdmin bind/port, saved UFW settings, and matching UFW rules
+- `restrict-phpmyadmin` - allow only specific IP/CIDR sources to the project's phpMyAdmin port and deny other traffic to that port
+- `clear-phpmyadmin-rules` - remove the saved phpMyAdmin UFW rules for that project
+- `show-ufw` - show the full numbered UFW ruleset
+
+The source list accepts comma-separated IPv4/IPv6 addresses or CIDR ranges, for example:
+
+- `203.0.113.10`
+- `203.0.113.0/24`
+- `2001:db8::10/128`
+
+The settings are saved in the project's `.project-meta` file:
+
+- `UFW_PMA_ALLOWED_SOURCES`
+- `UFW_PMA_RESTRICTED`
+- `UFW_PMA_PORT`
+
+If phpMyAdmin is still bound to `127.0.0.1`, UFW rules can be saved but they will not make phpMyAdmin publicly reachable. Use menu option `8) Manage phpMyAdmin` to change phpMyAdmin exposure when public access is really needed.
+
+If UFW is missing, the menu installs it. It does not enable UFW automatically. If UFW is inactive, the rules can be created and saved, but they are not enforced until UFW is enabled. Before enabling UFW on a remote server, make sure SSH access is allowed.
+
+## Project access settings
+
+Use menu option `20) Project access settings` to restrict a normal project website by source IP/CIDR.
+
+This is implemented in the project's Nginx vhost, not UFW. It works for individual project domains even though all projects share ports `80` and `443` through the reverse proxy.
+
+Available actions:
+
+- `status` - show whether the project is public or restricted
+- `restrict` - allow only specific IP/CIDR sources to the project website
+- `clear` - remove the project access restriction and make the project public again
+
+The source list accepts comma-separated IPv4/IPv6 addresses or CIDR ranges, for example:
+
+- `203.0.113.10`
+- `203.0.113.0/24`
+- `2001:db8::10/128`
+
+The settings are saved in the project's `.project-meta` file:
+
+- `PROJECT_ACCESS_ALLOWED_SOURCES`
+- `PROJECT_ACCESS_RESTRICTED`
+
+When you apply or clear the setting, the script regenerates that project's Nginx vhost and restarts the shared reverse proxy. Lets Encrypt ACME challenge paths remain public so certificate issuance and renewal can still work.
+
 ## Backups
 
 Backups are stored under:
@@ -255,6 +312,20 @@ Backups include:
 - A database dump (when the DB container exists)
 - Project files (excluding common heavy folders like `vendor` and `node_modules`)
 - A copy of `.project-meta`
+
+### Backup retention
+
+By default, each project keeps backup archives for 14 days.
+
+Use menu option `18) Backup settings` to change retention for a specific project:
+
+1. Select `18) Backup settings`
+2. Enter the project short name
+3. Enter the number of days to keep, for example `60`
+
+The value must be a whole number from `1` to `3650`. It is saved as `BACKUP_RETENTION_DAYS` in the project's `.project-meta` file, so it survives project updates and other configuration regeneration.
+
+Retention is applied whenever that project's next backup runs. To prune old files immediately after changing the setting, run a manual backup for that project.
 
 ### Run backups manually
 
@@ -490,7 +561,7 @@ It attempts a "final backup" first; if the DB container does not exist, it will 
 - Projects:
   - `/var/www/projects/<project>/`
   - `/var/www/projects/<project>/public/` (web root)
-  - `/var/www/projects/<project>/.project-meta` (stored variables for update/backup/restore)
+  - `/var/www/projects/<project>/.project-meta` (stored variables for update/backup/restore, including `BACKUP_RETENTION_DAYS`, project UFW settings, and project access settings)
 - Backups:
   - `/var/backups/laravel-projects/`
 

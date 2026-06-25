@@ -9,6 +9,7 @@ PROXY_CERTBOT_WWW="${PROXY_BASE}/certbot/www"
 PROXY_PROJECTS_DIR="${PROXY_BASE}/projects"
 PROJECTS_BASE="/var/www/projects"
 BACKUPS_BASE="/var/backups/laravel-projects"
+DEFAULT_BACKUP_RETENTION_DAYS="14"
 SHARED_NETWORK="laravel-shared"
 PROXY_COMPOSE="${PROXY_BASE}/docker-compose.yml"
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -62,6 +63,12 @@ GUACAMOLE_PROXY_UPSTREAM=""
 GUACAMOLE_STACK_VERSION=""
 GUACAMOLE_JSON_SECRET_KEY=""
 APP_PROFILE=""
+BACKUP_RETENTION_DAYS=""
+UFW_PMA_ALLOWED_SOURCES=""
+UFW_PMA_RESTRICTED=""
+UFW_PMA_PORT=""
+PROJECT_ACCESS_ALLOWED_SOURCES=""
+PROJECT_ACCESS_RESTRICTED=""
 
 banner() {
   echo "=============================================================="
@@ -134,6 +141,332 @@ validate_port_number() {
   local port="${1:-}"
   [[ "$port" =~ ^[0-9]+$ ]] || return 1
   [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+validate_backup_retention_days() {
+  local days="${1:-}"
+  [[ "$days" =~ ^[0-9]+$ ]] || return 1
+  [ "$days" -ge 1 ] && [ "$days" -le 3650 ]
+}
+
+trim_whitespace() {
+  local value="${1:-}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+validate_ipv4_cidr() {
+  local value="${1:-}"
+  local ip="${value%/*}"
+  local cidr=""
+  local octet
+  local -a octets=()
+
+  if [[ "$value" == */* ]]; then
+    cidr="${value#*/}"
+    [[ "$cidr" =~ ^[0-9]+$ ]] || return 1
+    [ "$cidr" -ge 0 ] && [ "$cidr" -le 32 ] || return 1
+  fi
+
+  [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+  IFS='.' read -r -a octets <<< "$ip"
+  [ "${#octets[@]}" -eq 4 ] || return 1
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+    [ "$octet" -ge 0 ] && [ "$octet" -le 255 ] || return 1
+  done
+}
+
+validate_ipv6_cidr() {
+  local value="${1:-}"
+  local ip="${value%/*}"
+  local cidr=""
+
+  if [[ "$value" != *:* ]]; then
+    return 1
+  fi
+
+  if [[ "$value" == */* ]]; then
+    cidr="${value#*/}"
+    [[ "$cidr" =~ ^[0-9]+$ ]] || return 1
+    [ "$cidr" -ge 0 ] && [ "$cidr" -le 128 ] || return 1
+  fi
+
+  [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]]
+}
+
+validate_ufw_source() {
+  local source="${1:-}"
+  [ -n "$source" ] || return 1
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$source" <<'PY'
+import ipaddress
+import sys
+
+value = sys.argv[1]
+try:
+    if "/" in value:
+        ipaddress.ip_network(value, strict=False)
+    else:
+        ipaddress.ip_address(value)
+except ValueError:
+    sys.exit(1)
+PY
+    return $?
+  fi
+
+  validate_ipv4_cidr "$source"
+}
+
+normalize_ufw_sources_csv() {
+  local input="${1:-}"
+  local part source result=""
+  local -A seen=()
+  local -a parts=()
+
+  IFS=',' read -r -a parts <<< "$input"
+  for part in "${parts[@]}"; do
+    source="$(trim_whitespace "$part")"
+    [ -n "$source" ] || continue
+    if ! validate_ufw_source "$source"; then
+      return 1
+    fi
+    if [ -z "${seen[$source]+x}" ]; then
+      seen[$source]=1
+      result="${result:+${result},}${source}"
+    fi
+  done
+
+  [ -n "$result" ] || return 1
+  echo "$result"
+}
+
+read_project_backup_retention_days() {
+  local app_dir="$1"
+  local meta_file="${app_dir}/.project-meta"
+  local configured_days=""
+
+  if [ -f "$meta_file" ]; then
+    configured_days="$(
+      BACKUP_RETENTION_DAYS=""
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "$meta_file" >/dev/null 2>&1 || true
+      printf '%s' "${BACKUP_RETENTION_DAYS:-}"
+    )"
+  fi
+
+  if validate_backup_retention_days "$configured_days"; then
+    echo "$configured_days"
+  else
+    echo "$DEFAULT_BACKUP_RETENTION_DAYS"
+  fi
+}
+
+prune_project_backups() {
+  local project_name="$1"
+  local retention_days="$2"
+  local backup_dir="${BACKUPS_BASE}/${project_name}"
+
+  if ! validate_backup_retention_days "$retention_days"; then
+    retention_days="$DEFAULT_BACKUP_RETENTION_DAYS"
+  fi
+
+  [ -d "$backup_dir" ] || return 0
+  find "$backup_dir" -type f -name "*.tar.gz" -mtime +"$retention_days" -delete || true
+}
+
+read_project_ufw_pma_allowed_sources() {
+  local app_dir="$1"
+  local meta_file="${app_dir}/.project-meta"
+  local configured_sources=""
+
+  if [ -f "$meta_file" ]; then
+    configured_sources="$(
+      UFW_PMA_ALLOWED_SOURCES=""
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "$meta_file" >/dev/null 2>&1 || true
+      printf '%s' "${UFW_PMA_ALLOWED_SOURCES:-}"
+    )"
+  fi
+
+  normalize_ufw_sources_csv "$configured_sources" 2>/dev/null || true
+}
+
+read_project_ufw_pma_restricted() {
+  local app_dir="$1"
+  local meta_file="${app_dir}/.project-meta"
+  local restricted=""
+
+  if [ -f "$meta_file" ]; then
+    restricted="$(
+      UFW_PMA_RESTRICTED=""
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "$meta_file" >/dev/null 2>&1 || true
+      printf '%s' "${UFW_PMA_RESTRICTED:-}"
+    )"
+  fi
+
+  if [ "${restricted,,}" = "yes" ]; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+read_project_ufw_pma_port() {
+  local app_dir="$1"
+  local fallback_port="${2:-}"
+  local meta_file="${app_dir}/.project-meta"
+  local saved_port=""
+
+  if [ -f "$meta_file" ]; then
+    saved_port="$(
+      UFW_PMA_PORT=""
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "$meta_file" >/dev/null 2>&1 || true
+      printf '%s' "${UFW_PMA_PORT:-}"
+    )"
+  fi
+
+  if validate_port_number "$saved_port"; then
+    echo "$saved_port"
+  elif validate_port_number "$fallback_port"; then
+    echo "$fallback_port"
+  fi
+}
+
+read_project_access_allowed_sources() {
+  local app_dir="$1"
+  local meta_file="${app_dir}/.project-meta"
+  local configured_sources=""
+
+  if [ -f "$meta_file" ]; then
+    configured_sources="$(
+      PROJECT_ACCESS_ALLOWED_SOURCES=""
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "$meta_file" >/dev/null 2>&1 || true
+      printf '%s' "${PROJECT_ACCESS_ALLOWED_SOURCES:-}"
+    )"
+  fi
+
+  normalize_ufw_sources_csv "$configured_sources" 2>/dev/null || true
+}
+
+read_project_access_restricted() {
+  local app_dir="$1"
+  local meta_file="${app_dir}/.project-meta"
+  local restricted=""
+
+  if [ -f "$meta_file" ]; then
+    restricted="$(
+      PROJECT_ACCESS_RESTRICTED=""
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "$meta_file" >/dev/null 2>&1 || true
+      printf '%s' "${PROJECT_ACCESS_RESTRICTED:-}"
+    )"
+  fi
+
+  if [ "${restricted,,}" = "yes" ]; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+build_nginx_access_block() {
+  local allowed_sources="${1:-}"
+  local restricted="${2:-no}"
+  local indent="${3:-        }"
+  local normalized_sources source
+  local -a sources=()
+
+  [ "$restricted" = "yes" ] || return 0
+  normalized_sources="$(normalize_ufw_sources_csv "$allowed_sources" 2>/dev/null)" || return 0
+
+  IFS=',' read -r -a sources <<< "$normalized_sources"
+  for source in "${sources[@]}"; do
+    source="$(trim_whitespace "$source")"
+    [ -n "$source" ] || continue
+    printf '%sallow %s;\n' "$indent" "$source"
+  done
+  printf '%sdeny all;\n' "$indent"
+}
+
+ensure_ufw_available() {
+  if command -v ufw >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "Installing UFW..."
+  apt-get update -y
+  apt-get install -y ufw
+
+  if ! command -v ufw >/dev/null 2>&1; then
+    echo "Failed to install UFW."
+    return 1
+  fi
+}
+
+delete_ufw_pma_rules() {
+  local port="$1"
+  local allowed_sources="${2:-}"
+  local restricted="${3:-no}"
+  local source
+  local -a sources=()
+
+  validate_port_number "$port" || return 0
+
+  if [ -n "$allowed_sources" ]; then
+    IFS=',' read -r -a sources <<< "$allowed_sources"
+    for source in "${sources[@]}"; do
+      source="$(trim_whitespace "$source")"
+      [ -n "$source" ] || continue
+      ufw --force delete allow proto tcp from "$source" to any port "$port" >/dev/null 2>&1 || true
+      ufw --force delete allow from "$source" to any port "$port" proto tcp >/dev/null 2>&1 || true
+    done
+  fi
+
+  if [ "$restricted" = "yes" ]; then
+    ufw --force delete deny "${port}/tcp" >/dev/null 2>&1 || true
+    ufw --force delete deny proto tcp from any to any port "$port" >/dev/null 2>&1 || true
+  fi
+}
+
+apply_ufw_pma_rules() {
+  local project_name="$1"
+  local new_port="$2"
+  local old_port="$3"
+  local old_sources="$4"
+  local new_sources="$5"
+  local was_restricted="$6"
+  local source
+  local allow_comment="laravel-manager:${project_name}:phpmyadmin"
+  local deny_comment="laravel-manager:${project_name}:phpmyadmin-deny"
+  local -a sources=()
+
+  if ! validate_port_number "$new_port"; then
+    echo "Invalid phpMyAdmin port for UFW: ${new_port}"
+    return 1
+  fi
+
+  delete_ufw_pma_rules "$old_port" "$old_sources" "$was_restricted"
+
+  IFS=',' read -r -a sources <<< "$new_sources"
+  for source in "${sources[@]}"; do
+    source="$(trim_whitespace "$source")"
+    [ -n "$source" ] || continue
+    ufw --force insert 1 allow proto tcp from "$source" to any port "$new_port" comment "$allow_comment"
+  done
+
+  ufw --force deny "${new_port}/tcp" comment "$deny_comment"
 }
 
 sql_escape_literal() {
@@ -230,16 +563,40 @@ set_phpmyadmin_portspec_in_compose() {
 dc() {
   if docker compose version >/dev/null 2>&1; then
     docker compose "$@"
-    return 0
+    return $?
   fi
 
   if command -v docker-compose >/dev/null 2>&1; then
     docker-compose "$@"
-    return 0
+    return $?
   fi
 
   echo "Docker Compose is not installed."
   exit 1
+}
+
+proxy_dc() {
+  local previous_dir status
+  previous_dir="$(pwd 2>/dev/null || true)"
+
+  if ! cd "$PROXY_BASE"; then
+    echo "Reverse proxy directory not found: ${PROXY_BASE}"
+    return 1
+  fi
+
+  if dc -f "$PROXY_COMPOSE" "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  if [ -n "$previous_dir" ] && [ -d "$previous_dir" ]; then
+    cd "$previous_dir" || cd /
+  else
+    cd /
+  fi
+
+  return "$status"
 }
 
 random_hex_16() {
@@ -601,6 +958,7 @@ validate_guacamole_upstream() {
 build_guacamole_proxy_block() {
   local guacamole_proxy_enabled="${1:-no}"
   local guacamole_proxy_upstream="${2:-$GUACAMOLE_DEFAULT_UPSTREAM}"
+  local access_block="${3:-}"
 
   if [ "$guacamole_proxy_enabled" != "yes" ]; then
     return 0
@@ -608,10 +966,12 @@ build_guacamole_proxy_block() {
 
   cat <<EOF
     location = /guacamole {
+${access_block}
         return 301 /guacamole/;
     }
 
     location /guacamole/ {
+${access_block}
         # Resolve the upstream through Docker DNS at request time so a missing
         # Guacamole container returns 502 only for /guacamole instead of
         # preventing nginx from starting for the whole reverse proxy.
@@ -784,7 +1144,7 @@ networks:
     external: true
 EOF
 
-  dc -f "$PROXY_COMPOSE" up -d
+  proxy_dc up -d
 }
 
 install_base() {
@@ -902,6 +1262,8 @@ write_project_files() {
   local redis_container="${project_name}-redis"
   local pma_container="${project_name}-phpmyadmin"
   local php_image_tag redis_command redis_healthcheck mysql_sql_mode_line
+  local backup_retention_days ufw_pma_allowed_sources ufw_pma_restricted ufw_pma_port
+  local project_access_allowed_sources project_access_restricted
 
   if [ -z "$pma_port" ]; then
     pma_port="$(pma_default_port "$project_name")"
@@ -931,6 +1293,13 @@ write_project_files() {
     echo "Use host:port, for example guacamole-web:8080"
     exit 1
   fi
+
+  backup_retention_days="$(read_project_backup_retention_days "$app_dir")"
+  ufw_pma_allowed_sources="$(read_project_ufw_pma_allowed_sources "$app_dir")"
+  ufw_pma_restricted="$(read_project_ufw_pma_restricted "$app_dir")"
+  ufw_pma_port="$(read_project_ufw_pma_port "$app_dir" "$pma_port")"
+  project_access_allowed_sources="$(read_project_access_allowed_sources "$app_dir")"
+  project_access_restricted="$(read_project_access_restricted "$app_dir")"
 
   if [ "$app_profile" = "node" ]; then
     local node_container="${project_name}-node"
@@ -1000,6 +1369,12 @@ EOF
       printf 'GUACAMOLE_PROXY_ENABLED=%q\n' "$guacamole_proxy_enabled"
       printf 'GUACAMOLE_PROXY_UPSTREAM=%q\n' "$guacamole_proxy_upstream"
       printf 'APP_PROFILE=%q\n' "$app_profile"
+      printf 'BACKUP_RETENTION_DAYS=%q\n' "$backup_retention_days"
+      printf 'UFW_PMA_ALLOWED_SOURCES=%q\n' "$ufw_pma_allowed_sources"
+      printf 'UFW_PMA_RESTRICTED=%q\n' "$ufw_pma_restricted"
+      printf 'UFW_PMA_PORT=%q\n' ""
+      printf 'PROJECT_ACCESS_ALLOWED_SOURCES=%q\n' "$project_access_allowed_sources"
+      printf 'PROJECT_ACCESS_RESTRICTED=%q\n' "$project_access_restricted"
     } > "${app_dir}/.project-meta"
 
     return 0
@@ -1271,6 +1646,12 @@ EOF
     printf 'GUACAMOLE_PROXY_ENABLED=%q\n' "$guacamole_proxy_enabled"
     printf 'GUACAMOLE_PROXY_UPSTREAM=%q\n' "$guacamole_proxy_upstream"
     printf 'APP_PROFILE=%q\n' "$app_profile"
+    printf 'BACKUP_RETENTION_DAYS=%q\n' "$backup_retention_days"
+    printf 'UFW_PMA_ALLOWED_SOURCES=%q\n' "$ufw_pma_allowed_sources"
+    printf 'UFW_PMA_RESTRICTED=%q\n' "$ufw_pma_restricted"
+    printf 'UFW_PMA_PORT=%q\n' "$ufw_pma_port"
+    printf 'PROJECT_ACCESS_ALLOWED_SOURCES=%q\n' "$project_access_allowed_sources"
+    printf 'PROJECT_ACCESS_RESTRICTED=%q\n' "$project_access_restricted"
   } > "${app_dir}/.project-meta"
 }
 
@@ -1285,9 +1666,13 @@ write_proxy_config_http() {
   local guacamole_proxy_enabled="no"
   local guacamole_proxy_upstream="$GUACAMOLE_DEFAULT_UPSTREAM"
   local guacamole_proxy_block=""
+  local project_access_allowed_sources project_access_restricted project_access_block
 
   app_dir="$(resolve_project_dir "$project_name")"
   app_profile="$(detect_project_profile "$app_dir")"
+  project_access_allowed_sources="$(read_project_access_allowed_sources "$app_dir")"
+  project_access_restricted="$(read_project_access_restricted "$app_dir")"
+  project_access_block="$(build_nginx_access_block "$project_access_allowed_sources" "$project_access_restricted" "        ")"
   if [ -f "${app_dir}/.project-meta" ]; then
     guacamole_proxy_enabled="$(
       # shellcheck disable=SC1090
@@ -1303,7 +1688,7 @@ write_proxy_config_http() {
     )"
     guacamole_proxy_upstream="$(normalize_guacamole_upstream "$guacamole_proxy_upstream")"
   fi
-  guacamole_proxy_block="$(build_guacamole_proxy_block "$guacamole_proxy_enabled" "$guacamole_proxy_upstream")"
+  guacamole_proxy_block="$(build_guacamole_proxy_block "$guacamole_proxy_enabled" "$guacamole_proxy_upstream" "$project_access_block")"
 
   if [ "$app_profile" = "node" ]; then
     cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
@@ -1318,6 +1703,7 @@ server {
     }
 
 ${guacamole_proxy_block}    location /ws/ {
+${project_access_block}
         proxy_pass http://${node_container}:3533;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
@@ -1332,6 +1718,7 @@ ${guacamole_proxy_block}    location /ws/ {
     }
 
     location / {
+${project_access_block}
         proxy_pass http://${node_container}:8080;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
@@ -1363,10 +1750,12 @@ server {
     }
 
 ${guacamole_proxy_block}    location / {
+${project_access_block}
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
     location ~ \.php(?:/|$) {
+${project_access_block}
         fastcgi_split_path_info ^(.+?\.php)(/.*)$;
         try_files \$fastcgi_script_name =404;
         include fastcgi_params;
@@ -1398,9 +1787,13 @@ write_proxy_config_https() {
   local guacamole_proxy_enabled="no"
   local guacamole_proxy_upstream="$GUACAMOLE_DEFAULT_UPSTREAM"
   local guacamole_proxy_block=""
+  local project_access_allowed_sources project_access_restricted project_access_block
 
   app_dir="$(resolve_project_dir "$project_name")"
   app_profile="$(detect_project_profile "$app_dir")"
+  project_access_allowed_sources="$(read_project_access_allowed_sources "$app_dir")"
+  project_access_restricted="$(read_project_access_restricted "$app_dir")"
+  project_access_block="$(build_nginx_access_block "$project_access_allowed_sources" "$project_access_restricted" "        ")"
   if [ -f "${app_dir}/.project-meta" ]; then
     guacamole_proxy_enabled="$(
       # shellcheck disable=SC1090
@@ -1416,7 +1809,7 @@ write_proxy_config_https() {
     )"
     guacamole_proxy_upstream="$(normalize_guacamole_upstream "$guacamole_proxy_upstream")"
   fi
-  guacamole_proxy_block="$(build_guacamole_proxy_block "$guacamole_proxy_enabled" "$guacamole_proxy_upstream")"
+  guacamole_proxy_block="$(build_guacamole_proxy_block "$guacamole_proxy_enabled" "$guacamole_proxy_upstream" "$project_access_block")"
 
   if [ "$app_profile" = "node" ]; then
     cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
@@ -1429,10 +1822,12 @@ server {
     }
 
     location = /guacamole {
+${project_access_block}
         return 301 https://\$host/guacamole/;
     }
 
     location / {
+${project_access_block}
         return 301 https://\$host\$request_uri;
     }
 }
@@ -1447,6 +1842,7 @@ server {
     client_max_body_size 5G;
 
 ${guacamole_proxy_block}    location /ws/ {
+${project_access_block}
         proxy_pass http://${node_container}:3533;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
@@ -1461,6 +1857,7 @@ ${guacamole_proxy_block}    location /ws/ {
     }
 
     location / {
+${project_access_block}
         proxy_pass http://${node_container}:8080;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
@@ -1488,10 +1885,12 @@ server {
     }
 
     location = /guacamole {
+${project_access_block}
         return 301 https://\$host/guacamole/;
     }
 
     location / {
+${project_access_block}
         return 301 https://\$host\$request_uri;
     }
 }
@@ -1508,10 +1907,12 @@ server {
     client_max_body_size 5G;
 
 ${guacamole_proxy_block}    location / {
+${project_access_block}
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
     location ~ \.php(?:/|$) {
+${project_access_block}
         fastcgi_split_path_info ^(.+?\.php)(/.*)$;
         try_files \$fastcgi_script_name =404;
         include fastcgi_params;
@@ -1530,6 +1931,25 @@ ${guacamole_proxy_block}    location / {
     }
 }
 EOF
+}
+
+project_has_https_certificate() {
+  local domain="$1"
+  [ -f "${PROXY_CERTBOT_CONF}/live/${domain}/fullchain.pem" ] \
+    && [ -f "${PROXY_CERTBOT_CONF}/live/${domain}/privkey.pem" ]
+}
+
+regenerate_project_proxy_config() {
+  local project_name="$1"
+  local domain="$2"
+
+  if project_has_https_certificate "$domain"; then
+    write_proxy_config_https "$project_name" "$domain"
+  else
+    write_proxy_config_http "$project_name" "$domain"
+  fi
+
+  proxy_dc restart reverse-proxy
 }
 
 write_reverb_proxy_config_http() {
@@ -2034,9 +2454,9 @@ issue_webmail_certificate() {
 
   echo "Issuing Let's Encrypt certificate for ${webmail_domain}..."
   write_acme_only_vhost "$webmail_domain"
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
-  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+  if ! proxy_dc run --rm certbot certonly \
     --webroot \
     --webroot-path=/var/www/certbot \
     --email "$cert_email" \
@@ -2060,9 +2480,9 @@ issue_reverb_certificate() {
 
   echo "Issuing Let's Encrypt certificate for ${reverb_domain}..."
   write_acme_only_vhost "$reverb_domain"
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
-  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+  if ! proxy_dc run --rm certbot certonly \
     --webroot \
     --webroot-path=/var/www/certbot \
     --email "$cert_email" \
@@ -2096,9 +2516,9 @@ issue_mail_host_certificate() {
 
   echo "Issuing Let's Encrypt certificate for ${mail_host}..."
   write_acme_only_vhost "$mail_host"
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
-  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+  if ! proxy_dc run --rm certbot certonly \
     --webroot \
     --webroot-path=/var/www/certbot \
     --email "$cert_email" \
@@ -2244,9 +2664,9 @@ setup_mailserver() {
 
   echo "Issuing Let's Encrypt certificate for ${mail_host}..."
   write_acme_only_vhost "$mail_host"
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
-  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+  if ! proxy_dc run --rm certbot certonly \
     --webroot \
     --webroot-path=/var/www/certbot \
     --email "admin@${mail_domain}" \
@@ -2740,7 +3160,7 @@ setup_webmail_roundcube() {
 
   echo "Publishing webmail via reverse proxy..."
   write_roundcube_proxy_configs "$webmail_domains"
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
   echo ""
   echo "=============================================================="
@@ -2856,7 +3276,7 @@ modify_webmail_roundcube() {
   fi
 
   write_roundcube_proxy_configs "$webmail_domains"
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
   if [ -n "$removed_domains" ]; then
     echo ""
@@ -2966,12 +3386,12 @@ create_project() {
   dc up -d --build
 
   echo "Restarting reverse proxy..."
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
   sleep 8
 
   echo "Requesting SSL certificate..."
-  dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+  proxy_dc run --rm certbot certonly \
     --webroot \
     --webroot-path=/var/www/certbot \
     --email "$email" \
@@ -2982,7 +3402,7 @@ create_project() {
     -d "$domain"
 
   write_proxy_config_https "$project_name" "$domain"
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
   ensure_cron_jobs
 
@@ -3067,10 +3487,10 @@ change_project_domain() {
 
   echo "Switching to HTTP for certificate issuance..."
   write_proxy_config_http "$PROJECT_NAME" "$new_domain"
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
   echo "Requesting SSL certificate for ${new_domain}..."
-  if ! dc -f "$PROXY_COMPOSE" run --rm certbot certonly \
+  if ! proxy_dc run --rm certbot certonly \
     --webroot \
     --webroot-path=/var/www/certbot \
     --email "$email" \
@@ -3081,13 +3501,13 @@ change_project_domain() {
     -d "$new_domain"; then
     echo "Failed to issue certificate. Restoring previous HTTPS config..."
     write_proxy_config_https "$PROJECT_NAME" "$old_domain"
-    dc -f "$PROXY_COMPOSE" restart reverse-proxy
+    proxy_dc restart reverse-proxy
     exit 1
   fi
 
   echo "Enabling HTTPS for ${new_domain}..."
   write_proxy_config_https "$PROJECT_NAME" "$new_domain"
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
   set_project_meta_var "${app_dir}/.project-meta" "DOMAIN" "$new_domain"
 
@@ -3183,7 +3603,7 @@ delete_project() {
   rm -rf "${BACKUPS_BASE:?}/${project_name:?}" || true
 
   echo "Restarting reverse proxy..."
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
   echo ""
   echo "Project deleted successfully."
@@ -3256,15 +3676,16 @@ list_projects() {
 backup_project_internal() {
   local project_name="$1"
   local suffix="${2:-manual}"
-  local app_dir
+  local app_dir app_profile backup_retention_days
+  local BACKUP_RETENTION_DAYS=""
   app_dir="$(resolve_project_dir "$project_name")"
 
   ensure_project_exists "$project_name" "$app_dir"
+  backup_retention_days="$(read_project_backup_retention_days "$app_dir")"
 
   # shellcheck disable=SC1090
   # shellcheck disable=SC1091
   source "${app_dir}/.project-meta"
-  local app_profile
   app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
 
   if [ "$app_profile" != "node" ]; then
@@ -3316,7 +3737,8 @@ backup_project_internal() {
 
   echo "Backup created: ${archive_path}"
 
-  find "${BACKUPS_BASE}/${project_name}" -type f -name "*.tar.gz" -mtime +14 -delete || true
+  echo "Pruning backups older than ${backup_retention_days} day(s)..."
+  prune_project_backups "$project_name" "$backup_retention_days"
 }
 
 backup_project() {
@@ -3352,6 +3774,50 @@ backup_all() {
     [ -d "$dir" ] || continue
     backup_project_internal "$(basename "$dir")" "auto"
   done
+}
+
+manage_backup_settings() {
+  local project_slug project_name app_dir current_days new_days
+
+  echo ""
+  echo "Existing projects:"
+  print_existing_projects
+  echo ""
+  prompt project_slug "Project short name for backup settings: "
+  project_name="$(slug_to_name "$project_slug")"
+  if [ -z "$project_name" ]; then
+    echo "Invalid project short name."
+    exit 1
+  fi
+
+  app_dir="$(resolve_project_dir "$project_name")"
+  ensure_project_exists "$project_name" "$app_dir"
+
+  if [ ! -f "${app_dir}/.project-meta" ]; then
+    echo "Project metadata not found at ${app_dir}/.project-meta"
+    echo "Backup settings require a project created or managed by this script."
+    exit 1
+  fi
+
+  current_days="$(read_project_backup_retention_days "$app_dir")"
+
+  echo ""
+  echo "Backup settings for ${project_name}"
+  echo "Current retention: keep backups for the last ${current_days} day(s)."
+  prompt new_days "Days of backups to keep (e.g. 60): " "$current_days"
+
+  if ! validate_backup_retention_days "$new_days"; then
+    echo "Invalid retention. Use a whole number between 1 and 3650."
+    exit 1
+  fi
+
+  set_project_meta_var "${app_dir}/.project-meta" "BACKUP_RETENTION_DAYS" "$new_days"
+
+  echo ""
+  echo "Backup retention updated."
+  echo "Project: ${project_name}"
+  echo "Keep backups for the last ${new_days} day(s)."
+  echo "Old backups are pruned when the next backup runs."
 }
 
 restore_project() {
@@ -3422,7 +3888,7 @@ restore_project() {
       "exec mariadb -u root -p'${DB_ROOT_PASSWORD}' '${DB_NAME}'" < "${tmp_restore}/database.sql"
   fi
 
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
 
   rm -rf "$tmp_restore"
 
@@ -3484,7 +3950,7 @@ update_project() {
 
   cd "$app_dir"
   dc up -d --build
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy
+  proxy_dc restart reverse-proxy
   ensure_cron_jobs
 
   echo "Project updated."
@@ -3685,6 +4151,237 @@ phpmyadmin_manage() {
   esac
 }
 
+manage_project_ufw() {
+  local project_slug project_name app_dir action app_profile
+  local pma_port pma_bind_ip saved_sources saved_restricted saved_ufw_port
+  local new_sources normalized_sources confirm ufw_status
+
+  echo ""
+  echo "Existing projects:"
+  print_existing_projects
+  echo ""
+  prompt project_slug "Project short name (UFW): "
+  project_name="$(slug_to_name "$project_slug")"
+  if [ -z "$project_name" ]; then
+    echo "Invalid project short name."
+    exit 1
+  fi
+
+  app_dir="$(resolve_project_dir "$project_name")"
+  ensure_project_exists "$project_name" "$app_dir"
+
+  if [ ! -f "${app_dir}/.project-meta" ]; then
+    echo "Project metadata not found at ${app_dir}/.project-meta"
+    echo "Run 'Update project' once to regenerate project files."
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
+  source "${app_dir}/.project-meta"
+  require_nonempty "PROJECT_NAME" "${PROJECT_NAME}"
+  app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
+  pma_port="${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}"
+  pma_bind_ip="${PMA_BIND_IP:-127.0.0.1}"
+  saved_sources="$(read_project_ufw_pma_allowed_sources "$app_dir")"
+  saved_restricted="$(read_project_ufw_pma_restricted "$app_dir")"
+  saved_ufw_port="$(read_project_ufw_pma_port "$app_dir" "$pma_port")"
+
+  if [ "$app_profile" = "node" ] || ! grep -q "^[[:space:]]*phpmyadmin:" "${app_dir}/docker-compose.yml"; then
+    echo "No per-project direct ports are managed by UFW for this project."
+    echo "Normal website traffic uses the shared reverse proxy on ports 80 and 443."
+    exit 1
+  fi
+
+  ensure_ufw_available
+
+  ufw_status="$(ufw status 2>/dev/null | head -n 1 || true)"
+
+  echo ""
+  echo "Project UFW"
+  echo "Project       : ${PROJECT_NAME}"
+  echo "Web traffic   : shared reverse proxy ports 80/443"
+  if [ "$pma_bind_ip" = "0.0.0.0" ]; then
+    echo "phpMyAdmin   : 0.0.0.0:${pma_port} (public bind)"
+  else
+    echo "phpMyAdmin   : 127.0.0.1:${pma_port} (localhost-only bind)"
+  fi
+  echo "UFW status    : ${ufw_status:-unknown}"
+  echo "Saved sources : ${saved_sources:-none}"
+  echo "Restricted    : ${saved_restricted}"
+  if [ -n "$saved_ufw_port" ] && [ "$saved_ufw_port" != "$pma_port" ]; then
+    echo "Saved UFW port: ${saved_ufw_port} (current phpMyAdmin port is ${pma_port})"
+  fi
+  echo ""
+  echo "Matching UFW rules for phpMyAdmin port ${pma_port}:"
+  if ! ufw status numbered 2>/dev/null | grep -E "(${pma_port}/tcp|port[[:space:]]+${pma_port}|[[:space:]]${pma_port}[[:space:]])"; then
+    echo "  No matching rules found."
+  fi
+  echo ""
+  echo "Note: UFW cannot isolate individual project domains on shared ports 80/443."
+  echo ""
+
+  prompt action "Action [status/restrict-phpmyadmin/clear-phpmyadmin-rules/show-ufw]: " "status"
+
+  case "${action,,}" in
+    status)
+      return 0
+      ;;
+    show-ufw)
+      ufw status numbered
+      ;;
+    restrict-phpmyadmin)
+      if [ "$pma_bind_ip" != "0.0.0.0" ]; then
+        echo ""
+        echo "phpMyAdmin is currently bound to localhost only."
+        echo "UFW rules will be saved, but public access still requires menu option 8 -> expose -> public."
+      fi
+
+      echo ""
+      echo "This will allow the listed IP/CIDR sources and deny other traffic to ${pma_port}/tcp."
+      prompt new_sources "Allowed IP/CIDR list (comma-separated, e.g. 203.0.113.10,203.0.113.0/24): " "$saved_sources"
+      if ! normalized_sources="$(normalize_ufw_sources_csv "$new_sources")"; then
+        echo "Invalid source list. Use IPv4/IPv6 addresses or CIDR ranges separated by commas."
+        exit 1
+      fi
+
+      prompt confirm "Apply UFW phpMyAdmin rules for ${PROJECT_NAME}? (yes/no): " "yes"
+      if [ "${confirm,,}" != "yes" ]; then
+        echo "Cancelled."
+        exit 0
+      fi
+
+      apply_ufw_pma_rules "$PROJECT_NAME" "$pma_port" "$saved_ufw_port" "$saved_sources" "$normalized_sources" "$saved_restricted"
+      set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_ALLOWED_SOURCES" "$normalized_sources"
+      set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_RESTRICTED" "yes"
+      set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_PORT" "$pma_port"
+
+      echo "Project UFW phpMyAdmin rules applied."
+      echo "Allowed sources: ${normalized_sources}"
+      echo "Denied by default: ${pma_port}/tcp"
+      if [ "$ufw_status" = "Status: inactive" ]; then
+        echo "UFW is currently inactive. These rules will not be enforced until UFW is enabled."
+      fi
+      ;;
+    clear-phpmyadmin-rules)
+      prompt confirm "Remove saved UFW phpMyAdmin rules for ${PROJECT_NAME}? (yes/no): " "no"
+      if [ "${confirm,,}" != "yes" ]; then
+        echo "Cancelled."
+        exit 0
+      fi
+
+      delete_ufw_pma_rules "$saved_ufw_port" "$saved_sources" "$saved_restricted"
+      set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_ALLOWED_SOURCES" ""
+      set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_RESTRICTED" "no"
+      set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_PORT" ""
+
+      echo "Saved UFW phpMyAdmin rules cleared for ${PROJECT_NAME}."
+      ;;
+    *)
+      echo "Invalid option."
+      exit 1
+      ;;
+  esac
+}
+
+manage_project_access() {
+  local project_slug project_name app_dir action app_profile
+  local allowed_sources restricted new_sources normalized_sources confirm
+
+  echo ""
+  echo "Existing projects:"
+  print_existing_projects
+  echo ""
+  prompt project_slug "Project short name (access settings): "
+  project_name="$(slug_to_name "$project_slug")"
+  if [ -z "$project_name" ]; then
+    echo "Invalid project short name."
+    exit 1
+  fi
+
+  app_dir="$(resolve_project_dir "$project_name")"
+  ensure_project_exists "$project_name" "$app_dir"
+
+  if [ ! -f "${app_dir}/.project-meta" ]; then
+    echo "Project metadata not found at ${app_dir}/.project-meta"
+    echo "Run 'Update project' once to regenerate project files."
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
+  source "${app_dir}/.project-meta"
+  require_nonempty "PROJECT_NAME" "${PROJECT_NAME}"
+  require_nonempty "DOMAIN" "${DOMAIN}"
+  app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
+  allowed_sources="$(read_project_access_allowed_sources "$app_dir")"
+  restricted="$(read_project_access_restricted "$app_dir")"
+
+  echo ""
+  echo "Project access"
+  echo "Project : ${PROJECT_NAME}"
+  echo "Domain  : ${DOMAIN}"
+  echo "Profile : ${app_profile}"
+  if [ "$restricted" = "yes" ] && [ -n "$allowed_sources" ]; then
+    echo "Mode    : restricted"
+    echo "Allowed : ${allowed_sources}"
+  else
+    echo "Mode    : public"
+  fi
+  echo ""
+  echo "This controls Nginx access for this project's website on ports 80/443."
+  echo "Let's Encrypt ACME challenge paths remain public for certificate renewal."
+  echo ""
+
+  prompt action "Action [status/restrict/clear]: " "status"
+
+  case "${action,,}" in
+    status)
+      return 0
+      ;;
+    restrict)
+      prompt new_sources "Allowed IP/CIDR list (comma-separated, e.g. 203.0.113.10,203.0.113.0/24): " "$allowed_sources"
+      if ! normalized_sources="$(normalize_ufw_sources_csv "$new_sources")"; then
+        echo "Invalid source list. Use IPv4/IPv6 addresses or CIDR ranges separated by commas."
+        exit 1
+      fi
+
+      echo ""
+      echo "This will restrict ${DOMAIN} to:"
+      echo "  ${normalized_sources}"
+      prompt confirm "Apply project access restriction? (yes/no): " "yes"
+      if [ "${confirm,,}" != "yes" ]; then
+        echo "Cancelled."
+        exit 0
+      fi
+
+      set_project_meta_var "${app_dir}/.project-meta" "PROJECT_ACCESS_ALLOWED_SOURCES" "$normalized_sources"
+      set_project_meta_var "${app_dir}/.project-meta" "PROJECT_ACCESS_RESTRICTED" "yes"
+      regenerate_project_proxy_config "$PROJECT_NAME" "$DOMAIN"
+
+      echo "Project access restricted for ${DOMAIN}."
+      echo "Allowed sources: ${normalized_sources}"
+      ;;
+    clear)
+      prompt confirm "Remove project access restriction for ${DOMAIN}? (yes/no): " "no"
+      if [ "${confirm,,}" != "yes" ]; then
+        echo "Cancelled."
+        exit 0
+      fi
+
+      set_project_meta_var "${app_dir}/.project-meta" "PROJECT_ACCESS_ALLOWED_SOURCES" ""
+      set_project_meta_var "${app_dir}/.project-meta" "PROJECT_ACCESS_RESTRICTED" "no"
+      regenerate_project_proxy_config "$PROJECT_NAME" "$DOMAIN"
+
+      echo "Project access is now public for ${DOMAIN}."
+      ;;
+    *)
+      echo "Invalid option."
+      exit 1
+      ;;
+  esac
+}
+
 reset_database_passwords() {
   local project_slug project_name app_dir scope
   local new_db_password new_root_password confirm
@@ -3844,7 +4541,7 @@ EOF
   if grep -q "^[[:space:]]*phpmyadmin:" "${app_dir}/docker-compose.yml"; then
     dc up -d phpmyadmin >/dev/null 2>&1 || true
   fi
-  dc -f "$PROXY_COMPOSE" restart reverse-proxy >/dev/null 2>&1 || true
+  proxy_dc restart reverse-proxy >/dev/null 2>&1 || true
 
   echo "Database password reset completed."
   if [ "$scope" = "app" ] || [ "$scope" = "both" ]; then
@@ -3939,7 +4636,7 @@ manage_reverb() {
 
       cd "$app_dir"
       dc up -d --build php
-      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+      proxy_dc restart reverse-proxy
 
       print_reverb_runtime_diagnostics "$PROJECT_NAME" "$reverb_port" "$reverb_domain" || true
       ;;
@@ -3991,7 +4688,7 @@ manage_reverb() {
 
       cd "$app_dir"
       dc up -d --build php
-      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+      proxy_dc restart reverse-proxy
 
       echo ""
       echo "Reverb enabled: https://${reverb_domain}"
@@ -4036,7 +4733,7 @@ manage_reverb() {
 
       cd "$app_dir"
       dc up -d --build php
-      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+      proxy_dc restart reverse-proxy
 
       prompt remove_old "Remove old certificate files for ${reverb_domain}? (yes/no): " "no"
       if [ "${remove_old,,}" = "yes" ]; then
@@ -4071,7 +4768,7 @@ manage_reverb() {
 
       cd "$app_dir"
       dc up -d --build php
-      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+      proxy_dc restart reverse-proxy
 
       echo "Reverb port updated to ${new_reverb_port}."
       ;;
@@ -4098,7 +4795,7 @@ manage_reverb() {
 
       cd "$app_dir"
       dc up -d --build php
-      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+      proxy_dc restart reverse-proxy
 
       echo "Reverb exposure updated: ${new_reverb_exposure}."
       ;;
@@ -4113,7 +4810,7 @@ manage_reverb() {
 
       cd "$app_dir"
       dc up -d --build php
-      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+      proxy_dc restart reverse-proxy
 
       if [ -n "$reverb_domain" ]; then
         prompt remove_old "Remove old certificate files for ${reverb_domain}? (yes/no): " "no"
@@ -4298,7 +4995,7 @@ manage_guacamole_proxy() {
       fi
 
       ensure_proxy_stack
-      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+      proxy_dc restart reverse-proxy
 
       echo ""
       echo "Guacamole proxy enabled: https://${DOMAIN}/guacamole/"
@@ -4359,7 +5056,7 @@ manage_guacamole_proxy() {
       fi
 
       ensure_proxy_stack
-      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+      proxy_dc restart reverse-proxy
 
       echo "Guacamole upstream updated to ${new_guacamole_proxy_upstream}."
       if [ "$new_guacamole_proxy_upstream" = "$GUACAMOLE_DEFAULT_UPSTREAM" ] && [ -n "$managed_guacamole_secret" ]; then
@@ -4388,7 +5085,7 @@ manage_guacamole_proxy() {
       fi
 
       ensure_proxy_stack
-      dc -f "$PROXY_COMPOSE" restart reverse-proxy
+      proxy_dc restart reverse-proxy
 
       if disable_project_guacamole_env "$app_dir"; then
         echo "Updated ${project_env_path:-${app_dir}/.env}: GUACAMOLE_ENABLED=false"
@@ -4717,6 +5414,9 @@ menu() {
   echo "15) Reset database passwords"
   echo "16) Manage Guacamole (stack + proxy)"
   echo "17) Manage VNC Server (TigerVNC)"
+  echo "18) Backup settings"
+  echo "19) Manage project UFW"
+  echo "20) Project access settings"
   echo ""
   read -r -p "Option: " action
 
@@ -4738,6 +5438,9 @@ menu() {
     15) reset_database_passwords ;;
     16) manage_guacamole_proxy ;;
     17) manage_vnc_server ;;
+    18) manage_backup_settings ;;
+    19) manage_project_ufw ;;
+    20) manage_project_access ;;
     *) echo "Invalid option."; exit 1 ;;
   esac
 }
