@@ -39,6 +39,12 @@ PMA_MAX_EXECUTION_TIME="0"
 MARIADB_MAX_ALLOWED_PACKET="1G"
 MARIADB_NET_READ_TIMEOUT="600"
 MARIADB_NET_WRITE_TIMEOUT="600"
+DEFAULT_LARAVEL_QUEUE_CONNECTION="redis"
+DEFAULT_LARAVEL_QUEUE_NAMES="default"
+DEFAULT_LARAVEL_QUEUE_SLEEP="1"
+DEFAULT_LARAVEL_QUEUE_TRIES="5"
+DEFAULT_LARAVEL_QUEUE_TIMEOUT="120"
+DEFAULT_LARAVEL_QUEUE_MAX_TIME="3600"
 
 # Values loaded from "${app_dir}/.project-meta" (declared to keep shellcheck happy)
 PROJECT_NAME=""
@@ -69,6 +75,12 @@ UFW_PMA_RESTRICTED=""
 UFW_PMA_PORT=""
 PROJECT_ACCESS_ALLOWED_SOURCES=""
 PROJECT_ACCESS_RESTRICTED=""
+LARAVEL_QUEUE_CONNECTION=""
+LARAVEL_QUEUE_NAMES=""
+LARAVEL_QUEUE_SLEEP=""
+LARAVEL_QUEUE_TRIES=""
+LARAVEL_QUEUE_TIMEOUT=""
+LARAVEL_QUEUE_MAX_TIME=""
 
 banner() {
   echo "=============================================================="
@@ -154,6 +166,39 @@ trim_whitespace() {
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   printf '%s' "$value"
+}
+
+validate_positive_integer() {
+  local value="${1:-}"
+  [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ]
+}
+
+normalize_queue_connection() {
+  local value
+  value="$(trim_whitespace "${1:-}")"
+  [[ "$value" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  echo "$value"
+}
+
+normalize_queue_names_csv() {
+  local input="${1:-}"
+  local part queue result=""
+  local -A seen=()
+  local -a parts=()
+
+  IFS=',' read -r -a parts <<< "$input"
+  for part in "${parts[@]}"; do
+    queue="$(trim_whitespace "$part")"
+    [ -n "$queue" ] || continue
+    [[ "$queue" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    if [ -z "${seen[$queue]+x}" ]; then
+      seen[$queue]=1
+      result="${result:+${result},}${queue}"
+    fi
+  done
+
+  [ -n "$result" ] || return 1
+  echo "$result"
 }
 
 validate_ipv4_cidr() {
@@ -378,6 +423,73 @@ read_project_access_restricted() {
     echo "yes"
   else
     echo "no"
+  fi
+}
+
+read_project_meta_var() {
+  local app_dir="$1"
+  local key="$2"
+  local meta_file="${app_dir}/.project-meta"
+
+  if [ -f "$meta_file" ]; then
+    (
+      set +u
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "$meta_file" >/dev/null 2>&1 || true
+      printf '%s' "${!key:-}"
+    )
+  fi
+}
+
+detect_laravel_queue_names() {
+  local app_dir="$1"
+  local grep_paths=()
+
+  for path in app bootstrap config database routes; do
+    [ -e "${app_dir}/${path}" ] && grep_paths+=("${app_dir}/${path}")
+  done
+
+  if [ "${#grep_paths[@]}" -gt 0 ] \
+    && grep -R -E "onQueue\\([\"']webhooks[\"']|--queue=webhooks|queue:?webhooks|webhooks,default" "${grep_paths[@]}" >/dev/null 2>&1; then
+    echo "webhooks,default"
+  else
+    echo "$DEFAULT_LARAVEL_QUEUE_NAMES"
+  fi
+}
+
+read_project_laravel_queue_connection() {
+  local app_dir="$1"
+  local configured
+  configured="$(read_project_meta_var "$app_dir" "LARAVEL_QUEUE_CONNECTION")"
+
+  normalize_queue_connection "$configured" 2>/dev/null || echo "$DEFAULT_LARAVEL_QUEUE_CONNECTION"
+}
+
+read_project_laravel_queue_names() {
+  local app_dir="$1"
+  local configured detected
+  configured="$(read_project_meta_var "$app_dir" "LARAVEL_QUEUE_NAMES")"
+
+  if normalize_queue_names_csv "$configured" 2>/dev/null; then
+    return 0
+  fi
+
+  detected="$(detect_laravel_queue_names "$app_dir")"
+  normalize_queue_names_csv "$detected" 2>/dev/null || echo "$DEFAULT_LARAVEL_QUEUE_NAMES"
+}
+
+read_project_laravel_queue_integer() {
+  local app_dir="$1"
+  local key="$2"
+  local fallback="$3"
+  local configured
+  configured="$(read_project_meta_var "$app_dir" "$key")"
+
+  if validate_positive_integer "$configured"; then
+    echo "$configured"
+  else
+    echo "$fallback"
   fi
 }
 
@@ -769,6 +881,7 @@ refresh_project_runtime_after_env_change() {
   if [ -n "$artisan_rel" ]; then
     artisan_path="/var/www/${artisan_rel}"
     dc exec -T php php "$artisan_path" optimize:clear >/dev/null 2>&1 || true
+    dc exec -T php php "$artisan_path" queue:restart >/dev/null 2>&1 || true
   fi
 
   dc restart php >/dev/null 2>&1
@@ -1264,6 +1377,8 @@ write_project_files() {
   local php_image_tag redis_command redis_healthcheck mysql_sql_mode_line
   local backup_retention_days ufw_pma_allowed_sources ufw_pma_restricted ufw_pma_port
   local project_access_allowed_sources project_access_restricted
+  local laravel_queue_connection="" laravel_queue_names="" laravel_queue_sleep="" laravel_queue_tries=""
+  local laravel_queue_timeout="" laravel_queue_max_time="" laravel_queue_stopwaitsecs=""
 
   if [ -z "$pma_port" ]; then
     pma_port="$(pma_default_port "$project_name")"
@@ -1411,6 +1526,16 @@ EOF
   fi
   artisan_path="/var/www/${artisan_rel}"
 
+  if project_has_laravel_runtime "$app_profile" "$app_dir"; then
+    laravel_queue_connection="$(read_project_laravel_queue_connection "$app_dir")"
+    laravel_queue_names="$(read_project_laravel_queue_names "$app_dir")"
+    laravel_queue_sleep="$(read_project_laravel_queue_integer "$app_dir" "LARAVEL_QUEUE_SLEEP" "$DEFAULT_LARAVEL_QUEUE_SLEEP")"
+    laravel_queue_tries="$(read_project_laravel_queue_integer "$app_dir" "LARAVEL_QUEUE_TRIES" "$DEFAULT_LARAVEL_QUEUE_TRIES")"
+    laravel_queue_timeout="$(read_project_laravel_queue_integer "$app_dir" "LARAVEL_QUEUE_TIMEOUT" "$DEFAULT_LARAVEL_QUEUE_TIMEOUT")"
+    laravel_queue_max_time="$(read_project_laravel_queue_integer "$app_dir" "LARAVEL_QUEUE_MAX_TIME" "$DEFAULT_LARAVEL_QUEUE_MAX_TIME")"
+    laravel_queue_stopwaitsecs="$((laravel_queue_timeout + 10))"
+  fi
+
   cat > "${app_dir}/php/supervisord.conf" <<EOF
 [supervisord]
 nodaemon=true
@@ -1442,11 +1567,14 @@ EOF
     cat >> "${app_dir}/php/supervisord.conf" <<EOF
 
 [program:laravel-worker]
-command=/bin/sh -c "while [ ! -f ${artisan_path} ]; do echo 'Waiting for ${artisan_path}...'; sleep 10; done; php ${artisan_path} queue:work --sleep=3 --tries=3 --timeout=90"
+command=/bin/sh -c "while [ ! -f ${artisan_path} ]; do echo 'Waiting for ${artisan_path}...'; sleep 10; done; php ${artisan_path} queue:work ${laravel_queue_connection} --queue=${laravel_queue_names} --sleep=${laravel_queue_sleep} --tries=${laravel_queue_tries} --timeout=${laravel_queue_timeout} --max-time=${laravel_queue_max_time}"
 autostart=true
 autorestart=true
 priority=20
 startsecs=5
+stopasgroup=true
+killasgroup=true
+stopwaitsecs=${laravel_queue_stopwaitsecs}
 stdout_logfile=/dev/stdout
 stdout_logfile_maxbytes=0
 stderr_logfile=/dev/stderr
@@ -1652,6 +1780,12 @@ EOF
     printf 'UFW_PMA_PORT=%q\n' "$ufw_pma_port"
     printf 'PROJECT_ACCESS_ALLOWED_SOURCES=%q\n' "$project_access_allowed_sources"
     printf 'PROJECT_ACCESS_RESTRICTED=%q\n' "$project_access_restricted"
+    printf 'LARAVEL_QUEUE_CONNECTION=%q\n' "$laravel_queue_connection"
+    printf 'LARAVEL_QUEUE_NAMES=%q\n' "$laravel_queue_names"
+    printf 'LARAVEL_QUEUE_SLEEP=%q\n' "$laravel_queue_sleep"
+    printf 'LARAVEL_QUEUE_TRIES=%q\n' "$laravel_queue_tries"
+    printf 'LARAVEL_QUEUE_TIMEOUT=%q\n' "$laravel_queue_timeout"
+    printf 'LARAVEL_QUEUE_MAX_TIME=%q\n' "$laravel_queue_max_time"
   } > "${app_dir}/.project-meta"
 }
 

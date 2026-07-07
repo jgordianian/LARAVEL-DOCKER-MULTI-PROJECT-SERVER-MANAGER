@@ -140,6 +140,19 @@ Do not upload the whole Laravel app into `/var/www/projects/<project>/public/`, 
 
 If you already uploaded a Laravel app one level too deep, the current script can detect that nested layout when you run `6) Update project` and regenerate the proxy config for it.
 
+The generated Laravel PHP container runs a Supervisor-managed queue worker. By default it uses Redis, queue `default`, `--sleep=1`, `--tries=5`, `--timeout=120`, and `--max-time=3600`. If the project code uses a `webhooks` queue, the manager generates `--queue=webhooks,default`.
+
+Queue worker settings are saved in `.project-meta` and can be overridden before running `6) Update project`:
+
+```bash
+LARAVEL_QUEUE_CONNECTION=redis
+LARAVEL_QUEUE_NAMES=webhooks,default
+LARAVEL_QUEUE_SLEEP=1
+LARAVEL_QUEUE_TRIES=5
+LARAVEL_QUEUE_TIMEOUT=120
+LARAVEL_QUEUE_MAX_TIME=3600
+```
+
 ### ThinkPHP / FastAdmin apps
 
 When creating a project for a ThinkPHP/FastAdmin app, select:
@@ -354,10 +367,13 @@ Use menu option "Update project". This regenerates:
 
 - `docker-compose.yml` and related project files
 - the Nginx vhost for the project
+- the PHP Supervisor config, including the Laravel queue worker
 
 Then it rebuilds the project containers and restarts the reverse proxy.
 
 If you enabled the Guacamole proxy for the project, the saved `/guacamole/` reverse-proxy settings are preserved when you run `Update project`.
+
+For Laravel projects, runtime refresh operations clear optimized caches, send `php artisan queue:restart`, and restart the PHP container so OPcache and queue workers pick up the new code cleanly.
 
 ## Resetting database passwords
 
