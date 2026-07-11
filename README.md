@@ -373,7 +373,7 @@ Then it rebuilds the project containers and restarts the reverse proxy.
 
 If you enabled the Guacamole proxy for the project, the saved `/guacamole/` reverse-proxy settings are preserved when you run `Update project`.
 
-For Laravel projects, runtime refresh operations clear optimized caches, send `php artisan queue:restart`, and restart the PHP container so OPcache and queue workers pick up the new code cleanly.
+For Laravel projects, runtime refresh operations clear optimized caches, remove Livewire single-file component caches, reset PHP-FPM OPcache through the project HTTPS endpoint, send `php artisan queue:restart`, and restart the PHP container so OPcache and queue workers pick up the new code cleanly.
 
 ## Resetting database passwords
 

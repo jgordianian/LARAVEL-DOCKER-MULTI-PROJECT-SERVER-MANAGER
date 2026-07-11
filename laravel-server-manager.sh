@@ -866,9 +866,36 @@ disable_project_guacamole_env() {
   set_env_file_var "$env_file" "GUACAMOLE_ENABLED" "false"
 }
 
+reset_project_fpm_opcache() {
+  local app_dir="$1"
+  local domain="$2"
+  local opcache_token opcache_file opcache_url curl_status
+
+  [ -n "$domain" ] || return 1
+  [ -d "${app_dir}/public" ] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+
+  opcache_token="$(openssl rand -hex 16 2>/dev/null || date +%s%N)"
+  opcache_file="${app_dir}/public/.opcache-reset-${opcache_token}.php"
+  opcache_url="https://${domain}/.opcache-reset-${opcache_token}.php"
+
+  cat > "$opcache_file" <<'PHP'
+<?php
+header('Content-Type: text/plain; charset=UTF-8');
+echo function_exists('opcache_reset') && opcache_reset() ? 'opcache_reset=true' : 'opcache_reset=false';
+PHP
+  chmod 0644 "$opcache_file" >/dev/null 2>&1 || true
+  curl -fsS --max-time 10 "$opcache_url" >/dev/null 2>&1
+  curl_status=$?
+  rm -f "$opcache_file"
+
+  return "$curl_status"
+}
+
 refresh_project_runtime_after_env_change() {
   local app_dir="$1"
   local project_name="$2"
+  local domain="${3:-}"
   local php_container="${project_name}-php"
   local artisan_rel artisan_path
 
@@ -884,7 +911,12 @@ refresh_project_runtime_after_env_change() {
     dc exec -T php php "$artisan_path" queue:restart >/dev/null 2>&1 || true
   fi
 
+  find storage/framework/views/livewire/classes storage/framework/views/livewire/views \
+    -type f ! -name '.gitignore' -delete >/dev/null 2>&1 || true
+
   dc restart php >/dev/null 2>&1
+  sleep 3
+  reset_project_fpm_opcache "$app_dir" "$domain" >/dev/null 2>&1 || true
 }
 
 recreate_phpmyadmin() {
@@ -4085,6 +4117,9 @@ update_project() {
   cd "$app_dir"
   dc up -d --build
   proxy_dc restart reverse-proxy
+  if [ "$app_profile" = "laravel" ]; then
+    refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME" "$DOMAIN" >/dev/null 2>&1 || true
+  fi
   ensure_cron_jobs
 
   echo "Project updated."
@@ -5092,7 +5127,7 @@ manage_guacamole_proxy() {
 
       if sync_project_guacamole_env "$app_dir" "$DOMAIN" "$managed_guacamole_secret"; then
         echo "Updated ${project_env_path:-${app_dir}/.env} with GUACAMOLE_* values."
-        if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME"; then
+        if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME" "$DOMAIN"; then
           echo "Restarted the PHP container so the new GUACAMOLE_* values take effect."
         fi
       else
@@ -5137,7 +5172,7 @@ manage_guacamole_proxy() {
       if [ "$new_guacamole_proxy_upstream" = "$GUACAMOLE_DEFAULT_UPSTREAM" ] && [ -n "$managed_guacamole_secret" ]; then
         if sync_project_guacamole_env "$app_dir" "$DOMAIN" "$managed_guacamole_secret"; then
           echo "Updated ${project_env_path:-${app_dir}/.env} with GUACAMOLE_* values."
-          if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME"; then
+          if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME" "$DOMAIN"; then
             echo "Restarted the PHP container so the new GUACAMOLE_* values take effect."
           fi
         else
@@ -5196,7 +5231,7 @@ manage_guacamole_proxy() {
       if [ "$new_guacamole_proxy_upstream" = "$GUACAMOLE_DEFAULT_UPSTREAM" ] && [ -n "$managed_guacamole_secret" ]; then
         if sync_project_guacamole_env "$app_dir" "$DOMAIN" "$managed_guacamole_secret"; then
           echo "Updated ${project_env_path:-${app_dir}/.env} with GUACAMOLE_* values."
-          if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME"; then
+          if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME" "$DOMAIN"; then
             echo "Restarted the PHP container so the new GUACAMOLE_* values take effect."
           fi
         fi
@@ -5223,7 +5258,7 @@ manage_guacamole_proxy() {
 
       if disable_project_guacamole_env "$app_dir"; then
         echo "Updated ${project_env_path:-${app_dir}/.env}: GUACAMOLE_ENABLED=false"
-        if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME"; then
+        if refresh_project_runtime_after_env_change "$app_dir" "$PROJECT_NAME" "$DOMAIN"; then
           echo "Restarted the PHP container so the Guacamole env change takes effect."
         fi
       fi
