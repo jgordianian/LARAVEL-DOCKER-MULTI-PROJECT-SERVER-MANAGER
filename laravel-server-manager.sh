@@ -241,6 +241,39 @@ validate_ipv6_cidr() {
   [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]]
 }
 
+detect_server_ip() {
+  local candidate=""
+
+  # Allow an explicit value for hosts whose public IP is provided through NAT.
+  candidate="$(trim_whitespace "${SERVER_IP:-}")"
+  if [ -n "$candidate" ] && validate_ipv4_cidr "$candidate" && [[ "$candidate" != */* ]]; then
+    echo "$candidate"
+    return 0
+  fi
+
+  # An external lookup returns the address clients actually use to reach the server.
+  if command -v curl >/dev/null 2>&1; then
+    candidate="$(curl -4fsS --connect-timeout 2 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+    candidate="$(trim_whitespace "$candidate")"
+    if validate_ipv4_cidr "$candidate" && [[ "$candidate" != */* ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  fi
+
+  # Fall back to the IPv4 address on the default route when Internet lookup fails.
+  if command -v ip >/dev/null 2>&1; then
+    candidate="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')"
+    candidate="$(trim_whitespace "$candidate")"
+    if validate_ipv4_cidr "$candidate" && [[ "$candidate" != */* ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  fi
+
+  echo "YOUR_SERVER_IP"
+}
+
 validate_ufw_source() {
   local source="${1:-}"
   [ -n "$source" ] || return 1
@@ -2558,11 +2591,13 @@ remove_webmail_proxy_configs() {
 
 print_webmail_dns_targets() {
   local webmail_domains="$1"
-  local domain
+  local domain server_ip
+
+  server_ip="$(detect_server_ip)"
 
   IFS=',' read -r -a domains <<< "$webmail_domains"
   for domain in "${domains[@]}"; do
-    echo "  ${domain} -> YOUR_SERVER_IP"
+    echo "  ${domain} -> ${server_ip}"
   done
 }
 
@@ -2751,7 +2786,9 @@ sync_webmail_mail_host_if_needed() {
 }
 
 setup_mailserver() {
-  local mail_domain mail_host admin_user admin_email admin_password proceed remove_old_cert
+  local mail_domain mail_host admin_user admin_email admin_password proceed remove_old_cert server_ip
+
+  server_ip="$(detect_server_ip)"
 
   echo ""
   echo "Email server setup (docker-mailserver)"
@@ -2795,13 +2832,13 @@ setup_mailserver() {
   echo "DNS records you need (create these BEFORE expecting mail to work):"
   echo "--------------------------------------------------------------"
   echo "A/AAAA:"
-  echo "  ${mail_host} -> YOUR_SERVER_IP"
+  echo "  ${mail_host} -> ${server_ip}"
   echo ""
   echo "MX (for ${mail_domain}):"
   echo "  ${mail_domain} MX 10 ${mail_host}"
   echo ""
   echo "PTR / rDNS (set at your VPS/provider):"
-  echo "  YOUR_SERVER_IP PTR ${mail_host}"
+  echo "  ${server_ip} PTR ${mail_host}"
   echo ""
   echo "SPF (TXT for ${mail_domain}):"
   echo "  v=spf1 mx -all"
@@ -3032,7 +3069,9 @@ add_mail_domain() {
 }
 
 change_mail_host() {
-  local old_mail_host new_mail_host cert_email remove_old new_mail_domain current_postmaster
+  local old_mail_host new_mail_host cert_email remove_old new_mail_domain current_postmaster server_ip
+
+  server_ip="$(detect_server_ip)"
 
   ensure_mailserver_running
 
@@ -3072,8 +3111,8 @@ change_mail_host() {
 
   echo ""
   echo "You must update DNS after this change:"
-  echo "  A/AAAA: ${new_mail_host} -> YOUR_SERVER_IP"
-  echo "  PTR/rDNS: YOUR_SERVER_IP -> ${new_mail_host}"
+  echo "  A/AAAA: ${new_mail_host} -> ${server_ip}"
+  echo "  PTR/rDNS: ${server_ip} -> ${new_mail_host}"
   echo "  Update MX for every hosted mail domain to point to ${new_mail_host}"
   echo "  Update SPF/DMARC where needed if they mention the old host"
   echo ""
@@ -4126,7 +4165,9 @@ update_project() {
 }
 
 phpmyadmin_manage() {
-  local project_slug project_name app_dir pma_container pma_port pma_bind_ip action new_port exposure confirm
+  local project_slug project_name app_dir pma_container pma_port pma_bind_ip action new_port exposure confirm server_ip
+
+  server_ip="$(detect_server_ip)"
 
   echo ""
   echo "Existing projects:"
@@ -4173,12 +4214,12 @@ phpmyadmin_manage() {
   echo ""
   echo "Access methods:"
   if [ "$pma_bind_ip" = "0.0.0.0" ]; then
-    echo "  - Public: http://YOUR_SERVER_IP:${pma_port}/"
+    echo "  - Public: http://${server_ip}:${pma_port}/"
   else
     echo "  - On the server: http://127.0.0.1:${pma_port}/"
   fi
   echo "  - From your computer via SSH tunnel:"
-  echo "      ssh -L 8080:127.0.0.1:${pma_port} root@YOUR_SERVER_IP"
+  echo "      ssh -L 8080:127.0.0.1:${pma_port} root@${server_ip}"
   echo "    Then open: http://127.0.0.1:8080/"
   echo ""
   echo "Login tips:"
@@ -4236,7 +4277,7 @@ phpmyadmin_manage() {
       recreate_phpmyadmin "$app_dir" "$pma_container"
 
       if [ "$pma_bind_ip" = "0.0.0.0" ]; then
-        echo "phpMyAdmin enabled on http://YOUR_SERVER_IP:${new_port}/ (public)."
+        echo "phpMyAdmin enabled on http://${server_ip}:${new_port}/ (public)."
       else
         echo "phpMyAdmin enabled on http://127.0.0.1:${new_port}/ (localhost only)."
       fi
@@ -4280,7 +4321,7 @@ phpmyadmin_manage() {
       recreate_phpmyadmin "$app_dir" "$pma_container"
 
       if [ "$pma_bind_ip" = "0.0.0.0" ]; then
-        echo "phpMyAdmin is now public on http://YOUR_SERVER_IP:${pma_port}/"
+        echo "phpMyAdmin is now public on http://${server_ip}:${pma_port}/"
       else
         echo "phpMyAdmin is now localhost-only on http://127.0.0.1:${pma_port}/"
       fi
@@ -4308,7 +4349,7 @@ phpmyadmin_manage() {
 
       recreate_phpmyadmin "$app_dir" "$pma_container"
       if [ "$pma_bind_ip" = "0.0.0.0" ]; then
-        echo "phpMyAdmin port updated to http://YOUR_SERVER_IP:${new_port}/ (public)."
+        echo "phpMyAdmin port updated to http://${server_ip}:${new_port}/ (public)."
       else
         echo "phpMyAdmin port updated to http://127.0.0.1:${new_port}/ (localhost only)."
       fi
