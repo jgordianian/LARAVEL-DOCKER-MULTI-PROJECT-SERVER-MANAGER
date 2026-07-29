@@ -560,6 +560,103 @@ ensure_ufw_available() {
   fi
 }
 
+apply_ufw_allow_source_port_tcp() {
+  local source="$1"
+  local port="$2"
+  local rule_comment="$3"
+
+  ufw allow from "$source" to any port "$port" proto tcp comment "$rule_comment" >/dev/null 2>&1 && return 0
+  ufw allow from "$source" to any port "$port" proto tcp >/dev/null 2>&1 && return 0
+  ufw allow proto tcp from "$source" to any port "$port" >/dev/null 2>&1 && return 0
+
+  ufw allow from "$source" to any port "$port"
+}
+
+apply_ufw_deny_port_tcp() {
+  local port="$1"
+  local rule_comment="$2"
+
+  ufw deny "${port}/tcp" comment "$rule_comment" >/dev/null 2>&1 && return 0
+  ufw deny "${port}/tcp" >/dev/null 2>&1 && return 0
+  ufw deny to any port "$port" proto tcp >/dev/null 2>&1 && return 0
+
+  ufw deny "$port"
+}
+
+apply_ufw_allow_port_tcp() {
+  local port="$1"
+  local rule_comment="$2"
+
+  if ! validate_port_number "$port"; then
+    return 1
+  fi
+
+  ufw allow "${port}/tcp" comment "$rule_comment" >/dev/null 2>&1 && return 0
+  ufw allow "${port}/tcp" >/dev/null 2>&1 && return 0
+
+  ufw allow "$port"
+}
+
+detect_current_ssh_port() {
+  local ssh_port=""
+
+  if [ -n "${SSH_CONNECTION:-}" ]; then
+    ssh_port="$(printf '%s' "$SSH_CONNECTION" | awk '{print $4}')"
+    if validate_port_number "$ssh_port"; then
+      echo "$ssh_port"
+      return 0
+    fi
+  fi
+
+  echo "22"
+}
+
+ufw_is_inactive() {
+  [ "$(ufw status 2>/dev/null | head -n 1 || true)" = "Status: inactive" ]
+}
+
+enable_ufw_if_inactive() {
+  local ssh_port
+
+  if ! ufw_is_inactive; then
+    return 0
+  fi
+
+  ssh_port="$(detect_current_ssh_port)"
+
+  echo "UFW is inactive. Allowing SSH and shared web ports before enabling it..."
+  apply_ufw_allow_port_tcp "$ssh_port" "laravel-manager:ssh"
+  if [ "$ssh_port" != "22" ]; then
+    apply_ufw_allow_port_tcp "22" "laravel-manager:ssh"
+  fi
+  apply_ufw_allow_port_tcp "80" "laravel-manager:http"
+  apply_ufw_allow_port_tcp "443" "laravel-manager:https"
+
+  printf 'y\n' | ufw enable
+}
+
+show_matching_ufw_pma_rules() {
+  local port="$1"
+  local pattern
+  local matched="no"
+
+  pattern="(${port}/tcp|port[[:space:]]+${port}|[[:space:]]${port}[[:space:]])"
+
+  if ufw status numbered 2>/dev/null | grep -E "$pattern"; then
+    matched="yes"
+  fi
+
+  if [ "$matched" != "yes" ] && ufw_is_inactive; then
+    if ufw show added 2>/dev/null | grep -E "$pattern"; then
+      matched="yes"
+    fi
+  fi
+
+  if [ "$matched" != "yes" ]; then
+    echo "  No matching rules found."
+  fi
+}
+
 delete_ufw_pma_rules() {
   local port="$1"
   local allowed_sources="${2:-}"
@@ -574,14 +671,17 @@ delete_ufw_pma_rules() {
     for source in "${sources[@]}"; do
       source="$(trim_whitespace "$source")"
       [ -n "$source" ] || continue
-      ufw --force delete allow proto tcp from "$source" to any port "$port" >/dev/null 2>&1 || true
-      ufw --force delete allow from "$source" to any port "$port" proto tcp >/dev/null 2>&1 || true
+      printf 'y\n' | ufw delete allow from "$source" to any port "$port" proto tcp >/dev/null 2>&1 || true
+      printf 'y\n' | ufw delete allow proto tcp from "$source" to any port "$port" >/dev/null 2>&1 || true
+      printf 'y\n' | ufw delete allow from "$source" to any port "$port" >/dev/null 2>&1 || true
     done
   fi
 
   if [ "$restricted" = "yes" ]; then
-    ufw --force delete deny "${port}/tcp" >/dev/null 2>&1 || true
-    ufw --force delete deny proto tcp from any to any port "$port" >/dev/null 2>&1 || true
+    printf 'y\n' | ufw delete deny "${port}/tcp" >/dev/null 2>&1 || true
+    printf 'y\n' | ufw delete deny to any port "$port" proto tcp >/dev/null 2>&1 || true
+    printf 'y\n' | ufw delete deny proto tcp from any to any port "$port" >/dev/null 2>&1 || true
+    printf 'y\n' | ufw delete deny "$port" >/dev/null 2>&1 || true
   fi
 }
 
@@ -608,10 +708,10 @@ apply_ufw_pma_rules() {
   for source in "${sources[@]}"; do
     source="$(trim_whitespace "$source")"
     [ -n "$source" ] || continue
-    ufw --force insert 1 allow proto tcp from "$source" to any port "$new_port" comment "$allow_comment"
+    apply_ufw_allow_source_port_tcp "$source" "$new_port" "$allow_comment"
   done
 
-  ufw --force deny "${new_port}/tcp" comment "$deny_comment"
+  apply_ufw_deny_port_tcp "$new_port" "$deny_comment"
 }
 
 sql_escape_literal() {
@@ -4424,9 +4524,7 @@ manage_project_ufw() {
   fi
   echo ""
   echo "Matching UFW rules for phpMyAdmin port ${pma_port}:"
-  if ! ufw status numbered 2>/dev/null | grep -E "(${pma_port}/tcp|port[[:space:]]+${pma_port}|[[:space:]]${pma_port}[[:space:]])"; then
-    echo "  No matching rules found."
-  fi
+  show_matching_ufw_pma_rules "$pma_port"
   echo ""
   echo "Note: UFW cannot isolate individual project domains on shared ports 80/443."
   echo ""
@@ -4469,9 +4567,7 @@ manage_project_ufw() {
       echo "Project UFW phpMyAdmin rules applied."
       echo "Allowed sources: ${normalized_sources}"
       echo "Denied by default: ${pma_port}/tcp"
-      if [ "$ufw_status" = "Status: inactive" ]; then
-        echo "UFW is currently inactive. These rules will not be enforced until UFW is enabled."
-      fi
+      enable_ufw_if_inactive
       ;;
     clear-phpmyadmin-rules)
       prompt confirm "Remove saved UFW phpMyAdmin rules for ${PROJECT_NAME}? (yes/no): " "no"

@@ -287,7 +287,7 @@ The settings are saved in the project's `.project-meta` file:
 
 If phpMyAdmin is still bound to `127.0.0.1`, UFW rules can be saved but they will not make phpMyAdmin publicly reachable. Use menu option `8) Manage phpMyAdmin` to change phpMyAdmin exposure when public access is really needed.
 
-If UFW is missing, the menu installs it. It does not enable UFW automatically. If UFW is inactive, the rules can be created and saved, but they are not enforced until UFW is enabled. Before enabling UFW on a remote server, make sure SSH access is allowed.
+If UFW is missing, the menu installs it. When `restrict-phpmyadmin` is applied and UFW is inactive, the script allows SSH plus the shared web ports `80/tcp` and `443/tcp`, then enables UFW automatically so the phpMyAdmin restriction is enforced.
 
 ## Project access settings
 
