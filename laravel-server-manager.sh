@@ -1465,6 +1465,7 @@ install_base() {
   systemctl enable --now cron
 
   mkdir -p "$PROJECTS_BASE" "$BACKUPS_BASE"
+  chmod 700 "$SCRIPT_PATH" >/dev/null 2>&1 || true
 
   if ! docker network inspect "$SHARED_NETWORK" >/dev/null 2>&1; then
     echo "Creating shared Docker network ${SHARED_NETWORK}..."
@@ -3109,6 +3110,117 @@ print_mail_dns_instructions() {
   echo "--------------------------------------------------------------"
 }
 
+smtp_port_25_check() {
+  local output=""
+
+  if command -v nc >/dev/null 2>&1; then
+    output="$(
+      timeout 12 bash -c "printf 'EHLO laravel-manager.local\r\nQUIT\r\n' | nc -w 8 127.0.0.1 25" 2>/dev/null || true
+    )"
+  else
+    output="$(
+      timeout 12 bash -c '
+        exec 3<>/dev/tcp/127.0.0.1/25 || exit 1
+        printf "EHLO laravel-manager.local\r\nQUIT\r\n" >&3
+        while IFS= read -r -t 3 line <&3; do
+          printf "%s\n" "$line"
+          case "$line" in
+            221*) break ;;
+          esac
+        done
+      ' 2>/dev/null || true
+    )"
+  fi
+
+  if echo "$output" | grep -q '^220'; then
+    echo "SMTP port 25 responded locally:"
+    echo "$output" | sed -n '1,8p'
+    return 0
+  fi
+
+  echo "Warning: SMTP port 25 did not return a local greeting."
+  if [ -n "$output" ]; then
+    echo "$output" | sed -n '1,8p'
+  fi
+  return 1
+}
+
+repair_postscreen_cache() {
+  local cache_file backup_dir backup_file proceed
+
+  ensure_mailserver_running
+
+  if [ ! -f "$MAIL_COMPOSE" ]; then
+    echo "Mailserver compose file not found: ${MAIL_COMPOSE}"
+    echo "Run option 10 first: Setup email server (docker-mailserver)."
+    exit 1
+  fi
+
+  cache_file="${MAIL_BASE}/docker-data/dms/mail-state/lib-postfix/postscreen_cache.db"
+  backup_dir="/root/mailserver-repair-backups/$(date +%Y%m%d-%H%M%S)"
+
+  echo ""
+  echo "Repair Postfix postscreen cache"
+  echo "--------------------------------------------------------------"
+  echo "This can fix errors like:"
+  echo "  postscreen_cache.db: Unknown error"
+  echo ""
+  echo "The mailserver container will be stopped briefly, the postscreen"
+  echo "cache file will be backed up and removed, then mailserver will be"
+  echo "recreated from ${MAIL_COMPOSE}."
+  echo ""
+  read -r -p "Proceed with postscreen cache repair? (yes/no): " proceed
+  if [ "${proceed,,}" != "yes" ]; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  mkdir -p "$backup_dir"
+  cp -a "$MAIL_COMPOSE" "$backup_dir/compose.yaml"
+  [ -f "$MAIL_ENV_FILE" ] && cp -a "$MAIL_ENV_FILE" "$backup_dir/mailserver.env"
+
+  if [ -f "$cache_file" ]; then
+    backup_file="$backup_dir/postscreen_cache.db"
+    cp -a "$cache_file" "$backup_file"
+    echo "Backed up postscreen cache to: ${backup_file}"
+  else
+    echo "No existing postscreen cache file found at: ${cache_file}"
+  fi
+
+  echo "Stopping mailserver..."
+  dc -f "$MAIL_COMPOSE" stop mailserver || true
+
+  echo "Removing postscreen cache..."
+  rm -f "$cache_file"
+
+  echo "Recreating mailserver..."
+  dc -f "$MAIL_COMPOSE" up -d --force-recreate mailserver
+
+  echo "Waiting for mailserver to start..."
+  for _ in $(seq 1 30); do
+    if docker_container_running "mailserver"; then
+      break
+    fi
+    sleep 2
+  done
+
+  if ! docker_container_running "mailserver"; then
+    echo "mailserver did not start successfully."
+    echo "Check logs with: docker logs mailserver"
+    exit 1
+  fi
+
+  echo ""
+  docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | awk 'NR==1 || $1=="mailserver"'
+  echo ""
+  smtp_port_25_check || true
+  echo ""
+  echo "Recent critical mailserver log lines:"
+  docker logs --since 5m mailserver 2>&1 \
+    | grep -Ei 'fatal|panic|error|failed|bad command startup|postscreen_cache' \
+    || echo "No critical mailserver log lines found in the last 5 minutes."
+}
+
 add_mail_domain() {
   local domain mail_host guessed_host dkim_file proceed
 
@@ -3261,7 +3373,7 @@ manage_mailserver() {
 
   ensure_mailserver_running
 
-  prompt action "Action [status/add-domain/change-mail-host/add-mailbox/delete-mailbox/reset-password/list-mailboxes/gen-dkim/show-dkim/dns-help]: " "status"
+  prompt action "Action [status/add-domain/change-mail-host/add-mailbox/delete-mailbox/reset-password/list-mailboxes/gen-dkim/show-dkim/dns-help/repair-postscreen-cache]: " "status"
 
   case "${action,,}" in
     status)
@@ -3391,6 +3503,9 @@ manage_mailserver() {
       fi
 
       print_mail_dns_instructions "$domain_list" "$mail_host"
+      ;;
+    repair-postscreen-cache)
+      repair_postscreen_cache
       ;;
     *)
       echo "Invalid option."
