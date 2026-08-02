@@ -16,9 +16,16 @@ SCRIPT_PATH="$(readlink -f "$0")"
 MAIL_BASE="/opt/mailserver"
 MAIL_COMPOSE="${MAIL_BASE}/compose.yaml"
 MAIL_ENV_FILE="${MAIL_BASE}/mailserver.env"
+MAIL_FAIL2BAN_JAIL_FILE="${MAIL_BASE}/docker-data/dms/config/fail2ban-jail.cf"
 WEBMAIL_BASE="/opt/webmail-roundcube"
 WEBMAIL_COMPOSE="${WEBMAIL_BASE}/compose.yaml"
 WEBMAIL_META_FILE="${WEBMAIL_BASE}/.webmail-meta"
+WEBMAIL_PASSWORD_HELPER_DIR="${WEBMAIL_BASE}/password-helper"
+WEBMAIL_PASSWORD_FORCE_PLUGIN_DIR="${WEBMAIL_BASE}/force-password-change-plugin"
+WEBMAIL_PASSWORD_CONFIG_FILE="${WEBMAIL_BASE}/data/config/password-change.inc.php"
+WEBMAIL_PASSWORD_FORCE_STATE_FILE="${WEBMAIL_BASE}/data/config/force-password-change-users.txt"
+WEBMAIL_PASSWORD_TOKEN_FILE="${WEBMAIL_BASE}/.password-helper-token"
+WEBMAIL_PASSWORD_HELPER_CONTAINER="roundcube-password-helper"
 GUACAMOLE_BASE="/opt/apache-guacamole"
 GUACAMOLE_COMPOSE="${GUACAMOLE_BASE}/compose.yaml"
 GUACAMOLE_META_FILE="${GUACAMOLE_BASE}/.guacamole-meta"
@@ -49,6 +56,7 @@ DEFAULT_LARAVEL_QUEUE_MAX_TIME="3600"
 # Values loaded from "${app_dir}/.project-meta" (declared to keep shellcheck happy)
 PROJECT_NAME=""
 DOMAIN=""
+PROJECT_DOMAINS=""
 DB_NAME=""
 DB_USER=""
 DB_PASSWORD=""
@@ -1545,6 +1553,7 @@ write_project_files() {
   local project_access_allowed_sources project_access_restricted
   local laravel_queue_connection="" laravel_queue_names="" laravel_queue_sleep="" laravel_queue_tries=""
   local laravel_queue_timeout="" laravel_queue_max_time="" laravel_queue_stopwaitsecs=""
+  local project_domains="${PROJECT_DOMAINS:-}"
 
   if [ -z "$pma_port" ]; then
     pma_port="$(pma_default_port "$project_name")"
@@ -1581,6 +1590,7 @@ write_project_files() {
   ufw_pma_port="$(read_project_ufw_pma_port "$app_dir" "$pma_port")"
   project_access_allowed_sources="$(read_project_access_allowed_sources "$app_dir")"
   project_access_restricted="$(read_project_access_restricted "$app_dir")"
+  project_domains="$(normalize_project_domain_list "$domain" "$project_domains" 2>/dev/null || echo "$domain")"
 
   if [ "$app_profile" = "node" ]; then
     local node_container="${project_name}-node"
@@ -1632,6 +1642,7 @@ EOF
     {
       printf 'PROJECT_NAME=%q\n' "$project_name"
       printf 'DOMAIN=%q\n' "$domain"
+      printf 'PROJECT_DOMAINS=%q\n' "$project_domains"
       printf 'DB_NAME=%q\n' ""
       printf 'DB_USER=%q\n' ""
       printf 'DB_PASSWORD=%q\n' ""
@@ -1922,6 +1933,7 @@ EOF
   {
     printf 'PROJECT_NAME=%q\n' "$project_name"
     printf 'DOMAIN=%q\n' "$domain"
+    printf 'PROJECT_DOMAINS=%q\n' "$project_domains"
     printf 'DB_NAME=%q\n' "$db_name"
     printf 'DB_USER=%q\n' "$db_user"
     printf 'DB_PASSWORD=%q\n' "$db_password"
@@ -1958,6 +1970,7 @@ EOF
 write_proxy_config_http() {
   local project_name="$1"
   local domain="$2"
+  local config_file="${3:-${PROXY_CONF_DIR}/${project_name}.conf}"
   local php_container="${project_name}-php"
   local node_container="${project_name}-node"
   local app_dir
@@ -1991,7 +2004,7 @@ write_proxy_config_http() {
   guacamole_proxy_block="$(build_guacamole_proxy_block "$guacamole_proxy_enabled" "$guacamole_proxy_upstream" "$project_access_block")"
 
   if [ "$app_profile" = "node" ]; then
-    cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
+    cat > "$config_file" <<EOF
 server {
     listen 80;
     server_name ${domain};
@@ -2036,7 +2049,7 @@ EOF
 
   docroot="$(project_container_docroot "$project_name" "$app_dir")"
 
-  cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
+  cat > "$config_file" <<EOF
 server {
     listen 80;
     server_name ${domain};
@@ -2079,6 +2092,7 @@ EOF
 write_proxy_config_https() {
   local project_name="$1"
   local domain="$2"
+  local config_file="${3:-${PROXY_CONF_DIR}/${project_name}.conf}"
   local php_container="${project_name}-php"
   local node_container="${project_name}-node"
   local app_dir
@@ -2112,7 +2126,7 @@ write_proxy_config_https() {
   guacamole_proxy_block="$(build_guacamole_proxy_block "$guacamole_proxy_enabled" "$guacamole_proxy_upstream" "$project_access_block")"
 
   if [ "$app_profile" = "node" ]; then
-    cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
+    cat > "$config_file" <<EOF
 server {
     listen 80;
     server_name ${domain};
@@ -2175,7 +2189,7 @@ EOF
 
   docroot="$(project_container_docroot "$project_name" "$app_dir")"
 
-  cat > "${PROXY_CONF_DIR}/${project_name}.conf" <<EOF
+  cat > "$config_file" <<EOF
 server {
     listen 80;
     server_name ${domain};
@@ -2239,15 +2253,186 @@ project_has_https_certificate() {
     && [ -f "${PROXY_CERTBOT_CONF}/live/${domain}/privkey.pem" ]
 }
 
+normalize_project_domain_list() {
+  local primary="$1"
+  local configured="${2:-}"
+  local normalized result part
+
+  primary="$(normalize_domain "$primary")"
+  validate_domain "$primary" || return 1
+
+  normalized="$(normalize_domain_csv "${configured:-$primary}")"
+  result="$primary"
+
+  IFS=',' read -r -a parts <<< "$normalized"
+  for part in "${parts[@]}"; do
+    [ -n "$part" ] || continue
+    validate_domain "$part" || return 1
+    if [ "$part" != "$primary" ] && ! csv_contains_value "$result" "$part"; then
+      result="${result},${part}"
+    fi
+  done
+
+  printf '%s' "$result"
+}
+
+project_domains_for_project() {
+  local app_dir="$1"
+  local primary="$2"
+  local configured
+
+  configured="$(read_project_meta_var "$app_dir" "PROJECT_DOMAINS")"
+  normalize_project_domain_list "$primary" "$configured" 2>/dev/null || echo "$primary"
+}
+
+project_alias_proxy_config_file() {
+  local project_name="$1"
+  local domain="$2"
+  echo "${PROXY_CONF_DIR}/${project_name}-alias-$(safe_domain_name "$domain").conf"
+}
+
+project_domain_proxy_config_file() {
+  local project_name="$1"
+  local domain="$2"
+  local primary_domain="$3"
+
+  if [ "$domain" = "$primary_domain" ]; then
+    echo "${PROXY_CONF_DIR}/${project_name}.conf"
+  else
+    project_alias_proxy_config_file "$project_name" "$domain"
+  fi
+}
+
+remove_stale_project_alias_proxy_configs() {
+  local project_name="$1"
+  local domains="$2"
+  local primary_domain expected="" domain file base expected_file
+
+  primary_domain="$(csv_first_value "$domains")"
+  IFS=',' read -r -a parts <<< "$domains"
+  for domain in "${parts[@]}"; do
+    [ -n "$domain" ] || continue
+    [ "$domain" != "$primary_domain" ] || continue
+    expected_file="$(basename "$(project_alias_proxy_config_file "$project_name" "$domain")")"
+    expected="${expected} ${expected_file}"
+  done
+
+  for file in "${PROXY_CONF_DIR}/${project_name}-alias-"*.conf; do
+    [ -e "$file" ] || continue
+    base="$(basename "$file")"
+    if [[ " ${expected} " != *" ${base} "* ]]; then
+      rm -f "$file"
+    fi
+  done
+}
+
+write_project_domain_proxy_config() {
+  local project_name="$1"
+  local domain="$2"
+  local primary_domain="$3"
+  local config_file
+
+  config_file="$(project_domain_proxy_config_file "$project_name" "$domain" "$primary_domain")"
+  if project_has_https_certificate "$domain"; then
+    write_proxy_config_https "$project_name" "$domain" "$config_file"
+  else
+    write_proxy_config_http "$project_name" "$domain" "$config_file"
+  fi
+}
+
+write_project_proxy_configs() {
+  local project_name="$1"
+  local domains="$2"
+  local primary_domain domain
+
+  primary_domain="$(csv_first_value "$domains")"
+  domains="$(normalize_project_domain_list "$primary_domain" "$domains")"
+  primary_domain="$(csv_first_value "$domains")"
+
+  remove_stale_project_alias_proxy_configs "$project_name" "$domains"
+
+  IFS=',' read -r -a parts <<< "$domains"
+  for domain in "${parts[@]}"; do
+    [ -n "$domain" ] || continue
+    write_project_domain_proxy_config "$project_name" "$domain" "$primary_domain"
+  done
+}
+
+issue_project_domain_certificate() {
+  local project_name="$1"
+  local domain="$2"
+  local email="$3"
+  local primary_domain="$4"
+  local config_file
+
+  config_file="$(project_domain_proxy_config_file "$project_name" "$domain" "$primary_domain")"
+
+  echo "Switching ${domain} to HTTP for certificate issuance..."
+  write_proxy_config_http "$project_name" "$domain" "$config_file"
+  proxy_dc restart reverse-proxy
+
+  echo "Requesting SSL certificate for ${domain}..."
+  if ! proxy_dc run --rm certbot certonly \
+    --webroot \
+    --webroot-path=/var/www/certbot \
+    --email "$email" \
+    --agree-tos \
+    --no-eff-email \
+    --non-interactive \
+    --keep-until-expiring \
+    -d "$domain"; then
+    return 1
+  fi
+
+  echo "Enabling HTTPS for ${domain}..."
+  write_proxy_config_https "$project_name" "$domain" "$config_file"
+}
+
+remove_project_certificate_files() {
+  local domain="$1"
+
+  rm -rf "${PROXY_CERTBOT_CONF}/live/${domain}" || true
+  rm -rf "${PROXY_CERTBOT_CONF}/archive/${domain}" || true
+  rm -rf "${PROXY_CERTBOT_CONF}/renewal/${domain}.conf" || true
+}
+
+remove_project_domain_proxy_config() {
+  local project_name="$1"
+  local domain="$2"
+  local primary_domain="$3"
+  local config_file
+
+  config_file="$(project_domain_proxy_config_file "$project_name" "$domain" "$primary_domain")"
+  rm -f "$config_file" || true
+}
+
+project_domain_list_remove() {
+  local domains="$1"
+  local remove_domain="$2"
+  local result="" domain
+
+  IFS=',' read -r -a parts <<< "$domains"
+  for domain in "${parts[@]}"; do
+    [ -n "$domain" ] || continue
+    [ "$domain" != "$remove_domain" ] || continue
+    if [ -z "$result" ]; then
+      result="$domain"
+    else
+      result="${result},${domain}"
+    fi
+  done
+
+  printf '%s' "$result"
+}
+
 regenerate_project_proxy_config() {
   local project_name="$1"
   local domain="$2"
+  local app_dir domains
 
-  if project_has_https_certificate "$domain"; then
-    write_proxy_config_https "$project_name" "$domain"
-  else
-    write_proxy_config_http "$project_name" "$domain"
-  fi
+  app_dir="$(resolve_project_dir "$project_name")"
+  domains="$(project_domains_for_project "$app_dir" "$domain")"
+  write_project_proxy_configs "$project_name" "$domains"
 
   proxy_dc restart reverse-proxy
 }
@@ -2671,6 +2856,7 @@ write_webmail_meta() {
   local webmail_domain="$1"
   local webmail_domains="$2"
   local mail_host="$3"
+  local password_change_enabled="${4:-no}"
 
   mkdir -p "$WEBMAIL_BASE"
   {
@@ -2678,6 +2864,7 @@ write_webmail_meta() {
     printf 'WEBMAIL_DOMAIN=%q\n' "$webmail_domain"
     printf 'WEBMAIL_DOMAINS=%q\n' "$webmail_domains"
     printf 'MAIL_HOST=%q\n' "$mail_host"
+    printf 'WEBMAIL_PASSWORD_CHANGE_ENABLED=%q\n' "$password_change_enabled"
   } > "$WEBMAIL_META_FILE"
 }
 
@@ -2712,13 +2899,665 @@ write_roundcube_proxy_configs() {
   done
 }
 
+generate_secret_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+    return 0
+  fi
+
+  od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+normalize_email_address() {
+  local email="${1:-}"
+  email="${email//[$'\t\r\n ']/}"
+  email="${email,,}"
+  printf '%s' "$email"
+}
+
+validate_email_address() {
+  local email="${1:-}"
+  [[ "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+}
+
+ensure_webmail_force_password_state_file() {
+  mkdir -p "$(dirname "$WEBMAIL_PASSWORD_FORCE_STATE_FILE")"
+  touch "$WEBMAIL_PASSWORD_FORCE_STATE_FILE"
+  chmod 0664 "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" >/dev/null 2>&1 || true
+  chown 33:33 "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" >/dev/null 2>&1 || true
+}
+
+webmail_force_password_mark() {
+  local email
+  email="$(normalize_email_address "${1:-}")"
+
+  if ! validate_email_address "$email"; then
+    echo "Invalid email address: ${email}"
+    return 1
+  fi
+
+  ensure_webmail_force_password_state_file
+  if grep -Fxiq "$email" "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" 2>/dev/null; then
+    echo "Already marked for password change: ${email}"
+    return 0
+  fi
+
+  printf '%s\n' "$email" >> "$WEBMAIL_PASSWORD_FORCE_STATE_FILE"
+  chmod 0664 "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" >/dev/null 2>&1 || true
+  chown 33:33 "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" >/dev/null 2>&1 || true
+  echo "Marked for password change at next Roundcube login: ${email}"
+}
+
+webmail_force_password_clear() {
+  local email tmp_file
+  email="$(normalize_email_address "${1:-}")"
+
+  if ! validate_email_address "$email"; then
+    echo "Invalid email address: ${email}"
+    return 1
+  fi
+
+  ensure_webmail_force_password_state_file
+  tmp_file="$(mktemp)"
+  awk -v target="$email" '
+    BEGIN { removed = 0 }
+    {
+      line = $0
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      if (tolower(line) == target) {
+        removed = 1
+        next
+      }
+      print
+    }
+    END { exit removed ? 0 : 2 }
+  ' "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" > "$tmp_file" || {
+    local status=$?
+    if [ "$status" -eq 2 ]; then
+      mv "$tmp_file" "$WEBMAIL_PASSWORD_FORCE_STATE_FILE"
+      chmod 0664 "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" >/dev/null 2>&1 || true
+      chown 33:33 "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" >/dev/null 2>&1 || true
+      echo "User was not marked: ${email}"
+      return 0
+    fi
+    rm -f "$tmp_file"
+    return "$status"
+  }
+
+  mv "$tmp_file" "$WEBMAIL_PASSWORD_FORCE_STATE_FILE"
+  chmod 0664 "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" >/dev/null 2>&1 || true
+  chown 33:33 "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" >/dev/null 2>&1 || true
+  echo "Cleared forced password change for: ${email}"
+}
+
+webmail_force_password_list() {
+  ensure_webmail_force_password_state_file
+  awk '
+    {
+      line = $0
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      if (line != "" && line !~ /^#/) {
+        print tolower(line)
+      }
+    }
+  ' "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" | sort -fu
+}
+
+mailbox_addresses() {
+  local accounts_file="${MAIL_BASE}/docker-data/dms/config/postfix-accounts.cf"
+
+  if [ -f "$accounts_file" ]; then
+    awk -F'|' '
+      /^[[:space:]]*#/ { next }
+      NF >= 2 {
+        account = $1
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", account)
+        if (account != "") {
+          print tolower(account)
+        }
+      }
+    ' "$accounts_file" | sort -fu
+    return 0
+  fi
+
+  docker exec mailserver setup email list 2>/dev/null \
+    | awk '/@/ {print tolower($1)}' \
+    | sort -fu
+}
+
+webmail_password_change_enabled() {
+  load_current_webmail_settings >/dev/null 2>&1 || true
+  [ "${WEBMAIL_CURRENT_PASSWORD_CHANGE_ENABLED:-no}" = "yes" ]
+}
+
+shared_network_subnet() {
+  docker network inspect "$SHARED_NETWORK" -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null | head -n 1
+}
+
+ensure_mailserver_fail2ban_ignores_shared_network() {
+  local subnet backup roundcube_ip
+
+  docker_container_exists mailserver || return 0
+
+  subnet="$(shared_network_subnet || true)"
+  if [ -z "$subnet" ]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$MAIL_FAIL2BAN_JAIL_FILE")"
+  if [ -f "$MAIL_FAIL2BAN_JAIL_FILE" ] && ! grep -q "Managed by laravel-server-manager" "$MAIL_FAIL2BAN_JAIL_FILE"; then
+    backup="${MAIL_FAIL2BAN_JAIL_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$MAIL_FAIL2BAN_JAIL_FILE" "$backup"
+    echo "Existing fail2ban jail override backed up to: ${backup}"
+  fi
+
+  cat > "$MAIL_FAIL2BAN_JAIL_FILE" <<EOF
+# Managed by laravel-server-manager.
+# Prevent one webmail login mistake from banning the shared Roundcube container IP.
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ${subnet}
+EOF
+  chmod 0644 "$MAIL_FAIL2BAN_JAIL_FILE" >/dev/null 2>&1 || true
+
+  if docker_container_running mailserver \
+    && docker exec mailserver sh -lc 'command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client ping >/dev/null 2>&1'; then
+    docker exec mailserver sh -lc 'cp /tmp/docker-mailserver/fail2ban-jail.cf /etc/fail2ban/jail.d/user-jail.local && fail2ban-client reload' >/dev/null 2>&1 || true
+
+    if docker_container_exists roundcube-webmail; then
+      roundcube_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' roundcube-webmail 2>/dev/null || true)"
+      if [ -n "$roundcube_ip" ]; then
+        docker exec mailserver fail2ban-client set dovecot unbanip "$roundcube_ip" >/dev/null 2>&1 || true
+        docker exec mailserver fail2ban-client set postfix unbanip "$roundcube_ip" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+}
+
+ensure_roundcube_password_change_files() {
+  local token
+
+  mkdir -p "$WEBMAIL_PASSWORD_HELPER_DIR" "$WEBMAIL_PASSWORD_FORCE_PLUGIN_DIR" "$(dirname "$WEBMAIL_PASSWORD_CONFIG_FILE")"
+  ensure_webmail_force_password_state_file
+
+  if [ ! -f "$WEBMAIL_PASSWORD_TOKEN_FILE" ]; then
+    umask 077
+    generate_secret_token > "$WEBMAIL_PASSWORD_TOKEN_FILE"
+  fi
+
+  chmod 600 "$WEBMAIL_PASSWORD_TOKEN_FILE" >/dev/null 2>&1 || true
+  token="$(cat "$WEBMAIL_PASSWORD_TOKEN_FILE")"
+
+  cat > "${WEBMAIL_PASSWORD_HELPER_DIR}/password-helper.py" <<'PY'
+#!/usr/bin/env python3
+import fcntl
+import hmac
+import os
+import re
+import signal
+import stat
+import subprocess
+import tempfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+
+ACCOUNTS_FILE = os.environ.get("MAIL_ACCOUNTS_FILE", "/tmp/docker-mailserver/postfix-accounts.cf")
+FORCE_CHANGE_FILE = os.environ.get("FORCE_PASSWORD_FILE", "/roundcube-config/force-password-change-users.txt")
+TOKEN = os.environ.get("PASSWORD_HELPER_TOKEN", "")
+MIN_LENGTH = int(os.environ.get("PASSWORD_MIN_LENGTH", "8"))
+LISTEN_HOST = os.environ.get("PASSWORD_LISTEN_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.environ.get("PASSWORD_LISTEN_PORT", "8080"))
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def run_doveadm(args):
+    return subprocess.run(
+        ["doveadm", "pw", *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+        check=False,
+    )
+
+
+def verify_password(stored_hash, password):
+    result = run_doveadm(["-t", stored_hash, "-p", password])
+    return result.returncode == 0
+
+
+def generate_hash(password):
+    result = run_doveadm(["-s", "SHA512-CRYPT", "-p", password])
+    if result.returncode != 0:
+        raise RuntimeError("failed to generate password hash")
+
+    generated = result.stdout.strip()
+    if not generated.startswith("{SHA512-CRYPT}"):
+        raise RuntimeError("unexpected password hash format")
+
+    return generated
+
+
+def read_accounts():
+    with open(ACCOUNTS_FILE, "r", encoding="utf-8") as handle:
+        return handle.readlines()
+
+
+def find_account(lines, username):
+    wanted = username.lower()
+    for index, line in enumerate(lines):
+        stripped = line.rstrip("\n")
+        if not stripped or stripped.startswith("#") or "|" not in stripped:
+            continue
+
+        account, stored_hash = stripped.split("|", 1)
+        if account.lower() == wanted:
+            return index, account, stored_hash
+
+    return None, None, None
+
+
+def clear_force_change(username):
+    wanted = username.lower()
+    directory = os.path.dirname(FORCE_CHANGE_FILE) or "."
+    os.makedirs(directory, exist_ok=True)
+    lock_path = FORCE_CHANGE_FILE + ".lock"
+
+    with open(lock_path, "w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+        try:
+            with open(FORCE_CHANGE_FILE, "r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except FileNotFoundError:
+            lines = []
+
+        kept = []
+        changed = False
+        for line in lines:
+            if line.strip().lower() == wanted:
+                changed = True
+                continue
+            kept.append(line)
+
+        if not changed:
+            return
+
+        with open(FORCE_CHANGE_FILE, "w", encoding="utf-8") as handle:
+            handle.writelines(kept)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def reload_mailserver_auth():
+    process_name = os.environ.get("MAIL_RELOAD_PROCESS", "dovecot")
+    signalled = False
+
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+
+        try:
+            with open(f"/proc/{entry}/comm", "r", encoding="utf-8") as handle:
+                comm = handle.read().strip()
+        except OSError:
+            continue
+
+        if comm != process_name:
+            continue
+
+        os.kill(int(entry), signal.SIGHUP)
+        signalled = True
+
+    if not signalled:
+        raise RuntimeError(f"{process_name} process not found for reload")
+
+
+def update_account(username, current_password, new_password):
+    lock_path = ACCOUNTS_FILE + ".lock"
+    account = username
+
+    with open(lock_path, "w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+        lines = read_accounts()
+        index, account, stored_hash = find_account(lines, username)
+        if index is None:
+            return 404, "user not found"
+
+        if not verify_password(stored_hash, current_password):
+            return 401, "current password is invalid"
+
+        new_hash = generate_hash(new_password)
+        newline = "\n" if lines[index].endswith("\n") else ""
+        lines[index] = f"{account}|{new_hash}{newline}"
+
+        file_stat = os.stat(ACCOUNTS_FILE)
+        directory = os.path.dirname(ACCOUNTS_FILE)
+        fd, tmp_path = tempfile.mkstemp(prefix=".postfix-accounts.", dir=directory, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                tmp.writelines(lines)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+
+            os.chmod(tmp_path, stat.S_IMODE(file_stat.st_mode))
+            os.chown(tmp_path, file_stat.st_uid, file_stat.st_gid)
+            os.replace(tmp_path, ACCOUNTS_FILE)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    reload_mailserver_auth()
+
+    try:
+        clear_force_change(account)
+    except Exception as exc:
+        print(f"force password marker clear failed user={account}: {exc}", flush=True)
+
+    return 200, "ok"
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "RoundcubePasswordHelper/1.0"
+
+    def log_message(self, fmt, *args):
+        print("%s - %s" % (self.address_string(), fmt % args), flush=True)
+
+    def write_plain(self, status, body):
+        encoded = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def do_GET(self):
+        if urlparse(self.path).path == "/health":
+            self.write_plain(200, "ok")
+            return
+        self.write_plain(404, "not found")
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/change":
+            self.write_plain(404, "not found")
+            return
+
+        query_token = parse_qs(parsed.query).get("token", [""])[0]
+        if not TOKEN or not hmac.compare_digest(query_token, TOKEN):
+            self.write_plain(403, "forbidden")
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > 16384:
+            self.write_plain(400, "invalid request")
+            return
+
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        params = parse_qs(body, keep_blank_values=True)
+        username = params.get("user", [""])[0].strip()
+        current_password = params.get("curpass", [""])[0]
+        new_password = params.get("newpass", [""])[0]
+
+        if not EMAIL_RE.match(username):
+            self.write_plain(400, "invalid user")
+            return
+
+        if len(new_password) < MIN_LENGTH:
+            self.write_plain(400, "password too short")
+            return
+
+        if "\x00" in current_password or "\x00" in new_password:
+            self.write_plain(400, "invalid password")
+            return
+
+        try:
+            status, message = update_account(username, current_password, new_password)
+        except Exception as exc:
+            print(f"password change error user={username}: {exc}", flush=True)
+            self.write_plain(500, "internal error")
+            return
+
+        if status == 200:
+            print(f"password change success user={username}", flush=True)
+            self.write_plain(200, "ok")
+            return
+
+        print(f"password change rejected user={username}: {message}", flush=True)
+        self.write_plain(status, message)
+
+
+if __name__ == "__main__":
+    ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler).serve_forever()
+PY
+
+  chmod 755 "${WEBMAIL_PASSWORD_HELPER_DIR}/password-helper.py"
+
+  cat > "$WEBMAIL_PASSWORD_CONFIG_FILE" <<EOF
+<?php
+\$config['password_driver'] = 'httpapi';
+\$config['password_confirm_current'] = true;
+\$config['password_minimum_length'] = 8;
+\$config['password_log'] = false;
+\$config['password_httpapi_url'] = 'http://roundcube-password-helper:8080/change?token=${token}';
+\$config['password_httpapi_method'] = 'POST';
+\$config['password_httpapi_var_user'] = 'user';
+\$config['password_httpapi_var_curpass'] = 'curpass';
+\$config['password_httpapi_var_newpass'] = 'newpass';
+\$config['password_httpapi_expect'] = '/^ok$/i';
+EOF
+
+  chmod 0644 "$WEBMAIL_PASSWORD_CONFIG_FILE"
+
+  cat > "${WEBMAIL_PASSWORD_FORCE_PLUGIN_DIR}/config.inc.php" <<'PHP'
+<?php
+$config['force_password_change_state_file'] = '/var/roundcube/config/force-password-change-users.txt';
+PHP
+
+  cat > "${WEBMAIL_PASSWORD_FORCE_PLUGIN_DIR}/force_password_change.php" <<'PHP'
+<?php
+
+class force_password_change extends rcube_plugin
+{
+    public $task = '.*';
+
+    private $rc;
+
+    public function init()
+    {
+        $this->rc = rcmail::get_instance();
+        $this->load_config();
+
+        $this->add_hook('login_after', [$this, 'login_after']);
+        $this->add_hook('startup', [$this, 'startup']);
+        $this->add_hook('password_change', [$this, 'password_change']);
+    }
+
+    public function login_after($args)
+    {
+        $username = $this->username();
+
+        if ($username && $this->is_forced($username)) {
+            $_SESSION['force_password_change'] = true;
+        }
+        else {
+            unset($_SESSION['force_password_change']);
+        }
+
+        return $args;
+    }
+
+    public function startup($args)
+    {
+        if (empty($_SESSION['user_id'])) {
+            return $args;
+        }
+
+        $username = $this->username();
+        if (!$username) {
+            return $args;
+        }
+
+        $forced = $this->is_forced($username);
+        if ($forced) {
+            $_SESSION['force_password_change'] = true;
+        }
+        else {
+            unset($_SESSION['force_password_change']);
+            return $args;
+        }
+
+        if (!$this->is_password_screen() && !$this->is_logout()) {
+            $this->rc->output->redirect([
+                '_task' => 'settings',
+                '_action' => 'plugin.password',
+                '_first' => 1,
+                '_forced' => 1,
+            ], 0);
+        }
+
+        return $args;
+    }
+
+    public function password_change($args)
+    {
+        $username = $this->username();
+        if ($username) {
+            $this->clear_forced($username);
+        }
+
+        unset($_SESSION['force_password_change']);
+
+        return $args;
+    }
+
+    private function username()
+    {
+        if ($this->rc && $this->rc->user && !empty($this->rc->user->data['username'])) {
+            return strtolower(trim($this->rc->user->data['username']));
+        }
+
+        if ($this->rc && method_exists($this->rc, 'get_user_name')) {
+            $username = $this->rc->get_user_name();
+            if ($username) {
+                return strtolower(trim($username));
+            }
+        }
+
+        return '';
+    }
+
+    private function is_password_screen()
+    {
+        return $this->rc->task === 'settings'
+            && strpos((string) $this->rc->action, 'plugin.password') === 0;
+    }
+
+    private function is_logout()
+    {
+        return $this->rc->task === 'logout' || $this->rc->action === 'logout';
+    }
+
+    private function state_file()
+    {
+        return $this->rc->config->get('force_password_change_state_file', '/var/roundcube/config/force-password-change-users.txt');
+    }
+
+    private function is_forced($username)
+    {
+        $path = $this->state_file();
+        if (!$path || !is_readable($path)) {
+            return false;
+        }
+
+        $wanted = strtolower(trim($username));
+        $lines = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if (!$lines) {
+            return false;
+        }
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if ($line === '' || strpos($line, '#') === 0) {
+                continue;
+            }
+
+            if (strtolower($line) === $wanted) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function clear_forced($username)
+    {
+        $path = $this->state_file();
+        $dir = dirname($path);
+        if (!$path || !is_dir($dir)) {
+            return;
+        }
+
+        if (!file_exists($path)) {
+            @touch($path);
+            @chmod($path, 0664);
+        }
+
+        $lock = @fopen($path . '.lock', 'c');
+        if (!$lock) {
+            return;
+        }
+
+        if (!flock($lock, LOCK_EX)) {
+            fclose($lock);
+            return;
+        }
+
+        $wanted = strtolower(trim($username));
+        $lines = @file($path, FILE_IGNORE_NEW_LINES);
+        $kept = [];
+        $changed = false;
+
+        foreach ($lines ?: [] as $line) {
+            if (strtolower(trim($line)) === $wanted) {
+                $changed = true;
+                continue;
+            }
+            $kept[] = rtrim($line, "\r\n");
+        }
+
+        if ($changed) {
+            $body = count($kept) ? implode(PHP_EOL, $kept) . PHP_EOL : '';
+            @file_put_contents($path, $body);
+            @chmod($path, 0664);
+        }
+
+        flock($lock, LOCK_UN);
+        fclose($lock);
+    }
+}
+PHP
+
+  chmod 0755 "$WEBMAIL_PASSWORD_FORCE_PLUGIN_DIR"
+  chmod 0644 "${WEBMAIL_PASSWORD_FORCE_PLUGIN_DIR}/config.inc.php" "${WEBMAIL_PASSWORD_FORCE_PLUGIN_DIR}/force_password_change.php"
+  chown -R 33:33 "${WEBMAIL_BASE}/data/config" >/dev/null 2>&1 || true
+}
+
 write_roundcube_compose() {
   local webmail_domain="$1"
   local webmail_domains="$2"
   local mail_host="$3"
+  local password_change_enabled="${4:-no}"
+  local roundcube_plugins="archive,zipdownload"
 
   mkdir -p "${WEBMAIL_BASE}/data/db" "${WEBMAIL_BASE}/data/config" "${WEBMAIL_BASE}/data/temp"
   chown -R 33:33 "${WEBMAIL_BASE}/data" >/dev/null 2>&1 || true
+
+  if [ "$password_change_enabled" = "yes" ]; then
+    ensure_roundcube_password_change_files
+    roundcube_plugins="archive,zipdownload,password,force_password_change"
+  fi
 
   cat > "$WEBMAIL_COMPOSE" <<EOF
 services:
@@ -2733,21 +3572,54 @@ services:
       ROUNDCUBEMAIL_SMTP_PORT: 587
       ROUNDCUBEMAIL_DB_TYPE: sqlite
       ROUNDCUBEMAIL_UPLOAD_MAX_FILESIZE: 25M
+      ROUNDCUBEMAIL_PLUGINS: "${roundcube_plugins}"
     volumes:
       - ./data/db:/var/roundcube/db
       - ./data/config:/var/roundcube/config
       - ./data/temp:/tmp/roundcube-temp
+      - ./force-password-change-plugin:/var/www/html/plugins/force_password_change:ro
     networks:
       ${SHARED_NETWORK}:
         aliases:
           - roundcube-webmail
+EOF
+
+  if [ "$password_change_enabled" = "yes" ]; then
+    cat >> "$WEBMAIL_COMPOSE" <<EOF
+
+  password-helper:
+    image: ghcr.io/docker-mailserver/docker-mailserver:latest
+    container_name: ${WEBMAIL_PASSWORD_HELPER_CONTAINER}
+    restart: unless-stopped
+    pid: "container:mailserver"
+    entrypoint: ["python3", "/app/password-helper.py"]
+    environment:
+      MAIL_ACCOUNTS_FILE: "/tmp/docker-mailserver/postfix-accounts.cf"
+      FORCE_PASSWORD_FILE: "/roundcube-config/force-password-change-users.txt"
+      MAIL_RELOAD_PROCESS: "dovecot"
+      PASSWORD_HELPER_TOKEN: "$(cat "$WEBMAIL_PASSWORD_TOKEN_FILE")"
+      PASSWORD_MIN_LENGTH: "8"
+      PASSWORD_LISTEN_HOST: "0.0.0.0"
+      PASSWORD_LISTEN_PORT: "8080"
+    volumes:
+      - ./password-helper:/app:ro
+      - ./data/config:/roundcube-config
+      - ${MAIL_BASE}/docker-data/dms/config:/tmp/docker-mailserver
+    networks:
+      ${SHARED_NETWORK}:
+        aliases:
+          - roundcube-password-helper
+EOF
+  fi
+
+  cat >> "$WEBMAIL_COMPOSE" <<EOF
 
 networks:
   ${SHARED_NETWORK}:
     external: true
 EOF
 
-  write_webmail_meta "$webmail_domain" "$webmail_domains" "$mail_host"
+  write_webmail_meta "$webmail_domain" "$webmail_domains" "$mail_host" "$password_change_enabled"
 }
 
 issue_webmail_certificate() {
@@ -2840,13 +3712,14 @@ issue_mail_host_certificate() {
 sync_webmail_mail_host_if_needed() {
   local old_mail_host="$1"
   local new_mail_host="$2"
-  local current_webmail_domains current_webmail_domain current_mail_host
+  local current_webmail_domains current_webmail_domain current_mail_host current_password_change_enabled
 
   [ -f "$WEBMAIL_COMPOSE" ] || return 0
 
   current_webmail_domains=""
   current_webmail_domain=""
   current_mail_host=""
+  current_password_change_enabled="no"
 
   if [ -f "$WEBMAIL_META_FILE" ]; then
     # shellcheck disable=SC1090
@@ -2855,6 +3728,7 @@ sync_webmail_mail_host_if_needed() {
     current_webmail_domain="${WEBMAIL_PRIMARY_DOMAIN:-${WEBMAIL_DOMAIN:-}}"
     current_webmail_domains="${WEBMAIL_DOMAINS:-}"
     current_mail_host="${MAIL_HOST:-}"
+    current_password_change_enabled="${WEBMAIL_PASSWORD_CHANGE_ENABLED:-no}"
   fi
 
   if [ -z "$current_mail_host" ]; then
@@ -2882,7 +3756,7 @@ sync_webmail_mail_host_if_needed() {
   fi
 
   echo "Updating Roundcube to use the new mail host..."
-  write_roundcube_compose "$current_webmail_domain" "$current_webmail_domains" "$new_mail_host"
+  write_roundcube_compose "$current_webmail_domain" "$current_webmail_domains" "$new_mail_host" "$current_password_change_enabled"
   dc -f "$WEBMAIL_COMPOSE" up -d --force-recreate
 }
 
@@ -2946,8 +3820,8 @@ setup_mailserver() {
   echo ""
   echo "DKIM + DMARC:"
   echo "  The script will generate DKIM keys and show you the TXT record to add."
-  echo "  Example DMARC (TXT for _dmarc.${mail_domain}):"
-  echo "    v=DMARC1; p=none; rua=mailto:dmarc@${mail_domain}"
+  echo "  Recommended DMARC (TXT for _dmarc.${mail_domain}):"
+  echo "    $(mail_dmarc_record "$mail_domain")"
   echo "--------------------------------------------------------------"
   echo ""
   echo "Multi-domain note:"
@@ -3099,15 +3973,174 @@ print_mail_dns_instructions() {
   echo "  ${domain} MX 10 ${mail_host}"
   echo ""
   echo "SPF (TXT for ${domain}):"
-  echo "  v=spf1 mx -all"
+  echo "  $(mail_spf_record)"
   echo ""
   echo "DMARC (TXT for _dmarc.${domain}):"
-  echo "  v=DMARC1; p=none; rua=mailto:dmarc@${domain}"
+  echo "  $(mail_dmarc_record "$domain")"
   echo ""
   echo "DKIM:"
   echo "  Add the TXT record from:"
   echo "    ${MAIL_BASE}/docker-data/dms/config/opendkim/keys/${domain}/mail.txt"
+  echo ""
+  echo "Cloudflare note:"
+  echo "  Keep mail host A records and MX targets as DNS only (gray cloud)."
+  echo "  Webmail HTTP/HTTPS records may be proxied (orange cloud)."
   echo "--------------------------------------------------------------"
+}
+
+mail_spf_record() {
+  echo "v=spf1 mx -all"
+}
+
+mail_dmarc_record() {
+  local domain="$1"
+  echo "v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${domain}"
+}
+
+mail_dkim_domains() {
+  find "${MAIL_BASE}/docker-data/dms/config/opendkim/keys" \
+    -maxdepth 2 -type f -name "mail.txt" -printf '%h\n' 2>/dev/null \
+    | sed 's#.*/##' \
+    | sort -u
+}
+
+mailbox_domains() {
+  local accounts_file="${MAIL_BASE}/docker-data/dms/config/postfix-accounts.cf"
+
+  if [ -f "$accounts_file" ]; then
+    awk -F'[|@]' 'NF >= 3 {print $2}' "$accounts_file" | sort -u
+    return 0
+  fi
+
+  docker exec mailserver setup email list 2>/dev/null \
+    | sed -n 's/.*[<* ]\([A-Za-z0-9._%+-]\+@[A-Za-z0-9.-]\+\.[A-Za-z]\{2,\}\).*/\1/p' \
+    | awk -F@ '{print $2}' \
+    | sort -u
+}
+
+dns_lookup_record() {
+  local type="$1"
+  local name="$2"
+  local resolver="${DNS_RESOLVER:-1.1.1.1}"
+
+  if command -v dig >/dev/null 2>&1; then
+    dig @"$resolver" +short "$name" "$type" 2>/dev/null || true
+    return 0
+  fi
+
+  if command -v nslookup >/dev/null 2>&1; then
+    nslookup -type="$type" "$name" "$resolver" 2>/dev/null || true
+    return 0
+  fi
+
+  echo "DNS lookup skipped: dig/nslookup not installed."
+}
+
+print_current_dns_record() {
+  local label="$1"
+  local type="$2"
+  local name="$3"
+  local output
+
+  output="$(dns_lookup_record "$type" "$name" | sed '/^$/d' || true)"
+  echo "${label}:"
+  if [ -n "$output" ]; then
+    echo "$output" | sed 's/^/  /'
+  else
+    echo "  Not found"
+  fi
+}
+
+audit_mail_dns() {
+  local mail_host mailbox_domain_list dkim_domain_list all_domains domain
+
+  ensure_mailserver_running
+
+  mail_host=""
+  if [ -f "$MAIL_ENV_FILE" ]; then
+    mail_host="$(awk -F= '/^OVERRIDE_HOSTNAME=/{print $2}' "$MAIL_ENV_FILE" | head -n 1)"
+  fi
+
+  if [ -z "$mail_host" ]; then
+    prompt mail_host "Mail host/FQDN (e.g. mail.example.com): "
+    mail_host="$(normalize_domain "$mail_host")"
+    if ! validate_domain "$mail_host"; then
+      echo "Invalid host: ${mail_host}"
+      exit 1
+    fi
+  fi
+
+  mailbox_domain_list="$(mailbox_domains || true)"
+  dkim_domain_list="$(mail_dkim_domains || true)"
+  all_domains="$(
+    {
+      echo "$mailbox_domain_list"
+      echo "$dkim_domain_list"
+    } | sed '/^$/d' | sort -u
+  )"
+
+  echo ""
+  echo "Mail DNS audit"
+  echo "--------------------------------------------------------------"
+  echo "Mail host: ${mail_host}"
+  echo "Resolver: ${DNS_RESOLVER:-1.1.1.1}"
+  echo ""
+  print_current_dns_record "Mail host A (${mail_host})" "A" "$mail_host"
+  echo ""
+  echo "Mailbox domains found:"
+  if [ -n "$mailbox_domain_list" ]; then
+    echo "$mailbox_domain_list" | sed 's/^/  /'
+  else
+    echo "  None"
+  fi
+  echo ""
+  echo "DKIM key domains found:"
+  if [ -n "$dkim_domain_list" ]; then
+    echo "$dkim_domain_list" | sed 's/^/  /'
+  else
+    echo "  None"
+  fi
+  echo "--------------------------------------------------------------"
+
+  if [ -z "$all_domains" ]; then
+    echo "No mail domains were found."
+    return 0
+  fi
+
+  while IFS= read -r domain; do
+    [ -n "$domain" ] || continue
+
+    echo ""
+    echo "Domain: ${domain}"
+    echo "--------------------------------------------------------------"
+    echo "Expected:"
+    echo "  MX: ${domain} MX 10 ${mail_host}"
+    echo "  SPF TXT (${domain}): $(mail_spf_record)"
+    echo "  DMARC TXT (_dmarc.${domain}): $(mail_dmarc_record "$domain")"
+    echo "  DKIM TXT: mail._domainkey.${domain}"
+    echo ""
+    echo "Current DNS:"
+    print_current_dns_record "  MX" "MX" "$domain"
+    print_current_dns_record "  SPF/TXT" "TXT" "$domain"
+    print_current_dns_record "  DMARC" "TXT" "_dmarc.${domain}"
+    print_current_dns_record "  DKIM" "TXT" "mail._domainkey.${domain}"
+
+    if ! echo "$mailbox_domain_list" | grep -Fxq "$domain"; then
+      echo ""
+      echo "Note: DKIM exists for ${domain}, but no mailbox for this domain was found."
+    fi
+
+    if ! echo "$dkim_domain_list" | grep -Fxq "$domain"; then
+      echo ""
+      echo "Warning: Mailboxes exist for ${domain}, but no DKIM key was found."
+      echo "Generate DKIM with menu 12 -> gen-dkim for ${domain}."
+    fi
+  done <<< "$all_domains"
+
+  echo ""
+  echo "Cloudflare reminder:"
+  echo "  mail.* A records and MX targets must stay DNS only (gray cloud)."
+  echo "  Do not proxy SMTP/IMAP records. webmail.* can be proxied for HTTPS."
 }
 
 smtp_port_25_check() {
@@ -3362,7 +4395,7 @@ change_mail_host() {
 }
 
 manage_mailserver() {
-  local action email_addr email_password domain_list mail_host guessed_host dkim_file confirm_delete
+  local action email_addr email_password domain_list mail_host guessed_host dkim_file confirm_delete force_change password_reset_done
 
   echo ""
   echo "Manage email server (docker-mailserver)"
@@ -3373,7 +4406,7 @@ manage_mailserver() {
 
   ensure_mailserver_running
 
-  prompt action "Action [status/add-domain/change-mail-host/add-mailbox/delete-mailbox/reset-password/list-mailboxes/gen-dkim/show-dkim/dns-help/repair-postscreen-cache]: " "status"
+  prompt action "Action [status/add-domain/change-mail-host/add-mailbox/delete-mailbox/reset-password/list-mailboxes/gen-dkim/show-dkim/dns-help/audit-dns/repair-postscreen-cache]: " "status"
 
   case "${action,,}" in
     status)
@@ -3387,8 +4420,8 @@ manage_mailserver() {
       ;;
     add-mailbox)
       prompt email_addr "New mailbox address (e.g. user@example.com): "
-      email_addr="${email_addr//[$'\t\r\n ']/}"
-      if [[ ! "$email_addr" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+      email_addr="$(normalize_email_address "$email_addr")"
+      if ! validate_email_address "$email_addr"; then
         echo "Invalid email address: ${email_addr}"
         exit 1
       fi
@@ -3400,6 +4433,9 @@ manage_mailserver() {
       echo "Creating mailbox: ${email_addr}"
       docker exec -i mailserver setup email add "$email_addr" "$email_password"
       echo "Mailbox created."
+      if webmail_password_change_enabled; then
+        webmail_force_password_mark "$email_addr" || true
+      fi
       ;;
     delete-mailbox)
       prompt email_addr "Mailbox address to delete (e.g. user@example.com): "
@@ -3422,8 +4458,8 @@ manage_mailserver() {
       ;;
     reset-password)
       prompt email_addr "Mailbox address to reset password for (e.g. user@example.com): "
-      email_addr="${email_addr//[$'\t\r\n ']/}"
-      if [[ ! "$email_addr" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+      email_addr="$(normalize_email_address "$email_addr")"
+      if ! validate_email_address "$email_addr"; then
         echo "Invalid email address: ${email_addr}"
         exit 1
       fi
@@ -3433,17 +4469,26 @@ manage_mailserver() {
         exit 1
       fi
       echo "Resetting password for: ${email_addr}"
+      password_reset_done="no"
       if docker exec -i mailserver setup email update "$email_addr" "$email_password"; then
         echo "Password updated."
+        password_reset_done="yes"
       elif docker exec -i mailserver setup email add "$email_addr" "$email_password"; then
         echo "Password updated."
         echo "Note: Your docker-mailserver setup tool did not accept 'update'."
         echo "This used 'add' as a fallback (some versions treat it as a password reset)."
+        password_reset_done="yes"
       else
         echo "Failed to reset password."
         echo "Try inside the container:"
         echo "  docker exec -it mailserver setup email help"
         exit 1
+      fi
+      if [ "$password_reset_done" = "yes" ] && webmail_password_change_enabled; then
+        prompt force_change "Force this user to change password at next Roundcube login? (yes/no): " "yes"
+        if [ "${force_change,,}" = "yes" ]; then
+          webmail_force_password_mark "$email_addr" || true
+        fi
       fi
       ;;
     list-mailboxes)
@@ -3503,6 +4548,9 @@ manage_mailserver() {
       fi
 
       print_mail_dns_instructions "$domain_list" "$mail_host"
+      ;;
+    audit-dns|audit-mail-dns)
+      audit_mail_dns
       ;;
     repair-postscreen-cache)
       repair_postscreen_cache
@@ -3567,6 +4615,7 @@ setup_webmail_roundcube() {
 
   install_base
   ensure_proxy_stack
+  ensure_mailserver_fail2ban_ignores_shared_network
 
   if ! issue_webmail_certificates "$webmail_domains" "admin@${mail_domain}"; then
     exit 1
@@ -3596,7 +4645,7 @@ setup_webmail_roundcube() {
 }
 
 modify_webmail_roundcube() {
-  local current_webmail_domain current_webmail_domains current_mail_host webmail_domains webmail_domain mail_host mail_domain proceed remove_old old_domain removed_domains part
+  local current_webmail_domain current_webmail_domains current_mail_host current_password_change_enabled webmail_domains webmail_domain mail_host mail_domain proceed remove_old old_domain removed_domains part
 
   echo ""
   echo "Modify webmail (Roundcube)"
@@ -3611,6 +4660,7 @@ modify_webmail_roundcube() {
   current_webmail_domain=""
   current_webmail_domains=""
   current_mail_host=""
+  current_password_change_enabled="no"
 
   if [ -f "$WEBMAIL_META_FILE" ]; then
     # shellcheck disable=SC1090
@@ -3619,6 +4669,7 @@ modify_webmail_roundcube() {
     current_webmail_domain="${WEBMAIL_PRIMARY_DOMAIN:-${WEBMAIL_DOMAIN:-}}"
     current_webmail_domains="${WEBMAIL_DOMAINS:-}"
     current_mail_host="${MAIL_HOST:-}"
+    current_password_change_enabled="${WEBMAIL_PASSWORD_CHANGE_ENABLED:-no}"
   fi
 
   if [ -z "$current_webmail_domain" ]; then
@@ -3676,8 +4727,10 @@ modify_webmail_roundcube() {
     exit 1
   fi
 
+  ensure_mailserver_fail2ban_ignores_shared_network
+
   echo "Rewriting Roundcube stack..."
-  write_roundcube_compose "$webmail_domain" "$webmail_domains" "$mail_host"
+  write_roundcube_compose "$webmail_domain" "$webmail_domains" "$mail_host" "$current_password_change_enabled"
   dc -f "$WEBMAIL_COMPOSE" up -d --force-recreate
 
   removed_domains=""
@@ -3723,6 +4776,254 @@ modify_webmail_roundcube() {
   echo "SMTP: ${mail_host}:587 (STARTTLS)"
   echo "Login format: full email address (e.g. user@example.com)"
   echo "=============================================================="
+}
+
+load_current_webmail_settings() {
+  WEBMAIL_CURRENT_PRIMARY=""
+  WEBMAIL_CURRENT_DOMAINS=""
+  WEBMAIL_CURRENT_MAIL_HOST=""
+  WEBMAIL_CURRENT_PASSWORD_CHANGE_ENABLED="no"
+
+  if [ -f "$WEBMAIL_META_FILE" ]; then
+    local WEBMAIL_PRIMARY_DOMAIN="" WEBMAIL_DOMAIN="" WEBMAIL_DOMAINS="" MAIL_HOST="" WEBMAIL_PASSWORD_CHANGE_ENABLED=""
+    # shellcheck disable=SC1090
+    # shellcheck disable=SC1091
+    source "$WEBMAIL_META_FILE"
+    WEBMAIL_CURRENT_PRIMARY="${WEBMAIL_PRIMARY_DOMAIN:-${WEBMAIL_DOMAIN:-}}"
+    WEBMAIL_CURRENT_DOMAINS="${WEBMAIL_DOMAINS:-}"
+    WEBMAIL_CURRENT_MAIL_HOST="${MAIL_HOST:-}"
+    WEBMAIL_CURRENT_PASSWORD_CHANGE_ENABLED="${WEBMAIL_PASSWORD_CHANGE_ENABLED:-no}"
+  fi
+
+  if [ -z "$WEBMAIL_CURRENT_PRIMARY" ]; then
+    WEBMAIL_CURRENT_PRIMARY="$(awk '/server_name / {print $2}' "${PROXY_CONF_DIR}"/webmail-*.conf 2>/dev/null | sed 's/;//' | head -n 1)"
+  fi
+  if [ -z "$WEBMAIL_CURRENT_DOMAINS" ]; then
+    WEBMAIL_CURRENT_DOMAINS="$(awk '/server_name / {print $2}' "${PROXY_CONF_DIR}"/webmail-*.conf 2>/dev/null | sed 's/;//' | sort -u | paste -sd ',' -)"
+  fi
+  if [ -z "$WEBMAIL_CURRENT_DOMAINS" ] && [ -n "$WEBMAIL_CURRENT_PRIMARY" ]; then
+    WEBMAIL_CURRENT_DOMAINS="$WEBMAIL_CURRENT_PRIMARY"
+  fi
+  if [ -z "$WEBMAIL_CURRENT_MAIL_HOST" ] && [ -f "$WEBMAIL_COMPOSE" ]; then
+    WEBMAIL_CURRENT_MAIL_HOST="$(awk -F'"' '/ROUNDCUBEMAIL_DEFAULT_HOST:/ {print $2}' "$WEBMAIL_COMPOSE" | sed 's/^ssl:\/\///' | head -n 1)"
+  fi
+}
+
+roundcube_password_helper_health() {
+  if ! docker_container_running "$WEBMAIL_PASSWORD_HELPER_CONTAINER"; then
+    return 1
+  fi
+
+  docker exec roundcube-webmail php -r '
+    $result = @file_get_contents("http://roundcube-password-helper:8080/health");
+    exit(trim((string) $result) === "ok" ? 0 : 1);
+  ' >/dev/null 2>&1
+}
+
+show_webmail_password_change_status() {
+  local helper_ports forced_users
+
+  load_current_webmail_settings
+
+  echo ""
+  echo "Webmail password change status"
+  echo "--------------------------------------------------------------"
+  echo "Configured: ${WEBMAIL_CURRENT_PASSWORD_CHANGE_ENABLED}"
+  echo "Primary webmail domain: ${WEBMAIL_CURRENT_PRIMARY:-not found}"
+  echo "All webmail domains: ${WEBMAIL_CURRENT_DOMAINS:-not found}"
+  echo "Mail host: ${WEBMAIL_CURRENT_MAIL_HOST:-not found}"
+  echo "Roundcube config: ${WEBMAIL_PASSWORD_CONFIG_FILE}"
+  echo "Helper script: ${WEBMAIL_PASSWORD_HELPER_DIR}/password-helper.py"
+  echo ""
+  docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' \
+    | awk -v helper="$WEBMAIL_PASSWORD_HELPER_CONTAINER" 'NR==1 || $1=="roundcube-webmail" || $1==helper'
+
+  echo ""
+  echo "Helper host-published ports:"
+  if docker_container_exists "$WEBMAIL_PASSWORD_HELPER_CONTAINER"; then
+    helper_ports="$(docker port "$WEBMAIL_PASSWORD_HELPER_CONTAINER" 2>/dev/null || true)"
+    if [ -n "$helper_ports" ]; then
+      echo "$helper_ports" | sed 's/^/  /'
+    else
+      echo "  none"
+    fi
+  else
+    echo "  helper container not found"
+  fi
+
+  if roundcube_password_helper_health; then
+    echo ""
+    echo "Helper health: ok"
+  else
+    echo ""
+    echo "Helper health: unavailable"
+  fi
+
+  forced_users="$(webmail_force_password_list || true)"
+  echo ""
+  echo "Users forced to change password:"
+  if [ -n "$forced_users" ]; then
+    echo "$forced_users" | sed 's/^/  /'
+  else
+    echo "  none"
+  fi
+  echo "--------------------------------------------------------------"
+}
+
+enable_webmail_password_change() {
+  local proceed
+
+  ensure_mailserver_running
+  ensure_mailserver_fail2ban_ignores_shared_network
+
+  if [ ! -f "$WEBMAIL_COMPOSE" ]; then
+    echo "Webmail stack not found."
+    echo "Run option 11 first: Setup webmail (Roundcube)."
+    exit 1
+  fi
+
+  load_current_webmail_settings
+  if [ -z "$WEBMAIL_CURRENT_PRIMARY" ] || [ -z "$WEBMAIL_CURRENT_DOMAINS" ] || [ -z "$WEBMAIL_CURRENT_MAIL_HOST" ]; then
+    echo "Could not detect current Roundcube settings."
+    echo "Run option 13 first to normalize the webmail configuration."
+    exit 1
+  fi
+
+  echo ""
+  echo "Enable password changes from Roundcube"
+  echo "--------------------------------------------------------------"
+  echo "Roundcube will enable the built-in password plugin."
+  echo "An internal helper container will update docker-mailserver accounts."
+  echo "No public port will be exposed for the helper."
+  echo ""
+  echo "Primary webmail domain: ${WEBMAIL_CURRENT_PRIMARY}"
+  echo "All webmail domains: ${WEBMAIL_CURRENT_DOMAINS}"
+  echo "Mail host: ${WEBMAIL_CURRENT_MAIL_HOST}"
+  echo ""
+  read -r -p "Enable this feature and recreate Roundcube? (yes/no): " proceed
+  if [ "${proceed,,}" != "yes" ]; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  ensure_roundcube_password_change_files
+  write_roundcube_compose "$WEBMAIL_CURRENT_PRIMARY" "$WEBMAIL_CURRENT_DOMAINS" "$WEBMAIL_CURRENT_MAIL_HOST" "yes"
+
+  echo "Starting Roundcube with password helper..."
+  dc -f "$WEBMAIL_COMPOSE" up -d --force-recreate --remove-orphans
+
+  echo "Refreshing reverse proxy upstream..."
+  proxy_dc restart reverse-proxy >/dev/null 2>&1 || true
+
+  echo "Waiting for password helper..."
+  for _ in $(seq 1 20); do
+    if roundcube_password_helper_health; then
+      break
+    fi
+    sleep 2
+  done
+
+  show_webmail_password_change_status
+  if ! roundcube_password_helper_health; then
+    echo "Warning: password helper did not respond to the health check."
+    echo "Check logs with: docker logs ${WEBMAIL_PASSWORD_HELPER_CONTAINER}"
+    exit 1
+  fi
+
+  echo "Password changes are enabled in Roundcube settings."
+}
+
+disable_webmail_password_change() {
+  local proceed
+
+  if [ ! -f "$WEBMAIL_COMPOSE" ]; then
+    echo "Webmail stack not found."
+    exit 1
+  fi
+
+  load_current_webmail_settings
+  if [ -z "$WEBMAIL_CURRENT_PRIMARY" ] || [ -z "$WEBMAIL_CURRENT_DOMAINS" ] || [ -z "$WEBMAIL_CURRENT_MAIL_HOST" ]; then
+    echo "Could not detect current Roundcube settings."
+    exit 1
+  fi
+
+  read -r -p "Disable Roundcube password changes and recreate webmail? (yes/no): " proceed
+  if [ "${proceed,,}" != "yes" ]; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  rm -f "$WEBMAIL_PASSWORD_CONFIG_FILE"
+  write_roundcube_compose "$WEBMAIL_CURRENT_PRIMARY" "$WEBMAIL_CURRENT_DOMAINS" "$WEBMAIL_CURRENT_MAIL_HOST" "no"
+
+  echo "Recreating Roundcube without password helper..."
+  dc -f "$WEBMAIL_COMPOSE" up -d --force-recreate --remove-orphans
+  docker rm -f "$WEBMAIL_PASSWORD_HELPER_CONTAINER" >/dev/null 2>&1 || true
+  proxy_dc restart reverse-proxy >/dev/null 2>&1 || true
+
+  show_webmail_password_change_status
+}
+
+manage_webmail_password_change() {
+  local action email_addr mailbox_list confirm_clear
+
+  echo ""
+  echo "Manage webmail password changes"
+  echo ""
+  prompt action "Action [status/enable/disable/list-forced/force-user/clear-user/force-all/clear-all]: " "status"
+
+  case "${action,,}" in
+    status)
+      show_webmail_password_change_status
+      ;;
+    enable)
+      enable_webmail_password_change
+      ;;
+    disable)
+      disable_webmail_password_change
+      ;;
+    list-forced)
+      webmail_force_password_list
+      ;;
+    force-user)
+      prompt email_addr "Mailbox address to force password change for: "
+      webmail_force_password_mark "$email_addr"
+      ;;
+    clear-user)
+      prompt email_addr "Mailbox address to clear forced password change for: "
+      webmail_force_password_clear "$email_addr"
+      ;;
+    force-all)
+      ensure_mailserver_running
+      mailbox_list="$(mailbox_addresses || true)"
+      if [ -z "$mailbox_list" ]; then
+        echo "No mailboxes found."
+        exit 1
+      fi
+      echo "Marking all mailboxes for password change at next Roundcube login..."
+      while IFS= read -r email_addr; do
+        [ -n "$email_addr" ] || continue
+        webmail_force_password_mark "$email_addr"
+      done <<< "$mailbox_list"
+      ;;
+    clear-all)
+      echo "This will clear the forced password change marker for every mailbox."
+      read -r -p "Type CLEAR to confirm: " confirm_clear
+      if [ "$confirm_clear" != "CLEAR" ]; then
+        echo "Cancelled."
+        exit 0
+      fi
+      ensure_webmail_force_password_state_file
+      : > "$WEBMAIL_PASSWORD_FORCE_STATE_FILE"
+      chmod 0664 "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" >/dev/null 2>&1 || true
+      chown 33:33 "$WEBMAIL_PASSWORD_FORCE_STATE_FILE" >/dev/null 2>&1 || true
+      echo "All forced password change markers cleared."
+      ;;
+    *)
+      echo "Invalid option."
+      exit 1
+      ;;
+  esac
 }
 
 create_project() {
@@ -3853,7 +5154,8 @@ create_project() {
 }
 
 change_project_domain() {
-  local project_slug project_name app_dir old_domain new_domain email remove_old
+  local project_slug project_name app_dir old_domain new_domain remove_domain email remove_old action
+  local current_domains new_domains default_email
 
   echo ""
   echo "Existing projects:"
@@ -3882,69 +5184,148 @@ change_project_domain() {
   require_nonempty "PROJECT_NAME" "${PROJECT_NAME}"
   require_nonempty "DOMAIN" "${DOMAIN}"
   old_domain="${DOMAIN}"
+  current_domains="$(project_domains_for_project "$app_dir" "$old_domain")"
 
   echo ""
-  echo "Current domain: ${old_domain}"
-  prompt new_domain "New domain (e.g. example.com): "
-  new_domain="$(normalize_domain "$new_domain")"
-  if ! validate_domain "$new_domain"; then
-    echo "Invalid domain: ${new_domain}"
-    exit 1
-  fi
-
-  if [ "$new_domain" = "$old_domain" ]; then
-    echo "New domain is the same as the current domain."
-    exit 0
-  fi
-
-  prompt email "Email for Let's Encrypt: "
-  if [ -z "$email" ]; then
-    echo "Email is required."
-    exit 1
-  fi
-
-  ensure_proxy_stack
-
-  echo "Switching to HTTP for certificate issuance..."
-  write_proxy_config_http "$PROJECT_NAME" "$new_domain"
-  proxy_dc restart reverse-proxy
-
-  echo "Requesting SSL certificate for ${new_domain}..."
-  if ! proxy_dc run --rm certbot certonly \
-    --webroot \
-    --webroot-path=/var/www/certbot \
-    --email "$email" \
-    --agree-tos \
-    --no-eff-email \
-    --non-interactive \
-    --keep-until-expiring \
-    -d "$new_domain"; then
-    echo "Failed to issue certificate. Restoring previous HTTPS config..."
-    write_proxy_config_https "$PROJECT_NAME" "$old_domain"
-    proxy_dc restart reverse-proxy
-    exit 1
-  fi
-
-  echo "Enabling HTTPS for ${new_domain}..."
-  write_proxy_config_https "$PROJECT_NAME" "$new_domain"
-  proxy_dc restart reverse-proxy
-
-  set_project_meta_var "${app_dir}/.project-meta" "DOMAIN" "$new_domain"
-
+  echo "Project: ${PROJECT_NAME}"
+  echo "Primary domain: ${old_domain}"
+  echo "All domains: ${current_domains}"
   echo ""
-  prompt remove_old "Remove old certificate files for ${old_domain}? (yes/no): " "no"
-  if [ "${remove_old,,}" = "yes" ]; then
-    rm -rf "${PROXY_CERTBOT_CONF}/live/${old_domain}" || true
-    rm -rf "${PROXY_CERTBOT_CONF}/archive/${old_domain}" || true
-    rm -rf "${PROXY_CERTBOT_CONF}/renewal/${old_domain}.conf" || true
-    echo "Old certificate files removed."
-  fi
+  prompt action "Action [change-primary/add-domain/remove-domain/list]: " "change-primary"
 
-  echo "Domain updated: https://${new_domain}"
+  case "${action,,}" in
+    list)
+      echo ""
+      echo "Project domains:"
+      echo "$current_domains" | tr ',' '\n' | sed 's/^/  /'
+      ;;
+    add-domain)
+      prompt new_domain "Domain to add (e.g. www.example.com): "
+      new_domain="$(normalize_domain "$new_domain")"
+      if ! validate_domain "$new_domain"; then
+        echo "Invalid domain: ${new_domain}"
+        exit 1
+      fi
+      if csv_contains_value "$current_domains" "$new_domain"; then
+        echo "Domain already exists for this project: ${new_domain}"
+        exit 0
+      fi
+
+      default_email="admin@${new_domain#*.}"
+      prompt email "Email for Let's Encrypt [${default_email}]: " "$default_email"
+      if [ -z "$email" ]; then
+        echo "Email is required."
+        exit 1
+      fi
+
+      ensure_proxy_stack
+      if ! issue_project_domain_certificate "$PROJECT_NAME" "$new_domain" "$email" "$old_domain"; then
+        echo "Failed to issue certificate. Restoring previous project domains..."
+        write_project_proxy_configs "$PROJECT_NAME" "$current_domains"
+        proxy_dc restart reverse-proxy
+        exit 1
+      fi
+
+      new_domains="$(normalize_project_domain_list "$old_domain" "${current_domains},${new_domain}")"
+      set_project_meta_var "${app_dir}/.project-meta" "PROJECT_DOMAINS" "$new_domains"
+      PROJECT_DOMAINS="$new_domains"
+      write_project_proxy_configs "$PROJECT_NAME" "$new_domains"
+      proxy_dc restart reverse-proxy
+
+      echo "Domain added: https://${new_domain}"
+      echo "All domains: ${new_domains}"
+      ;;
+    remove-domain)
+      prompt remove_domain "Domain to remove from this project: "
+      remove_domain="$(normalize_domain "$remove_domain")"
+      if ! validate_domain "$remove_domain"; then
+        echo "Invalid domain: ${remove_domain}"
+        exit 1
+      fi
+      if [ "$remove_domain" = "$old_domain" ]; then
+        echo "Cannot remove the primary domain here. Use change-primary first."
+        exit 1
+      fi
+      if ! csv_contains_value "$current_domains" "$remove_domain"; then
+        echo "Domain is not configured for this project: ${remove_domain}"
+        exit 0
+      fi
+
+      new_domains="$(project_domain_list_remove "$current_domains" "$remove_domain")"
+      new_domains="$(normalize_project_domain_list "$old_domain" "$new_domains")"
+      remove_project_domain_proxy_config "$PROJECT_NAME" "$remove_domain" "$old_domain"
+      set_project_meta_var "${app_dir}/.project-meta" "PROJECT_DOMAINS" "$new_domains"
+      PROJECT_DOMAINS="$new_domains"
+      write_project_proxy_configs "$PROJECT_NAME" "$new_domains"
+      proxy_dc restart reverse-proxy
+
+      echo ""
+      prompt remove_old "Remove certificate files for ${remove_domain}? (yes/no): " "no"
+      if [ "${remove_old,,}" = "yes" ]; then
+        remove_project_certificate_files "$remove_domain"
+        echo "Certificate files removed."
+      fi
+
+      echo "Domain removed: ${remove_domain}"
+      echo "All domains: ${new_domains}"
+      ;;
+    change-primary)
+      prompt new_domain "New primary domain (e.g. example.com): "
+      new_domain="$(normalize_domain "$new_domain")"
+      if ! validate_domain "$new_domain"; then
+        echo "Invalid domain: ${new_domain}"
+        exit 1
+      fi
+
+      if [ "$new_domain" = "$old_domain" ]; then
+        echo "New domain is the same as the current primary domain."
+        exit 0
+      fi
+
+      default_email="admin@${new_domain#*.}"
+      prompt email "Email for Let's Encrypt [${default_email}]: " "$default_email"
+      if [ -z "$email" ]; then
+        echo "Email is required."
+        exit 1
+      fi
+
+      new_domains="$(project_domain_list_remove "$current_domains" "$old_domain")"
+      new_domains="$(normalize_project_domain_list "$new_domain" "$new_domains")"
+
+      ensure_proxy_stack
+      if ! issue_project_domain_certificate "$PROJECT_NAME" "$new_domain" "$email" "$new_domain"; then
+        echo "Failed to issue certificate. Restoring previous project domains..."
+        write_project_proxy_configs "$PROJECT_NAME" "$current_domains"
+        proxy_dc restart reverse-proxy
+        exit 1
+      fi
+
+      set_project_meta_var "${app_dir}/.project-meta" "DOMAIN" "$new_domain"
+      set_project_meta_var "${app_dir}/.project-meta" "PROJECT_DOMAINS" "$new_domains"
+      DOMAIN="$new_domain"
+      PROJECT_DOMAINS="$new_domains"
+      write_project_proxy_configs "$PROJECT_NAME" "$new_domains"
+      proxy_dc restart reverse-proxy
+
+      echo ""
+      prompt remove_old "Remove old certificate files for ${old_domain}? (yes/no): " "no"
+      if [ "${remove_old,,}" = "yes" ]; then
+        remove_project_certificate_files "$old_domain"
+        echo "Old certificate files removed."
+      fi
+
+      echo "Primary domain updated: https://${new_domain}"
+      echo "All domains: ${new_domains}"
+      ;;
+    *)
+      echo "Invalid option."
+      exit 1
+      ;;
+  esac
 }
 
 delete_project() {
-  local project_slug project_name app_dir domain reverb_domain
+  local project_slug project_name app_dir domain reverb_domain project_domains domain_part
   echo ""
   echo "Existing projects:"
   print_existing_projects
@@ -3967,6 +5348,7 @@ delete_project() {
     # shellcheck disable=SC1091
     source "${app_dir}/.project-meta"
     domain="${DOMAIN:-}"
+    project_domains="${PROJECT_DOMAINS:-${DOMAIN:-}}"
     reverb_domain="${REVERB_DOMAIN:-}"
   fi
 
@@ -4001,13 +5383,19 @@ delete_project() {
 
   echo "Removing Nginx configuration..."
   rm -f "${PROXY_CONF_DIR}/${project_name}.conf"
+  rm -f "${PROXY_CONF_DIR}/${project_name}-alias-"*.conf 2>/dev/null || true
   remove_reverb_proxy_config "$project_name"
 
-  if [ -n "$domain" ]; then
+  if [ -n "$project_domains" ]; then
     echo "Removing SSL certificates..."
-    rm -rf "${PROXY_CERTBOT_CONF}/live/${domain}" || true
-    rm -rf "${PROXY_CERTBOT_CONF}/archive/${domain}" || true
-    rm -rf "${PROXY_CERTBOT_CONF}/renewal/${domain}.conf" || true
+    IFS=',' read -r -a parts <<< "$project_domains"
+    for domain_part in "${parts[@]}"; do
+      [ -n "$domain_part" ] || continue
+      remove_project_certificate_files "$domain_part"
+    done
+  elif [ -n "$domain" ]; then
+    echo "Removing SSL certificates..."
+    remove_project_certificate_files "$domain"
   fi
   if [ -n "$reverb_domain" ]; then
     rm -rf "${PROXY_CERTBOT_CONF}/live/${reverb_domain}" || true
@@ -4361,7 +5749,7 @@ update_project() {
 
   echo "Regenerating project configuration..."
   write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
-  write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+  write_project_proxy_configs "$PROJECT_NAME" "$(project_domains_for_project "$app_dir" "$DOMAIN")"
   if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
     write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
   else
@@ -4951,7 +6339,7 @@ EOF
 
   echo "Regenerating project configuration..."
   write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
-  write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+  write_project_proxy_configs "$PROJECT_NAME" "$(project_domains_for_project "$app_dir" "$DOMAIN")"
   if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
     write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
   else
@@ -5050,7 +6438,7 @@ manage_reverb() {
 
       echo "Rebuilding PHP container and restarting reverse proxy..."
       write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
-      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_project_proxy_configs "$PROJECT_NAME" "$(project_domains_for_project "$app_dir" "$DOMAIN")"
       if [ -n "$reverb_domain" ]; then
         write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
       fi
@@ -5104,7 +6492,7 @@ manage_reverb() {
       fi
 
       write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
-      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_project_proxy_configs "$PROJECT_NAME" "$(project_domains_for_project "$app_dir" "$DOMAIN")"
       write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
 
       cd "$app_dir"
@@ -5149,7 +6537,7 @@ manage_reverb() {
       fi
 
       write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$new_reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
-      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_project_proxy_configs "$PROJECT_NAME" "$(project_domains_for_project "$app_dir" "$DOMAIN")"
       write_reverb_proxy_config_https "$PROJECT_NAME" "$new_reverb_domain" "$reverb_port" "$reverb_exposure"
 
       cd "$app_dir"
@@ -5184,7 +6572,7 @@ manage_reverb() {
       fi
 
       write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$new_reverb_port" "$reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
-      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_project_proxy_configs "$PROJECT_NAME" "$(project_domains_for_project "$app_dir" "$DOMAIN")"
       write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$new_reverb_port" "$reverb_exposure"
 
       cd "$app_dir"
@@ -5211,7 +6599,7 @@ manage_reverb() {
       fi
 
       write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}" "${PMA_BIND_IP:-127.0.0.1}" "yes" "$reverb_domain" "$reverb_port" "$new_reverb_exposure" "$app_profile" "$guacamole_proxy_enabled" "$guacamole_proxy_upstream"
-      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_project_proxy_configs "$PROJECT_NAME" "$(project_domains_for_project "$app_dir" "$DOMAIN")"
       write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$new_reverb_exposure"
 
       cd "$app_dir"
@@ -5408,7 +6796,7 @@ manage_guacamole_proxy() {
       fi
 
       write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$db_name" "$db_user" "$db_password" "$db_root_password" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "yes" "$new_guacamole_proxy_upstream"
-      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_project_proxy_configs "$PROJECT_NAME" "$(project_domains_for_project "$app_dir" "$DOMAIN")"
       if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
         write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
       else
@@ -5469,7 +6857,7 @@ manage_guacamole_proxy() {
       fi
 
       write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$db_name" "$db_user" "$db_password" "$db_root_password" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "yes" "$new_guacamole_proxy_upstream"
-      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_project_proxy_configs "$PROJECT_NAME" "$(project_domains_for_project "$app_dir" "$DOMAIN")"
       if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
         write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
       else
@@ -5498,7 +6886,7 @@ manage_guacamole_proxy() {
       fi
 
       write_project_files "$app_dir" "$PROJECT_NAME" "$DOMAIN" "$db_name" "$db_user" "$db_password" "$db_root_password" "$pma_port" "$pma_bind_ip" "$reverb_enabled" "$reverb_domain" "$reverb_port" "$reverb_exposure" "$app_profile" "no" "$guacamole_proxy_upstream"
-      write_proxy_config_https "$PROJECT_NAME" "$DOMAIN"
+      write_project_proxy_configs "$PROJECT_NAME" "$(project_domains_for_project "$app_dir" "$DOMAIN")"
       if [ "$reverb_enabled" = "yes" ] && [ -n "$reverb_domain" ]; then
         write_reverb_proxy_config_https "$PROJECT_NAME" "$reverb_domain" "$reverb_port" "$reverb_exposure"
       else
@@ -5838,6 +7226,7 @@ menu() {
   echo "18) Backup settings"
   echo "19) Manage project UFW"
   echo "20) Project access settings"
+  echo "21) Manage webmail password changes"
   echo ""
   read -r -p "Option: " action
 
@@ -5862,6 +7251,7 @@ menu() {
     18) manage_backup_settings ;;
     19) manage_project_ufw ;;
     20) manage_project_access ;;
+    21) manage_webmail_password_change ;;
     *) echo "Invalid option."; exit 1 ;;
   esac
 }

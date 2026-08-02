@@ -19,7 +19,7 @@ It creates one shared reverse proxy stack in `/opt/laravel-reverse-proxy` and on
 - Default PHP upload limit set to 5 GB, with matching Nginx body size and 600-second PHP/FastCGI upload timeouts
 - PHP extensions enabled in the image (high-level): `curl`, `pdo_mysql`, `mysqli`, `opcache`, `zip`, `mbstring`, `redis`, `gd`, `intl`, `bcmath`, `exif`, `pcntl`
 - Project profiles for Laravel, generic PHP, ThinkPHP/FastAdmin apps, and Node games/apps
-- Nginx virtual hosts per project (one file per project)
+- Nginx virtual hosts per project, including optional additional project domains/aliases
 - Lets Encrypt certificates (HTTP-01 webroot challenge)
 - Daily cron jobs for SSL renewal and backups
 
@@ -56,10 +56,10 @@ The script is interactive and shows a menu.
 - `6) Update project` - regenerates config and rebuilds containers
 - `7) Run backup for all projects now` - runs backups for all projects
 - `8) Manage phpMyAdmin` - enables/disables phpMyAdmin and controls exposure
-- `9) Change project domain` - updates Nginx + issues a new SSL cert for a new domain
+- `9) Change project domain` - change the primary project domain, add/remove extra project domains, list all domains, and issue SSL certs
 - `10) Setup email server (docker-mailserver)` - provisions a basic mail server stack and prints DNS instructions
 - `11) Setup webmail (Roundcube)` - provisions Roundcube webmail behind the reverse proxy, with optional alias domains
-- `12) Manage email domains/mailboxes` - add domains, change the mail host, add/delete mailboxes, reset mailbox passwords, manage DKIM, and print DNS help for additional domains
+- `12) Manage email domains/mailboxes` - add domains, change the mail host, add/delete mailboxes, reset mailbox passwords, manage DKIM, print/audit DNS help, and repair the Postfix postscreen cache
 - `13) Modify webmail (Roundcube)` - change the current webmail domain list and/or mail host
 - `14) Manage Reverb` - enable/disable Reverb, change its domain/port, and control local/public exposure
 - `15) Reset database passwords` - rotate the project DB user password, MariaDB root password, or both
@@ -68,6 +68,7 @@ The script is interactive and shows a menu.
 - `18) Backup settings` - configure per-project backup retention days
 - `19) Manage project UFW` - configure project-specific UFW rules for direct project ports
 - `20) Project access settings` - restrict normal project website access by IP/CIDR in Nginx
+- `21) Manage webmail password changes` - enable/disable Roundcube password changes, force first-login password changes, and list/clear forced users
 
 ## Non-interactive commands
 
@@ -78,7 +79,7 @@ The script is interactive and shows a menu.
 - Open the VNC manager directly:
   - `sudo /root/laravel-server-manager.sh manage-vnc`
 
-## Domain handling (important)
+## Project domain handling
 
 The script uses the domain **exactly as you type it**.
 
@@ -86,6 +87,43 @@ The script uses the domain **exactly as you type it**.
 - If you type `www.example.com`, it will request a certificate only for `www.example.com` and configure Nginx `server_name www.example.com;`.
 
 It does not automatically add or redirect between `www` and apex.
+
+### Multiple domains for one project
+
+Menu option `9) Change project domain` can also attach more than one domain to the same project. This lets a single project answer on two or more URLs, for example:
+
+- `example.com`
+- `www.example.com`
+- `app.otherdomain.com`
+
+Available actions:
+
+- `change-primary` - replace the saved primary domain in `.project-meta`
+- `add-domain` - add an extra domain/alias and issue its own Let's Encrypt certificate
+- `remove-domain` - remove an extra domain/alias from Nginx and optionally remove its certificate files
+- `list` - show the primary domain and all configured project domains
+
+The primary domain remains stored as:
+
+```bash
+DOMAIN=example.com
+```
+
+The full domain list is stored as:
+
+```bash
+PROJECT_DOMAINS=example.com,www.example.com,app.otherdomain.com
+```
+
+The primary domain uses the normal project vhost file:
+
+- `/opt/laravel-reverse-proxy/nginx/conf.d/<project>.conf`
+
+Additional domains use separate alias vhost files:
+
+- `/opt/laravel-reverse-proxy/nginx/conf.d/<project>-alias-<domain>.conf`
+
+Each domain needs its own DNS `A/AAAA` record pointing to the server IP before certificate issuance. When you run `6) Update project`, the script regenerates proxy configs for all saved project domains, not just the primary one.
 
 ## Where to upload website files
 
@@ -366,7 +404,7 @@ Verify:
 Use menu option "Update project". This regenerates:
 
 - `docker-compose.yml` and related project files
-- the Nginx vhost for the project
+- the Nginx vhost for the project, including any saved `PROJECT_DOMAINS` aliases
 - the PHP Supervisor config, including the Laravel queue worker
 
 Then it rebuilds the project containers and restarts the reverse proxy.
@@ -577,7 +615,7 @@ It attempts a "final backup" first; if the DB container does not exist, it will 
 - Projects:
   - `/var/www/projects/<project>/`
   - `/var/www/projects/<project>/public/` (web root)
-  - `/var/www/projects/<project>/.project-meta` (stored variables for update/backup/restore, including `BACKUP_RETENTION_DAYS`, project UFW settings, and project access settings)
+  - `/var/www/projects/<project>/.project-meta` (stored variables for update/backup/restore, including `DOMAIN`, `PROJECT_DOMAINS`, `BACKUP_RETENTION_DAYS`, project UFW settings, and project access settings)
 - Backups:
   - `/var/backups/laravel-projects/`
 
@@ -659,7 +697,7 @@ DNS records you typically need:
 - `PTR/rDNS` (set at your VPS/provider): server IP -> your mail host
 - `SPF` TXT for your domain (example): `v=spf1 mx -all`
 - `DKIM` TXT (generated by the script)
-- `DMARC` TXT (example): `v=DMARC1; p=none; rua=mailto:dmarc@example.com`
+- `DMARC` TXT (recommended): `v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@example.com`
 
 Notes:
 
@@ -677,7 +715,18 @@ High-level steps for each additional domain (example `otherdomain.com`):
 - Generate DKIM for `otherdomain.com` and add the TXT record
 - Create mailboxes like `user@otherdomain.com`
 
-Use menu option `12) Manage email domains/mailboxes` to onboard a new domain in one flow (`add-domain`), change the mail host (`change-mail-host`), create mailboxes, reset mailbox passwords, and manage DKIM from the server.
+Use menu option `12) Manage email domains/mailboxes` to onboard a new domain in one flow (`add-domain`), change the mail host (`change-mail-host`), create mailboxes, reset mailbox passwords, manage DKIM from the server, audit DNS records, and repair the Postfix postscreen cache when needed.
+
+Recommended mail DNS values:
+
+```dns
+MX     @        10 mail.example.com
+TXT    @        v=spf1 mx -all
+TXT    _dmarc   v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@example.com
+TXT    mail._domainkey   <DKIM value generated by the script>
+```
+
+If using Cloudflare, keep mail host records and MX targets as **DNS only**. Do not proxy SMTP/IMAP hostnames through Cloudflare.
 
 ## Webmail (optional)
 
@@ -716,11 +765,50 @@ Setup notes:
 
 If you later need to change the webmail domain list or point Roundcube to a different mail host, use menu option `13) Modify webmail (Roundcube)`.
 
+### Webmail password changes
+
+Menu option `21) Manage webmail password changes` enables the Roundcube password plugin and an internal helper container:
+
+- Roundcube plugin: `password`
+- Internal helper container: `roundcube-password-helper`
+- Helper path: `/opt/webmail-roundcube/password-helper/password-helper.py`
+- Roundcube config: `/opt/webmail-roundcube/data/config/password-change.inc.php`
+- Forced-change state file: `/opt/webmail-roundcube/data/config/force-password-change-users.txt`
+
+The helper updates docker-mailserver accounts in:
+
+- `/opt/mailserver/docker-data/dms/config/postfix-accounts.cf`
+
+No public port is exposed for the helper. It is reachable only inside the shared Docker network.
+
+Available actions:
+
+- `status` - show Roundcube/helper status and users currently forced to change password
+- `enable` - enable password changes from Roundcube settings
+- `disable` - disable the Roundcube password plugin/helper
+- `list-forced` - list users marked for forced password change
+- `force-user` - require one mailbox to change password at next Roundcube login
+- `clear-user` - remove the forced-change marker for one mailbox
+- `force-all` - require all mailboxes to change password at next Roundcube login
+- `clear-all` - clear all forced-change markers
+
+When password changes are enabled:
+
+- Users can change their password from Roundcube settings.
+- New mailboxes created through menu option `12) Manage email domains/mailboxes` -> `add-mailbox` are automatically marked to change password on first Roundcube login.
+- Password resets through menu option `12` -> `reset-password` ask whether to force a password change on the next Roundcube login.
+- After a successful password change, the forced-change marker is cleared automatically.
+- Dovecot is reloaded so the new password works immediately.
+- The script configures fail2ban to ignore the shared Docker subnet so failed webmail login attempts do not ban the Roundcube container from reaching IMAP.
+
+This first-login enforcement applies to users signing in through Roundcube. Direct IMAP/SMTP clients such as Outlook, Apple Mail, and mobile mail apps will not show Roundcube's password-change screen.
+
 ## Security notes
 
 - Database and other secrets are stored in `/var/www/projects/<project>/.project-meta` so the script can automate backups/restores/updates.
   - Keep project directories restricted to trusted admins.
 - If you enable phpMyAdmin, keep it restricted (this script binds it to localhost by default). Prefer SSH tunnels instead of exposing it publicly.
+- If you enable webmail password changes, protect `/opt/webmail-roundcube/.password-helper-token` and the mailserver config directory. The helper token is internal but should still be treated as sensitive.
 - Use a firewall (for example `ufw`) and only open required ports.
 
 ## Disclaimer
