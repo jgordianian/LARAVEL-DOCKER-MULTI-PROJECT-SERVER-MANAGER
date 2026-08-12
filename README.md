@@ -88,6 +88,13 @@ The script uses the domain **exactly as you type it**.
 
 It does not automatically add or redirect between `www` and apex.
 
+Direct access by server IP on the shared web ports is intentionally blocked by the default reverse-proxy vhost. In other words:
+
+- `http://SERVER_IP/` should not serve a project.
+- `https://SERVER_IP/` should not fall through to a project certificate/vhost.
+- Project websites should be accessed through configured domains only.
+- phpMyAdmin is the exception when it is explicitly exposed on its own direct port, for example `http://SERVER_IP:8283/`.
+
 ### Multiple domains for one project
 
 Menu option `9) Change project domain` can also attach more than one domain to the same project. This lets a single project answer on two or more URLs, for example:

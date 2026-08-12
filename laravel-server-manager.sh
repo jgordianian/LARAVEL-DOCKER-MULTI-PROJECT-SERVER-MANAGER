@@ -4,6 +4,7 @@ set -euo pipefail
 
 PROXY_BASE="/opt/laravel-reverse-proxy"
 PROXY_CONF_DIR="${PROXY_BASE}/nginx/conf.d"
+PROXY_DEFAULT_DENY_CONF="${PROXY_CONF_DIR}/00-default-deny.conf"
 PROXY_CERTBOT_CONF="${PROXY_BASE}/certbot/conf"
 PROXY_CERTBOT_WWW="${PROXY_BASE}/certbot/www"
 PROXY_PROJECTS_DIR="${PROXY_BASE}/projects"
@@ -1335,6 +1336,36 @@ project_php_image_tag() {
   esac
 }
 
+write_default_deny_proxy_config() {
+  mkdir -p "$PROXY_CONF_DIR"
+
+  cat > "$PROXY_DEFAULT_DENY_CONF" <<'EOF'
+# Managed by laravel-server-manager.
+# Drop requests that do not match an explicit project/webmail/mail vhost.
+# This prevents direct access by server IP or unknown Host headers.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 444;
+    }
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+EOF
+}
+
 project_has_laravel_runtime() {
   local app_profile="$1"
   local app_dir="$2"
@@ -1394,6 +1425,7 @@ print_existing_projects() {
 
 proxy_up() {
   mkdir -p "$PROXY_CONF_DIR" "$PROXY_CERTBOT_CONF" "$PROXY_CERTBOT_WWW" "$PROXY_PROJECTS_DIR"
+  write_default_deny_proxy_config
 
   cat > "$PROXY_COMPOSE" <<EOF
 version: "3.9"
