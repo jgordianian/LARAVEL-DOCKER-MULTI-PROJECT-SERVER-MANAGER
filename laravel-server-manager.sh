@@ -10,6 +10,11 @@ PROXY_CERTBOT_WWW="${PROXY_BASE}/certbot/www"
 PROXY_PROJECTS_DIR="${PROXY_BASE}/projects"
 PROJECTS_BASE="/var/www/projects"
 BACKUPS_BASE="/var/backups/laravel-projects"
+MANAGER_ETC_DIR="/etc/laravel-manager"
+DOCKER_PMA_FIREWALL_RULES_FILE="${MANAGER_ETC_DIR}/docker-pma-firewall.rules"
+DOCKER_PMA_FIREWALL_APPLY_SCRIPT="/usr/local/sbin/laravel-manager-apply-docker-pma-firewall"
+DOCKER_PMA_FIREWALL_SERVICE_FILE="/etc/systemd/system/laravel-manager-docker-pma-firewall.service"
+DOCKER_PMA_FIREWALL_CHAIN="LARAVEL-PMA-FW"
 DEFAULT_BACKUP_RETENTION_DAYS="14"
 SHARED_NETWORK="laravel-shared"
 PROXY_COMPOSE="${PROXY_BASE}/docker-compose.yml"
@@ -566,6 +571,167 @@ ensure_ufw_available() {
   if ! command -v ufw >/dev/null 2>&1; then
     echo "Failed to install UFW."
     return 1
+  fi
+}
+
+write_docker_pma_firewall_apply_script() {
+  mkdir -p "$(dirname "$DOCKER_PMA_FIREWALL_APPLY_SCRIPT")"
+
+  cat > "$DOCKER_PMA_FIREWALL_APPLY_SCRIPT" <<EOF
+#!/bin/sh
+set -eu
+
+RULES_FILE="${DOCKER_PMA_FIREWALL_RULES_FILE}"
+CHAIN="${DOCKER_PMA_FIREWALL_CHAIN}"
+
+if ! command -v iptables >/dev/null 2>&1; then
+  exit 0
+fi
+
+IPTABLES="iptables"
+if iptables -w -L >/dev/null 2>&1; then
+  IPTABLES="iptables -w"
+fi
+
+\$IPTABLES -N DOCKER-USER 2>/dev/null || true
+\$IPTABLES -N "\$CHAIN" 2>/dev/null || true
+\$IPTABLES -F "\$CHAIN"
+\$IPTABLES -C FORWARD -j DOCKER-USER >/dev/null 2>&1 || \$IPTABLES -I FORWARD 1 -j DOCKER-USER
+\$IPTABLES -C DOCKER-USER -j "\$CHAIN" >/dev/null 2>&1 || \$IPTABLES -I DOCKER-USER 1 -j "\$CHAIN"
+
+CTDIR_ARGS=""
+if iptables -m conntrack -h 2>&1 | grep -q -- '--ctdir'; then
+  CTDIR_ARGS="--ctdir ORIGINAL"
+fi
+
+\$IPTABLES -A "\$CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+
+if [ -f "\$RULES_FILE" ]; then
+  while IFS='|' read -r project port sources; do
+    case "\$project" in
+      ""|"#"*) continue ;;
+    esac
+    case "\$port" in
+      ""|*[!0-9]*) continue ;;
+    esac
+    [ "\$port" -ge 1 ] && [ "\$port" -le 65535 ] || continue
+
+    old_ifs="\$IFS"
+    IFS=','
+    set -- \$sources
+    IFS="\$old_ifs"
+
+    for source do
+      [ -n "\$source" ] || continue
+      case "\$source" in
+        *:*) continue ;;
+      esac
+      # Docker DNAT changes the visible destination port. conntrack keeps the original host port.
+      \$IPTABLES -A "\$CHAIN" -p tcp -s "\$source" -m conntrack \$CTDIR_ARGS --ctorigdstport "\$port" -j RETURN
+    done
+
+    \$IPTABLES -A "\$CHAIN" -p tcp -m conntrack \$CTDIR_ARGS --ctorigdstport "\$port" -j DROP
+  done < "\$RULES_FILE"
+fi
+
+\$IPTABLES -A "\$CHAIN" -j RETURN
+EOF
+
+  chmod 700 "$DOCKER_PMA_FIREWALL_APPLY_SCRIPT"
+}
+
+write_docker_pma_firewall_service() {
+  cat > "$DOCKER_PMA_FIREWALL_SERVICE_FILE" <<EOF
+[Unit]
+Description=Laravel Manager Docker phpMyAdmin firewall
+After=docker.service ufw.service
+Wants=docker.service ufw.service
+
+[Service]
+Type=oneshot
+ExecStart=${DOCKER_PMA_FIREWALL_APPLY_SCRIPT}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+ensure_docker_pma_firewall_assets() {
+  mkdir -p "$MANAGER_ETC_DIR"
+  write_docker_pma_firewall_apply_script
+
+  if command -v systemctl >/dev/null 2>&1; then
+    write_docker_pma_firewall_service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable "$(basename "$DOCKER_PMA_FIREWALL_SERVICE_FILE")" >/dev/null 2>&1 || true
+  fi
+}
+
+sync_docker_pma_firewall_rules() {
+  local tmp meta_file
+
+  ensure_docker_pma_firewall_assets
+  tmp="$(mktemp "${DOCKER_PMA_FIREWALL_RULES_FILE}.tmp.XXXXXX")"
+
+  {
+    echo "# Managed by laravel-server-manager. Do not edit by hand."
+    echo "# Format: project|host_port|allowed_sources_csv"
+    for meta_file in "$PROJECTS_BASE"/*/.project-meta; do
+      [ -f "$meta_file" ] || continue
+      (
+        PROJECT_NAME=""
+        PMA_PORT=""
+        UFW_PMA_ALLOWED_SOURCES=""
+        UFW_PMA_RESTRICTED=""
+        UFW_PMA_PORT=""
+        # shellcheck disable=SC1090
+        # shellcheck disable=SC1091
+        source "$meta_file" >/dev/null 2>&1 || exit 0
+
+        project_name="${PROJECT_NAME:-$(basename "$(dirname "$meta_file")")}"
+        pma_port="${UFW_PMA_PORT:-${PMA_PORT:-}}"
+        if [ "${UFW_PMA_RESTRICTED:-no}" != "yes" ]; then
+          exit 0
+        fi
+        validate_port_number "$pma_port" || exit 0
+        if [ -n "${UFW_PMA_ALLOWED_SOURCES:-}" ]; then
+          normalized_sources="$(normalize_ufw_sources_csv "$UFW_PMA_ALLOWED_SOURCES" 2>/dev/null)" || normalized_sources=""
+        else
+          normalized_sources=""
+        fi
+
+        printf '%s|%s|%s\n' "$project_name" "$pma_port" "$normalized_sources"
+      )
+    done
+  } > "$tmp"
+
+  install -m 600 "$tmp" "$DOCKER_PMA_FIREWALL_RULES_FILE"
+  rm -f "$tmp"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart "$(basename "$DOCKER_PMA_FIREWALL_SERVICE_FILE")" >/dev/null 2>&1 || "$DOCKER_PMA_FIREWALL_APPLY_SCRIPT"
+  elif ! "$DOCKER_PMA_FIREWALL_APPLY_SCRIPT"; then
+    echo "Warning: failed to apply Docker phpMyAdmin firewall rules."
+    return 1
+  fi
+}
+
+show_matching_docker_pma_rules() {
+  local port="$1"
+
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "  iptables not found."
+    return 0
+  fi
+
+  if ! iptables -S "$DOCKER_PMA_FIREWALL_CHAIN" >/dev/null 2>&1; then
+    echo "  Docker phpMyAdmin firewall chain not installed."
+    return 0
+  fi
+
+  if ! iptables -S "$DOCKER_PMA_FIREWALL_CHAIN" 2>/dev/null | grep -E -- "--ctorigdstport ${port}([[:space:]]|$)"; then
+    echo "  No matching Docker phpMyAdmin rules found."
   fi
 }
 
@@ -6061,10 +6227,14 @@ manage_project_ufw() {
   echo "Matching UFW rules for phpMyAdmin port ${pma_port}:"
   show_matching_ufw_pma_rules "$pma_port"
   echo ""
+  echo "Matching Docker rules for phpMyAdmin port ${pma_port}:"
+  show_matching_docker_pma_rules "$pma_port"
+  echo ""
   echo "Note: UFW cannot isolate individual project domains on shared ports 80/443."
+  echo "Note: Docker-published ports are filtered through ${DOCKER_PMA_FIREWALL_CHAIN}."
   echo ""
 
-  prompt action "Action [status/restrict-phpmyadmin/clear-phpmyadmin-rules/show-ufw]: " "status"
+  prompt action "Action [status/restrict-phpmyadmin/block-phpmyadmin/clear-phpmyadmin-rules/show-ufw]: " "status"
 
   case "${action,,}" in
     status)
@@ -6098,11 +6268,34 @@ manage_project_ufw() {
       set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_ALLOWED_SOURCES" "$normalized_sources"
       set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_RESTRICTED" "yes"
       set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_PORT" "$pma_port"
+      enable_ufw_if_inactive
+      sync_docker_pma_firewall_rules
 
       echo "Project UFW phpMyAdmin rules applied."
       echo "Allowed sources: ${normalized_sources}"
       echo "Denied by default: ${pma_port}/tcp"
+      echo "Docker-published access is filtered through ${DOCKER_PMA_FIREWALL_CHAIN}."
+      ;;
+    block-phpmyadmin)
+      echo ""
+      echo "This will deny public Docker-published traffic to ${pma_port}/tcp for phpMyAdmin."
+      echo "You can still use phpMyAdmin through a localhost bind or an SSH tunnel if enabled that way."
+      prompt confirm "Block public phpMyAdmin access for ${PROJECT_NAME}? (yes/no): " "yes"
+      if [ "${confirm,,}" != "yes" ]; then
+        echo "Cancelled."
+        exit 0
+      fi
+
+      apply_ufw_pma_rules "$PROJECT_NAME" "$pma_port" "$saved_ufw_port" "$saved_sources" "" "$saved_restricted"
+      set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_ALLOWED_SOURCES" ""
+      set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_RESTRICTED" "yes"
+      set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_PORT" "$pma_port"
       enable_ufw_if_inactive
+
+      sync_docker_pma_firewall_rules
+
+      echo "Public phpMyAdmin access is blocked on ${pma_port}/tcp."
+      echo "Docker-published access is filtered through ${DOCKER_PMA_FIREWALL_CHAIN}."
       ;;
     clear-phpmyadmin-rules)
       prompt confirm "Remove saved UFW phpMyAdmin rules for ${PROJECT_NAME}? (yes/no): " "no"
@@ -6115,6 +6308,7 @@ manage_project_ufw() {
       set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_ALLOWED_SOURCES" ""
       set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_RESTRICTED" "no"
       set_project_meta_var "${app_dir}/.project-meta" "UFW_PMA_PORT" ""
+      sync_docker_pma_firewall_rules
 
       echo "Saved UFW phpMyAdmin rules cleared for ${PROJECT_NAME}."
       ;;

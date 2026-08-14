@@ -315,8 +315,11 @@ Available actions:
 
 - `status` - show the project phpMyAdmin bind/port, saved UFW settings, and matching UFW rules
 - `restrict-phpmyadmin` - allow only specific IP/CIDR sources to the project's phpMyAdmin port and deny other traffic to that port
+- `block-phpmyadmin` - deny all public traffic to the project's phpMyAdmin port
 - `clear-phpmyadmin-rules` - remove the saved phpMyAdmin UFW rules for that project
 - `show-ufw` - show the full numbered UFW ruleset
+
+Docker publishes container ports through NAT/FORWARD rules, so normal UFW `INPUT` rules do not always block a public Docker port. For phpMyAdmin restrictions, the script also installs a persistent Docker-aware firewall chain named `LARAVEL-PMA-FW` and applies it from Docker's `DOCKER-USER` chain.
 
 The source list accepts comma-separated IPv4/IPv6 addresses or CIDR ranges, for example:
 
