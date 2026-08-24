@@ -23,6 +23,7 @@ MAIL_BASE="/opt/mailserver"
 MAIL_COMPOSE="${MAIL_BASE}/compose.yaml"
 MAIL_ENV_FILE="${MAIL_BASE}/mailserver.env"
 MAIL_FAIL2BAN_JAIL_FILE="${MAIL_BASE}/docker-data/dms/config/fail2ban-jail.cf"
+MAIL_VIRTUAL_FILE="${MAIL_BASE}/docker-data/dms/config/postfix-virtual.cf"
 WEBMAIL_BASE="/opt/webmail-roundcube"
 WEBMAIL_COMPOSE="${WEBMAIL_BASE}/compose.yaml"
 WEBMAIL_META_FILE="${WEBMAIL_BASE}/.webmail-meta"
@@ -32,6 +33,7 @@ WEBMAIL_PASSWORD_CONFIG_FILE="${WEBMAIL_BASE}/data/config/password-change.inc.ph
 WEBMAIL_PASSWORD_FORCE_STATE_FILE="${WEBMAIL_BASE}/data/config/force-password-change-users.txt"
 WEBMAIL_PASSWORD_TOKEN_FILE="${WEBMAIL_BASE}/.password-helper-token"
 WEBMAIL_PASSWORD_HELPER_CONTAINER="roundcube-password-helper"
+WEBMAIL_MANAGESIEVE_CONFIG_FILE="${WEBMAIL_BASE}/data/config/managesieve.inc.php"
 GUACAMOLE_BASE="/opt/apache-guacamole"
 GUACAMOLE_COMPOSE="${GUACAMOLE_BASE}/compose.yaml"
 GUACAMOLE_META_FILE="${GUACAMOLE_BASE}/.guacamole-meta"
@@ -3055,6 +3057,7 @@ write_webmail_meta() {
   local webmail_domains="$2"
   local mail_host="$3"
   local password_change_enabled="${4:-no}"
+  local managesieve_enabled="${5:-no}"
 
   mkdir -p "$WEBMAIL_BASE"
   {
@@ -3063,6 +3066,7 @@ write_webmail_meta() {
     printf 'WEBMAIL_DOMAINS=%q\n' "$webmail_domains"
     printf 'MAIL_HOST=%q\n' "$mail_host"
     printf 'WEBMAIL_PASSWORD_CHANGE_ENABLED=%q\n' "$password_change_enabled"
+    printf 'WEBMAIL_MANAGESIEVE_ENABLED=%q\n' "$managesieve_enabled"
   } > "$WEBMAIL_META_FILE"
 }
 
@@ -3116,6 +3120,29 @@ normalize_email_address() {
 validate_email_address() {
   local email="${1:-}"
   [[ "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+}
+
+normalize_email_csv() {
+  local input="${1:-}"
+  local part email result=""
+  local -A seen=()
+  local -a parts=()
+
+  IFS=',' read -r -a parts <<< "$input"
+  for part in "${parts[@]}"; do
+    email="$(normalize_email_address "$part")"
+    [ -n "$email" ] || continue
+    if ! validate_email_address "$email"; then
+      return 1
+    fi
+    if [ -z "${seen[$email]+x}" ]; then
+      seen[$email]=1
+      result="${result:+${result},}${email}"
+    fi
+  done
+
+  [ -n "$result" ] || return 1
+  echo "$result"
 }
 
 ensure_webmail_force_password_state_file() {
@@ -3221,6 +3248,295 @@ mailbox_addresses() {
   docker exec mailserver setup email list 2>/dev/null \
     | awk '/@/ {print tolower($1)}' \
     | sort -fu
+}
+
+mailbox_exists() {
+  local email
+  email="$(normalize_email_address "${1:-}")"
+  validate_email_address "$email" || return 1
+  mailbox_addresses | grep -Fxiq "$email"
+}
+
+mailbox_host_home_dir() {
+  local email local_part domain
+  email="$(normalize_email_address "${1:-}")"
+  local_part="${email%@*}"
+  domain="${email#*@}"
+  printf '%s/docker-data/dms/mail-data/%s/%s/home' "$MAIL_BASE" "$domain" "$local_part"
+}
+
+mailbox_container_home_dir() {
+  local email local_part domain
+  email="$(normalize_email_address "${1:-}")"
+  local_part="${email%@*}"
+  domain="${email#*@}"
+  printf '/var/mail/%s/%s/home' "$domain" "$local_part"
+}
+
+reload_mailserver_postfix() {
+  docker exec mailserver postfix reload >/dev/null 2>&1 || true
+}
+
+reload_mailserver_dovecot() {
+  docker exec mailserver doveadm reload >/dev/null 2>&1 || true
+}
+
+mail_alias_recipients() {
+  local alias_addr="$1"
+  alias_addr="$(normalize_email_address "$alias_addr")"
+
+  [ -f "$MAIL_VIRTUAL_FILE" ] || return 1
+  awk -v alias="$alias_addr" '
+    /^[[:space:]]*#/ { next }
+    NF >= 2 {
+      key = tolower($1)
+      if (key == alias) {
+        $1 = ""
+        gsub(/^[[:space:]]+/, "", $0)
+        print tolower($0)
+        found = 1
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$MAIL_VIRTUAL_FILE"
+}
+
+list_mail_aliases() {
+  local alias_output
+
+  if [ ! -s "$MAIL_VIRTUAL_FILE" ]; then
+    echo "No mail aliases configured."
+    return 0
+  fi
+
+  alias_output="$(
+    awk '
+    /^[[:space:]]*#/ { next }
+    NF >= 2 {
+      key = $1
+      $1 = ""
+      gsub(/^[[:space:]]+/, "", $0)
+      printf "%s -> %s\n", tolower(key), tolower($0)
+    }
+    ' "$MAIL_VIRTUAL_FILE" | sort -fu
+  )"
+
+  if [ -n "$alias_output" ]; then
+    echo "$alias_output"
+  else
+    echo "No mail aliases configured."
+  fi
+}
+
+add_mail_alias() {
+  local alias_addr="$1"
+  local recipients_csv="$2"
+  local recipient
+  local -a recipients=()
+
+  alias_addr="$(normalize_email_address "$alias_addr")"
+  recipients_csv="$(normalize_email_csv "$recipients_csv")" || {
+    echo "Invalid recipient list."
+    return 1
+  }
+
+  if ! validate_email_address "$alias_addr"; then
+    echo "Invalid alias address: ${alias_addr}"
+    return 1
+  fi
+
+  if mailbox_exists "$alias_addr"; then
+    echo "Alias source is already a real mailbox: ${alias_addr}"
+    echo "Use mailbox forwarding for existing mailboxes."
+    return 1
+  fi
+
+  IFS=',' read -r -a recipients <<< "$recipients_csv"
+  for recipient in "${recipients[@]}"; do
+    recipient="$(normalize_email_address "$recipient")"
+    if [ "$recipient" = "$alias_addr" ]; then
+      echo "Alias recipient cannot be the alias itself: ${recipient}"
+      return 1
+    fi
+    docker exec -i mailserver setup alias add "$alias_addr" "$recipient"
+  done
+
+  reload_mailserver_postfix
+  echo "Alias configured: ${alias_addr} -> ${recipients_csv}"
+}
+
+delete_mail_alias() {
+  local alias_addr="$1"
+  local recipients_csv="${2:-}"
+  local existing_recipients recipient
+  local -a recipients=()
+
+  alias_addr="$(normalize_email_address "$alias_addr")"
+  if ! validate_email_address "$alias_addr"; then
+    echo "Invalid alias address: ${alias_addr}"
+    return 1
+  fi
+
+  if [ -z "$recipients_csv" ]; then
+    existing_recipients="$(mail_alias_recipients "$alias_addr" 2>/dev/null || true)"
+    if [ -z "$existing_recipients" ]; then
+      echo "Alias not found: ${alias_addr}"
+      return 1
+    fi
+    recipients_csv="$existing_recipients"
+  else
+    recipients_csv="$(normalize_email_csv "$recipients_csv")" || {
+      echo "Invalid recipient list."
+      return 1
+    }
+  fi
+
+  IFS=',' read -r -a recipients <<< "$recipients_csv"
+  for recipient in "${recipients[@]}"; do
+    recipient="$(normalize_email_address "$recipient")"
+    [ -n "$recipient" ] || continue
+    docker exec -i mailserver setup alias del "$alias_addr" "$recipient" >/dev/null 2>&1 || true
+  done
+
+  reload_mailserver_postfix
+  echo "Alias recipient(s) removed for: ${alias_addr}"
+}
+
+mailbox_forward_sieve_host_path() {
+  local email home_dir
+  email="$(normalize_email_address "${1:-}")"
+  home_dir="$(mailbox_host_home_dir "$email")"
+  printf '%s/sieve/managesieve.sieve' "$home_dir"
+}
+
+mailbox_forward_sieve_container_path() {
+  local email home_dir
+  email="$(normalize_email_address "${1:-}")"
+  home_dir="$(mailbox_container_home_dir "$email")"
+  printf '%s/sieve/managesieve.sieve' "$home_dir"
+}
+
+list_mailbox_forwards() {
+  local email sieve_file recipients keep_copy
+
+  while IFS= read -r email; do
+    [ -n "$email" ] || continue
+    sieve_file="$(mailbox_forward_sieve_host_path "$email")"
+    [ -f "$sieve_file" ] || continue
+    grep -q "Managed by laravel-server-manager mailbox forwarding" "$sieve_file" || continue
+    recipients="$(
+      sed -n 's/^[[:space:]]*redirect[[:space:]][^"]*"\([^"]*\)".*/\1/p' "$sieve_file" \
+        | paste -sd ',' -
+    )"
+    [ -n "$recipients" ] || continue
+    keep_copy="no"
+    if grep -q '^[[:space:]]*redirect[[:space:]]*:copy' "$sieve_file"; then
+      keep_copy="yes"
+    fi
+    printf '%s -> %s (keep copy: %s)\n' "$email" "$recipients" "$keep_copy"
+  done < <(mailbox_addresses)
+}
+
+set_mailbox_forward() {
+  local email="$1"
+  local recipients_csv="$2"
+  local keep_copy="${3:-yes}"
+  local recipient home_dir sieve_dir sieve_file active_link container_sieve
+  local -a recipients=()
+
+  email="$(normalize_email_address "$email")"
+  recipients_csv="$(normalize_email_csv "$recipients_csv")" || {
+    echo "Invalid recipient list."
+    return 1
+  }
+
+  if ! mailbox_exists "$email"; then
+    echo "Mailbox not found: ${email}"
+    return 1
+  fi
+
+  keep_copy="${keep_copy,,}"
+  case "$keep_copy" in
+    yes|no) ;;
+    *) echo "Invalid keep-copy value. Use yes or no."; return 1 ;;
+  esac
+
+  IFS=',' read -r -a recipients <<< "$recipients_csv"
+  for recipient in "${recipients[@]}"; do
+    recipient="$(normalize_email_address "$recipient")"
+    if [ "$recipient" = "$email" ]; then
+      echo "Forward recipient cannot be the source mailbox itself: ${recipient}"
+      return 1
+    fi
+  done
+
+  home_dir="$(mailbox_host_home_dir "$email")"
+  sieve_dir="${home_dir}/sieve"
+  sieve_file="$(mailbox_forward_sieve_host_path "$email")"
+  active_link="${home_dir}/.dovecot.sieve"
+  container_sieve="$(mailbox_forward_sieve_container_path "$email")"
+
+  mkdir -p "$sieve_dir"
+  {
+    echo "# Managed by laravel-server-manager mailbox forwarding."
+    echo "# Changes made in Roundcube filters can replace this script."
+    if [ "$keep_copy" = "yes" ]; then
+      echo 'require ["copy"];'
+    fi
+    for recipient in "${recipients[@]}"; do
+      recipient="$(normalize_email_address "$recipient")"
+      if [ "$keep_copy" = "yes" ]; then
+        printf 'redirect :copy "%s";\n' "$recipient"
+      else
+        printf 'redirect "%s";\n' "$recipient"
+      fi
+    done
+    echo "stop;"
+  } > "$sieve_file"
+
+  ln -sfn "sieve/managesieve.sieve" "$active_link"
+  chown -R 5000:5000 "$home_dir" >/dev/null 2>&1 || true
+  chmod 0700 "$home_dir" "$sieve_dir" >/dev/null 2>&1 || true
+  chmod 0600 "$sieve_file" "$active_link" >/dev/null 2>&1 || true
+
+  docker exec mailserver sievec "$container_sieve" >/dev/null
+  chown -R 5000:5000 "$home_dir" >/dev/null 2>&1 || true
+  reload_mailserver_dovecot
+
+  echo "Mailbox forward configured: ${email} -> ${recipients_csv} (keep copy: ${keep_copy})"
+}
+
+clear_mailbox_forward() {
+  local email="$1"
+  local home_dir sieve_file active_link compiled_file link_target
+
+  email="$(normalize_email_address "$email")"
+  if ! validate_email_address "$email"; then
+    echo "Invalid mailbox address: ${email}"
+    return 1
+  fi
+
+  home_dir="$(mailbox_host_home_dir "$email")"
+  sieve_file="$(mailbox_forward_sieve_host_path "$email")"
+  compiled_file="${sieve_file%.sieve}.svbin"
+  active_link="${home_dir}/.dovecot.sieve"
+
+  if [ -f "$sieve_file" ] && ! grep -q "Managed by laravel-server-manager mailbox forwarding" "$sieve_file"; then
+    echo "Forward script is not managed by laravel-server-manager; leaving it in place:"
+    echo "  ${sieve_file}"
+    return 1
+  fi
+
+  if [ -L "$active_link" ]; then
+    link_target="$(readlink "$active_link" || true)"
+    if [ "$link_target" = "sieve/managesieve.sieve" ]; then
+      rm -f "$active_link"
+    fi
+  fi
+
+  rm -f "$sieve_file" "$compiled_file"
+  reload_mailserver_dovecot
+  echo "Managed mailbox forward cleared for: ${email}"
 }
 
 webmail_password_change_enabled() {
@@ -3742,19 +4058,196 @@ PHP
   chown -R 33:33 "${WEBMAIL_BASE}/data/config" >/dev/null 2>&1 || true
 }
 
+ensure_roundcube_managesieve_files() {
+  local mail_host="${1:-mailserver}"
+
+  mkdir -p "$(dirname "$WEBMAIL_MANAGESIEVE_CONFIG_FILE")"
+
+  cat > "$WEBMAIL_MANAGESIEVE_CONFIG_FILE" <<EOF
+<?php
+\$config['managesieve_host'] = 'tls://${mail_host}';
+\$config['managesieve_auth_type'] = null;
+\$config['managesieve_conn_options'] = null;
+\$config['managesieve_script_name'] = 'managesieve';
+\$config['managesieve_mbox_encoding'] = 'UTF-8';
+\$config['managesieve_forward'] = 1;
+\$config['managesieve_vacation'] = 1;
+\$config['managesieve_raw_editor'] = false;
+EOF
+
+  chmod 0644 "$WEBMAIL_MANAGESIEVE_CONFIG_FILE"
+  chown 33:33 "$WEBMAIL_MANAGESIEVE_CONFIG_FILE" >/dev/null 2>&1 || true
+}
+
+mailserver_managesieve_enabled() {
+  if [ -f "$MAIL_ENV_FILE" ] && grep -q '^ENABLE_MANAGESIEVE=1$' "$MAIL_ENV_FILE"; then
+    return 0
+  fi
+
+  docker exec mailserver sh -c 'test "${ENABLE_MANAGESIEVE:-0}" = "1"' >/dev/null 2>&1
+}
+
+enable_mailserver_managesieve() {
+  if [ ! -f "$MAIL_ENV_FILE" ] || [ ! -f "$MAIL_COMPOSE" ]; then
+    echo "Mailserver config files not found."
+    echo "Run option 10 first: Setup email server (docker-mailserver)."
+    return 1
+  fi
+
+  set_env_file_var "$MAIL_ENV_FILE" "ENABLE_MANAGESIEVE" "1"
+  echo "Recreating mailserver with ManageSieve enabled..."
+  dc -f "$MAIL_COMPOSE" up -d --force-recreate mailserver
+
+  for _ in $(seq 1 30); do
+    if docker exec mailserver sh -c "ss -lnt 2>/dev/null | grep -q ':4190\\b'"; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Warning: ManageSieve did not start listening on port 4190 yet."
+  return 1
+}
+
+roundcube_managesieve_health() {
+  docker exec roundcube-webmail php -r '
+    $errno = 0;
+    $errstr = "";
+    $fp = @fsockopen("mailserver", 4190, $errno, $errstr, 3);
+    if (!$fp) {
+        exit(1);
+    }
+    fclose($fp);
+    exit(0);
+  ' >/dev/null 2>&1
+}
+
+show_mail_forwarding_status() {
+  local managesieve_ports plugin_line forwards_output
+
+  echo ""
+  echo "Mail aliases and forwarding status"
+  echo "--------------------------------------------------------------"
+  if mailserver_managesieve_enabled; then
+    echo "Mailserver ManageSieve: enabled"
+  else
+    echo "Mailserver ManageSieve: disabled"
+  fi
+
+  echo "ManageSieve internal listener:"
+  if docker exec mailserver sh -c "ss -lnt 2>/dev/null | grep ':4190\\b'" >/dev/null 2>&1; then
+    docker exec mailserver sh -c "ss -lnt 2>/dev/null | grep ':4190\\b'" | sed 's/^/  /'
+  else
+    echo "  not listening"
+  fi
+
+  echo ""
+  echo "Roundcube ManageSieve:"
+  load_current_webmail_settings >/dev/null 2>&1 || true
+  echo "  configured: ${WEBMAIL_CURRENT_MANAGESIEVE_ENABLED:-no}"
+  if docker_container_exists roundcube-webmail; then
+    plugin_line="$(docker exec roundcube-webmail sh -c 'grep -n "managesieve\\|plugins" /var/www/html/config/config.docker.inc.php 2>/dev/null | head -5' || true)"
+    if [ -n "$plugin_line" ]; then
+      echo "$plugin_line" | sed 's/^/  /'
+    fi
+    if roundcube_managesieve_health; then
+      echo "  health: ok"
+    else
+      echo "  health: unavailable"
+    fi
+  else
+    echo "  roundcube container not found"
+  fi
+
+  echo ""
+  echo "Host-published ManageSieve ports:"
+  managesieve_ports="$(docker port mailserver 4190/tcp 2>/dev/null || true)"
+  if [ -n "$managesieve_ports" ]; then
+    echo "$managesieve_ports" | sed 's/^/  /'
+  else
+    echo "  none"
+  fi
+
+  echo ""
+  echo "Aliases:"
+  list_mail_aliases | sed 's/^/  /'
+  echo ""
+  echo "Managed mailbox forwards:"
+  forwards_output="$(list_mailbox_forwards || true)"
+  if [ -n "$forwards_output" ]; then
+    echo "$forwards_output" | sed 's/^/  /'
+  else
+    echo "  none"
+  fi
+  echo "--------------------------------------------------------------"
+}
+
+enable_webmail_mailbox_forwards() {
+  local proceed
+
+  ensure_mailserver_running
+
+  if [ ! -f "$WEBMAIL_COMPOSE" ]; then
+    echo "Webmail stack not found."
+    echo "Run option 11 first: Setup webmail (Roundcube)."
+    exit 1
+  fi
+
+  load_current_webmail_settings
+  if [ -z "$WEBMAIL_CURRENT_PRIMARY" ] || [ -z "$WEBMAIL_CURRENT_DOMAINS" ] || [ -z "$WEBMAIL_CURRENT_MAIL_HOST" ]; then
+    echo "Could not detect current Roundcube settings."
+    echo "Run option 13 first to normalize the webmail configuration."
+    exit 1
+  fi
+
+  echo ""
+  echo "Enable mailbox forwarding from Roundcube"
+  echo "--------------------------------------------------------------"
+  echo "This enables docker-mailserver ManageSieve internally and adds"
+  echo "Roundcube's Filters/Forwarding UI. No ManageSieve port is"
+  echo "published to the Internet."
+  echo ""
+  read -r -p "Enable this feature and recreate mailserver/Roundcube? (yes/no): " proceed
+  if [ "${proceed,,}" != "yes" ]; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  enable_mailserver_managesieve || true
+  ensure_roundcube_managesieve_files "$WEBMAIL_CURRENT_MAIL_HOST"
+  write_roundcube_compose "$WEBMAIL_CURRENT_PRIMARY" "$WEBMAIL_CURRENT_DOMAINS" "$WEBMAIL_CURRENT_MAIL_HOST" "$WEBMAIL_CURRENT_PASSWORD_CHANGE_ENABLED" "yes"
+
+  echo "Recreating Roundcube with ManageSieve plugin..."
+  dc -f "$WEBMAIL_COMPOSE" up -d --force-recreate --remove-orphans
+  proxy_dc restart reverse-proxy >/dev/null 2>&1 || true
+
+  show_mail_forwarding_status
+  if ! roundcube_managesieve_health; then
+    echo "Warning: Roundcube could not reach ManageSieve on mailserver:4190."
+    exit 1
+  fi
+
+  echo "Mailbox forwarding UI is enabled in Roundcube."
+}
+
 write_roundcube_compose() {
   local webmail_domain="$1"
   local webmail_domains="$2"
   local mail_host="$3"
   local password_change_enabled="${4:-no}"
+  local managesieve_enabled="${5:-no}"
   local roundcube_plugins="archive,zipdownload"
 
   mkdir -p "${WEBMAIL_BASE}/data/db" "${WEBMAIL_BASE}/data/config" "${WEBMAIL_BASE}/data/temp"
   chown -R 33:33 "${WEBMAIL_BASE}/data" >/dev/null 2>&1 || true
+  ensure_roundcube_managesieve_files "$mail_host"
 
   if [ "$password_change_enabled" = "yes" ]; then
     ensure_roundcube_password_change_files
     roundcube_plugins="archive,zipdownload,password,force_password_change"
+  fi
+  if [ "$managesieve_enabled" = "yes" ]; then
+    roundcube_plugins="${roundcube_plugins},managesieve"
   fi
 
   cat > "$WEBMAIL_COMPOSE" <<EOF
@@ -3776,6 +4269,7 @@ services:
       - ./data/config:/var/roundcube/config
       - ./data/temp:/tmp/roundcube-temp
       - ./force-password-change-plugin:/var/www/html/plugins/force_password_change:ro
+      - ./data/config/managesieve.inc.php:/var/www/html/plugins/managesieve/config.inc.php:ro
     networks:
       ${SHARED_NETWORK}:
         aliases:
@@ -3817,7 +4311,7 @@ networks:
     external: true
 EOF
 
-  write_webmail_meta "$webmail_domain" "$webmail_domains" "$mail_host" "$password_change_enabled"
+  write_webmail_meta "$webmail_domain" "$webmail_domains" "$mail_host" "$password_change_enabled" "$managesieve_enabled"
 }
 
 issue_webmail_certificate() {
@@ -3910,7 +4404,7 @@ issue_mail_host_certificate() {
 sync_webmail_mail_host_if_needed() {
   local old_mail_host="$1"
   local new_mail_host="$2"
-  local current_webmail_domains current_webmail_domain current_mail_host current_password_change_enabled
+  local current_webmail_domains current_webmail_domain current_mail_host current_password_change_enabled current_managesieve_enabled
 
   [ -f "$WEBMAIL_COMPOSE" ] || return 0
 
@@ -3918,6 +4412,7 @@ sync_webmail_mail_host_if_needed() {
   current_webmail_domain=""
   current_mail_host=""
   current_password_change_enabled="no"
+  current_managesieve_enabled="no"
 
   if [ -f "$WEBMAIL_META_FILE" ]; then
     # shellcheck disable=SC1090
@@ -3927,6 +4422,7 @@ sync_webmail_mail_host_if_needed() {
     current_webmail_domains="${WEBMAIL_DOMAINS:-}"
     current_mail_host="${MAIL_HOST:-}"
     current_password_change_enabled="${WEBMAIL_PASSWORD_CHANGE_ENABLED:-no}"
+    current_managesieve_enabled="${WEBMAIL_MANAGESIEVE_ENABLED:-no}"
   fi
 
   if [ -z "$current_mail_host" ]; then
@@ -3954,7 +4450,7 @@ sync_webmail_mail_host_if_needed() {
   fi
 
   echo "Updating Roundcube to use the new mail host..."
-  write_roundcube_compose "$current_webmail_domain" "$current_webmail_domains" "$new_mail_host" "$current_password_change_enabled"
+  write_roundcube_compose "$current_webmail_domain" "$current_webmail_domains" "$new_mail_host" "$current_password_change_enabled" "$current_managesieve_enabled"
   dc -f "$WEBMAIL_COMPOSE" up -d --force-recreate
 }
 
@@ -4071,6 +4567,7 @@ ENABLE_FAIL2BAN=1
 ENABLE_CLAMAV=0
 ENABLE_SPAMASSASSIN=0
 ENABLE_POSTGREY=0
+ENABLE_MANAGESIEVE=1
 
 POSTMASTER_ADDRESS=postmaster@${mail_domain}
 LOG_LEVEL=info
@@ -4594,6 +5091,7 @@ change_mail_host() {
 
 manage_mailserver() {
   local action email_addr email_password domain_list mail_host guessed_host dkim_file confirm_delete force_change password_reset_done
+  local alias_addr recipients_csv keep_copy confirm_clear forwards_output
 
   echo ""
   echo "Manage email server (docker-mailserver)"
@@ -4604,7 +5102,7 @@ manage_mailserver() {
 
   ensure_mailserver_running
 
-  prompt action "Action [status/add-domain/change-mail-host/add-mailbox/delete-mailbox/reset-password/list-mailboxes/gen-dkim/show-dkim/dns-help/audit-dns/repair-postscreen-cache]: " "status"
+  prompt action "Action [status/add-domain/change-mail-host/add-mailbox/delete-mailbox/reset-password/list-mailboxes/add-alias/delete-alias/list-aliases/set-forward/clear-forward/list-forwards/enable-webmail-forwards/forward-status/gen-dkim/show-dkim/dns-help/audit-dns/repair-postscreen-cache]: " "status"
 
   case "${action,,}" in
     status)
@@ -4630,6 +5128,7 @@ manage_mailserver() {
       fi
       echo "Creating mailbox: ${email_addr}"
       docker exec -i mailserver setup email add "$email_addr" "$email_password"
+      reload_mailserver_dovecot
       echo "Mailbox created."
       if webmail_password_change_enabled; then
         webmail_force_password_mark "$email_addr" || true
@@ -4652,6 +5151,7 @@ manage_mailserver() {
         exit 0
       fi
       docker exec -i mailserver setup email del "$email_addr"
+      reload_mailserver_dovecot
       echo "Mailbox deleted."
       ;;
     reset-password)
@@ -4682,6 +5182,9 @@ manage_mailserver() {
         echo "  docker exec -it mailserver setup email help"
         exit 1
       fi
+      if [ "$password_reset_done" = "yes" ]; then
+        reload_mailserver_dovecot
+      fi
       if [ "$password_reset_done" = "yes" ] && webmail_password_change_enabled; then
         prompt force_change "Force this user to change password at next Roundcube login? (yes/no): " "yes"
         if [ "${force_change,,}" = "yes" ]; then
@@ -4691,6 +5194,82 @@ manage_mailserver() {
       ;;
     list-mailboxes)
       docker exec -i mailserver setup email list || true
+      ;;
+    add-alias)
+      prompt alias_addr "Alias address (e.g. sales@example.com): "
+      alias_addr="$(normalize_email_address "$alias_addr")"
+      if ! validate_email_address "$alias_addr"; then
+        echo "Invalid alias address: ${alias_addr}"
+        exit 1
+      fi
+      prompt recipients_csv "Recipient address(es), comma-separated: "
+      if ! recipients_csv="$(normalize_email_csv "$recipients_csv")"; then
+        echo "Invalid recipient list."
+        exit 1
+      fi
+      add_mail_alias "$alias_addr" "$recipients_csv"
+      ;;
+    delete-alias)
+      prompt alias_addr "Alias address to modify/delete: "
+      alias_addr="$(normalize_email_address "$alias_addr")"
+      if ! validate_email_address "$alias_addr"; then
+        echo "Invalid alias address: ${alias_addr}"
+        exit 1
+      fi
+      prompt recipients_csv "Recipient(s) to remove, comma-separated [blank = all recipients for alias]: "
+      if [ -n "$recipients_csv" ]; then
+        if ! recipients_csv="$(normalize_email_csv "$recipients_csv")"; then
+          echo "Invalid recipient list."
+          exit 1
+        fi
+      fi
+      delete_mail_alias "$alias_addr" "$recipients_csv"
+      ;;
+    list-aliases)
+      list_mail_aliases
+      ;;
+    set-forward)
+      prompt email_addr "Existing mailbox to forward (e.g. user@example.com): "
+      email_addr="$(normalize_email_address "$email_addr")"
+      if ! validate_email_address "$email_addr"; then
+        echo "Invalid mailbox address: ${email_addr}"
+        exit 1
+      fi
+      prompt recipients_csv "Forward recipient address(es), comma-separated: "
+      if ! recipients_csv="$(normalize_email_csv "$recipients_csv")"; then
+        echo "Invalid recipient list."
+        exit 1
+      fi
+      prompt keep_copy "Keep a copy in the original mailbox? (yes/no): " "yes"
+      set_mailbox_forward "$email_addr" "$recipients_csv" "$keep_copy"
+      ;;
+    clear-forward)
+      prompt email_addr "Mailbox address to clear managed forward for: "
+      email_addr="$(normalize_email_address "$email_addr")"
+      if ! validate_email_address "$email_addr"; then
+        echo "Invalid mailbox address: ${email_addr}"
+        exit 1
+      fi
+      prompt confirm_clear "Clear managed forward for ${email_addr}? (yes/no): " "no"
+      if [ "${confirm_clear,,}" != "yes" ]; then
+        echo "Cancelled."
+        exit 0
+      fi
+      clear_mailbox_forward "$email_addr"
+      ;;
+    list-forwards)
+      forwards_output="$(list_mailbox_forwards || true)"
+      if [ -n "$forwards_output" ]; then
+        echo "$forwards_output"
+      else
+        echo "No managed mailbox forwards configured."
+      fi
+      ;;
+    enable-webmail-forwards)
+      enable_webmail_mailbox_forwards
+      ;;
+    forward-status)
+      show_mail_forwarding_status
       ;;
     gen-dkim)
       prompt domain_list "Domain(s) to generate DKIM for (comma-separated): "
@@ -4843,7 +5422,7 @@ setup_webmail_roundcube() {
 }
 
 modify_webmail_roundcube() {
-  local current_webmail_domain current_webmail_domains current_mail_host current_password_change_enabled webmail_domains webmail_domain mail_host mail_domain proceed remove_old old_domain removed_domains part
+  local current_webmail_domain current_webmail_domains current_mail_host current_password_change_enabled current_managesieve_enabled webmail_domains webmail_domain mail_host mail_domain proceed remove_old old_domain removed_domains part
 
   echo ""
   echo "Modify webmail (Roundcube)"
@@ -4859,6 +5438,7 @@ modify_webmail_roundcube() {
   current_webmail_domains=""
   current_mail_host=""
   current_password_change_enabled="no"
+  current_managesieve_enabled="no"
 
   if [ -f "$WEBMAIL_META_FILE" ]; then
     # shellcheck disable=SC1090
@@ -4868,6 +5448,7 @@ modify_webmail_roundcube() {
     current_webmail_domains="${WEBMAIL_DOMAINS:-}"
     current_mail_host="${MAIL_HOST:-}"
     current_password_change_enabled="${WEBMAIL_PASSWORD_CHANGE_ENABLED:-no}"
+    current_managesieve_enabled="${WEBMAIL_MANAGESIEVE_ENABLED:-no}"
   fi
 
   if [ -z "$current_webmail_domain" ]; then
@@ -4928,7 +5509,7 @@ modify_webmail_roundcube() {
   ensure_mailserver_fail2ban_ignores_shared_network
 
   echo "Rewriting Roundcube stack..."
-  write_roundcube_compose "$webmail_domain" "$webmail_domains" "$mail_host" "$current_password_change_enabled"
+  write_roundcube_compose "$webmail_domain" "$webmail_domains" "$mail_host" "$current_password_change_enabled" "$current_managesieve_enabled"
   dc -f "$WEBMAIL_COMPOSE" up -d --force-recreate
 
   removed_domains=""
@@ -4981,9 +5562,10 @@ load_current_webmail_settings() {
   WEBMAIL_CURRENT_DOMAINS=""
   WEBMAIL_CURRENT_MAIL_HOST=""
   WEBMAIL_CURRENT_PASSWORD_CHANGE_ENABLED="no"
+  WEBMAIL_CURRENT_MANAGESIEVE_ENABLED="no"
 
   if [ -f "$WEBMAIL_META_FILE" ]; then
-    local WEBMAIL_PRIMARY_DOMAIN="" WEBMAIL_DOMAIN="" WEBMAIL_DOMAINS="" MAIL_HOST="" WEBMAIL_PASSWORD_CHANGE_ENABLED=""
+    local WEBMAIL_PRIMARY_DOMAIN="" WEBMAIL_DOMAIN="" WEBMAIL_DOMAINS="" MAIL_HOST="" WEBMAIL_PASSWORD_CHANGE_ENABLED="" WEBMAIL_MANAGESIEVE_ENABLED=""
     # shellcheck disable=SC1090
     # shellcheck disable=SC1091
     source "$WEBMAIL_META_FILE"
@@ -4991,6 +5573,7 @@ load_current_webmail_settings() {
     WEBMAIL_CURRENT_DOMAINS="${WEBMAIL_DOMAINS:-}"
     WEBMAIL_CURRENT_MAIL_HOST="${MAIL_HOST:-}"
     WEBMAIL_CURRENT_PASSWORD_CHANGE_ENABLED="${WEBMAIL_PASSWORD_CHANGE_ENABLED:-no}"
+    WEBMAIL_CURRENT_MANAGESIEVE_ENABLED="${WEBMAIL_MANAGESIEVE_ENABLED:-no}"
   fi
 
   if [ -z "$WEBMAIL_CURRENT_PRIMARY" ]; then
@@ -5105,7 +5688,7 @@ enable_webmail_password_change() {
   fi
 
   ensure_roundcube_password_change_files
-  write_roundcube_compose "$WEBMAIL_CURRENT_PRIMARY" "$WEBMAIL_CURRENT_DOMAINS" "$WEBMAIL_CURRENT_MAIL_HOST" "yes"
+  write_roundcube_compose "$WEBMAIL_CURRENT_PRIMARY" "$WEBMAIL_CURRENT_DOMAINS" "$WEBMAIL_CURRENT_MAIL_HOST" "yes" "$WEBMAIL_CURRENT_MANAGESIEVE_ENABLED"
 
   echo "Starting Roundcube with password helper..."
   dc -f "$WEBMAIL_COMPOSE" up -d --force-recreate --remove-orphans
@@ -5152,7 +5735,7 @@ disable_webmail_password_change() {
   fi
 
   rm -f "$WEBMAIL_PASSWORD_CONFIG_FILE"
-  write_roundcube_compose "$WEBMAIL_CURRENT_PRIMARY" "$WEBMAIL_CURRENT_DOMAINS" "$WEBMAIL_CURRENT_MAIL_HOST" "no"
+  write_roundcube_compose "$WEBMAIL_CURRENT_PRIMARY" "$WEBMAIL_CURRENT_DOMAINS" "$WEBMAIL_CURRENT_MAIL_HOST" "no" "$WEBMAIL_CURRENT_MANAGESIEVE_ENABLED"
 
   echo "Recreating Roundcube without password helper..."
   dc -f "$WEBMAIL_COMPOSE" up -d --force-recreate --remove-orphans
