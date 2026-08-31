@@ -97,6 +97,20 @@ LARAVEL_QUEUE_SLEEP=""
 LARAVEL_QUEUE_TRIES=""
 LARAVEL_QUEUE_TIMEOUT=""
 LARAVEL_QUEUE_MAX_TIME=""
+SERVER_RAM_MB=""
+SERVER_CPU_CORES=""
+SERVER_CAPACITY_PROFILE=""
+RAM_MB=""
+CPU_CORES=""
+PROFILE_NAME=""
+PHP_FPM_CHILDREN=""
+PHP_FPM_START_SERVERS=""
+PHP_FPM_MIN_SPARE_SERVERS=""
+PHP_FPM_MAX_SPARE_SERVERS=""
+OPCACHE_MEMORY=""
+REDIS_MEMORY=""
+MYSQL_BUFFER=""
+MYSQL_MAX_CONNECTIONS=""
 
 banner() {
   echo "=============================================================="
@@ -1684,31 +1698,144 @@ install_base() {
   ensure_cron_jobs
 }
 
-detect_tuning() {
-  RAM_MB=$(free -m | awk '/Mem:/ {print $2}')
-  echo "Detected memory: ${RAM_MB} MB"
+server_ram_total_mb() {
+  local detected=""
 
-  if [ "$RAM_MB" -le 2048 ]; then
-    PROFILE_NAME="LOW MEMORY"
-    PHP_FPM_CHILDREN=5
-    OPCACHE_MEMORY=128
-    REDIS_MEMORY="256mb"
-    MYSQL_BUFFER="128M"
-  elif [ "$RAM_MB" -le 4096 ]; then
-    PROFILE_NAME="BALANCED"
-    PHP_FPM_CHILDREN=10
-    OPCACHE_MEMORY=192
-    REDIS_MEMORY="512mb"
-    MYSQL_BUFFER="256M"
-  else
-    PROFILE_NAME="HIGH PERFORMANCE"
-    PHP_FPM_CHILDREN=20
-    OPCACHE_MEMORY=256
-    REDIS_MEMORY="1gb"
-    MYSQL_BUFFER="512M"
+  if command -v free >/dev/null 2>&1; then
+    detected="$(free -m | awk '/Mem:/ {print $2; exit}')"
   fi
 
+  if ! [[ "$detected" =~ ^[0-9]+$ ]] && [ -r /proc/meminfo ]; then
+    detected="$(awk '/MemTotal:/ {printf "%d\n", $2 / 1024; exit}' /proc/meminfo)"
+  fi
+
+  if [[ "$detected" =~ ^[0-9]+$ ]] && [ "$detected" -gt 0 ]; then
+    echo "$detected"
+  else
+    echo "0"
+  fi
+}
+
+server_cpu_cores() {
+  local detected=""
+
+  if command -v nproc >/dev/null 2>&1; then
+    detected="$(nproc 2>/dev/null || true)"
+  fi
+
+  if ! [[ "$detected" =~ ^[0-9]+$ ]] && command -v getconf >/dev/null 2>&1; then
+    detected="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  fi
+
+  if [[ "$detected" =~ ^[0-9]+$ ]] && [ "$detected" -gt 0 ]; then
+    echo "$detected"
+  else
+    echo "1"
+  fi
+}
+
+clamp_int() {
+  local value="$1"
+  local min_value="$2"
+  local max_value="$3"
+
+  if [ "$value" -lt "$min_value" ]; then
+    echo "$min_value"
+  elif [ "$value" -gt "$max_value" ]; then
+    echo "$max_value"
+  else
+    echo "$value"
+  fi
+}
+
+format_memory_mb_for_redis() {
+  local value_mb="$1"
+
+  if [ "$value_mb" -ge 1024 ] && [ $((value_mb % 1024)) -eq 0 ]; then
+    echo "$((value_mb / 1024))gb"
+  else
+    echo "${value_mb}mb"
+  fi
+}
+
+detect_tuning() {
+  local app_profile="${1:-}"
+  local detected_ram detected_cpu redis_memory_mb mysql_buffer_mb php_max_by_ram
+
+  detected_ram="$(server_ram_total_mb)"
+  detected_cpu="$(server_cpu_cores)"
+
+  RAM_MB="$detected_ram"
+  CPU_CORES="$detected_cpu"
+
+  if [ "$RAM_MB" -le 0 ]; then
+    echo "Could not detect server RAM."
+    exit 1
+  fi
+
+  if [ "$CPU_CORES" -le 0 ]; then
+    echo "Could not detect server CPU cores."
+    exit 1
+  fi
+
+  echo "Detected server capacity: ${RAM_MB} MB RAM, ${CPU_CORES} CPU core(s)"
+
+  if [ "$RAM_MB" -le 2048 ] || [ "$CPU_CORES" -le 1 ]; then
+    PROFILE_NAME="LOW CAPACITY"
+    PHP_FPM_CHILDREN="$(clamp_int "$((CPU_CORES * 4))" 4 6)"
+    OPCACHE_MEMORY=128
+    redis_memory_mb=256
+    mysql_buffer_mb=128
+    MYSQL_MAX_CONNECTIONS=75
+  elif [ "$RAM_MB" -le 4096 ] || [ "$CPU_CORES" -le 2 ]; then
+    PROFILE_NAME="BALANCED"
+    PHP_FPM_CHILDREN="$(clamp_int "$((CPU_CORES * 5))" 8 12)"
+    OPCACHE_MEMORY=192
+    redis_memory_mb="$(clamp_int "$((RAM_MB / 8))" 256 512)"
+    mysql_buffer_mb="$(clamp_int "$((RAM_MB / 8))" 256 512)"
+    MYSQL_MAX_CONNECTIONS="$(clamp_int "$((CPU_CORES * 50))" 100 150)"
+  else
+    PROFILE_NAME="HIGH PERFORMANCE"
+    php_max_by_ram="$((RAM_MB / 192))"
+    php_max_by_ram="$(clamp_int "$php_max_by_ram" 16 80)"
+    PHP_FPM_CHILDREN="$(clamp_int "$((CPU_CORES * 8))" 16 "$php_max_by_ram")"
+    OPCACHE_MEMORY="$(clamp_int "$((RAM_MB / 32))" 256 768)"
+    redis_memory_mb="$(clamp_int "$((RAM_MB / 8))" 512 4096)"
+    mysql_buffer_mb="$(clamp_int "$((RAM_MB / 6))" 512 4096)"
+    MYSQL_MAX_CONNECTIONS="$(clamp_int "$((CPU_CORES * 75))" 150 600)"
+  fi
+
+  PHP_FPM_START_SERVERS="$(clamp_int "$((PHP_FPM_CHILDREN / 4))" 1 8)"
+  PHP_FPM_MIN_SPARE_SERVERS="$PHP_FPM_START_SERVERS"
+  PHP_FPM_MAX_SPARE_SERVERS="$(clamp_int "$((PHP_FPM_CHILDREN / 2))" "$PHP_FPM_MIN_SPARE_SERVERS" 24)"
+  REDIS_MEMORY="$(format_memory_mb_for_redis "$redis_memory_mb")"
+  MYSQL_BUFFER="${mysql_buffer_mb}M"
+
   echo "Applied profile: ${PROFILE_NAME}"
+  if [ "$app_profile" = "node" ]; then
+    echo "Project tuning: Node container can use available host CPU/RAM; no PHP/MariaDB/Redis tuning generated."
+  else
+    echo "Project tuning: PHP-FPM max_children=${PHP_FPM_CHILDREN}, MariaDB buffer=${MYSQL_BUFFER}, Redis maxmemory=${REDIS_MEMORY}"
+  fi
+}
+
+verify_server_capacity_or_exit() {
+  local action="${1:-manage project}"
+  local app_profile="${2:-}"
+
+  detect_tuning "$app_profile"
+
+  if [ "$RAM_MB" -lt 1024 ]; then
+    echo "Server capacity check failed for ${action}: at least 1024 MB RAM is required."
+    exit 1
+  fi
+
+  if [ "$CPU_CORES" -lt 1 ]; then
+    echo "Server capacity check failed for ${action}: at least 1 CPU core is required."
+    exit 1
+  fi
+
+  echo "Server capacity check passed for ${action}."
 }
 
 ensure_project_exists() {
@@ -1791,6 +1918,7 @@ write_project_files() {
   project_access_allowed_sources="$(read_project_access_allowed_sources "$app_dir")"
   project_access_restricted="$(read_project_access_restricted "$app_dir")"
   project_domains="$(normalize_project_domain_list "$domain" "$project_domains" 2>/dev/null || echo "$domain")"
+  detect_tuning "$app_profile"
 
   if [ "$app_profile" = "node" ]; then
     local node_container="${project_name}-node"
@@ -1861,6 +1989,9 @@ EOF
       printf 'GUACAMOLE_PROXY_ENABLED=%q\n' "$guacamole_proxy_enabled"
       printf 'GUACAMOLE_PROXY_UPSTREAM=%q\n' "$guacamole_proxy_upstream"
       printf 'APP_PROFILE=%q\n' "$app_profile"
+      printf 'SERVER_RAM_MB=%q\n' "$RAM_MB"
+      printf 'SERVER_CPU_CORES=%q\n' "$CPU_CORES"
+      printf 'SERVER_CAPACITY_PROFILE=%q\n' "$PROFILE_NAME"
       printf 'BACKUP_RETENTION_DAYS=%q\n' "$backup_retention_days"
       printf 'UFW_PMA_ALLOWED_SOURCES=%q\n' "$ufw_pma_allowed_sources"
       printf 'UFW_PMA_RESTRICTED=%q\n' "$ufw_pma_restricted"
@@ -1888,7 +2019,7 @@ EOF
 [mysqld]
 innodb_buffer_pool_size=${MYSQL_BUFFER}
 innodb_log_file_size=128M
-max_connections=100
+max_connections=${MYSQL_MAX_CONNECTIONS}
 max_allowed_packet=${MARIADB_MAX_ALLOWED_PACKET}
 net_read_timeout=${MARIADB_NET_READ_TIMEOUT}
 net_write_timeout=${MARIADB_NET_WRITE_TIMEOUT}
@@ -2040,9 +2171,9 @@ RUN echo "opcache.enable=1" >> /usr/local/etc/php/conf.d/opcache.ini \
 
 RUN echo "pm = dynamic" >> /usr/local/etc/php-fpm.d/www.conf \
  && echo "pm.max_children=${PHP_FPM_CHILDREN}" >> /usr/local/etc/php-fpm.d/www.conf \
- && echo "pm.start_servers=2" >> /usr/local/etc/php-fpm.d/www.conf \
- && echo "pm.min_spare_servers=2" >> /usr/local/etc/php-fpm.d/www.conf \
- && echo "pm.max_spare_servers=5" >> /usr/local/etc/php-fpm.d/www.conf
+ && echo "pm.start_servers=${PHP_FPM_START_SERVERS}" >> /usr/local/etc/php-fpm.d/www.conf \
+ && echo "pm.min_spare_servers=${PHP_FPM_MIN_SPARE_SERVERS}" >> /usr/local/etc/php-fpm.d/www.conf \
+ && echo "pm.max_spare_servers=${PHP_FPM_MAX_SPARE_SERVERS}" >> /usr/local/etc/php-fpm.d/www.conf
 
 WORKDIR /var/www
 
@@ -2152,6 +2283,17 @@ EOF
     printf 'GUACAMOLE_PROXY_ENABLED=%q\n' "$guacamole_proxy_enabled"
     printf 'GUACAMOLE_PROXY_UPSTREAM=%q\n' "$guacamole_proxy_upstream"
     printf 'APP_PROFILE=%q\n' "$app_profile"
+    printf 'SERVER_RAM_MB=%q\n' "$RAM_MB"
+    printf 'SERVER_CPU_CORES=%q\n' "$CPU_CORES"
+    printf 'SERVER_CAPACITY_PROFILE=%q\n' "$PROFILE_NAME"
+    printf 'PHP_FPM_CHILDREN=%q\n' "$PHP_FPM_CHILDREN"
+    printf 'PHP_FPM_START_SERVERS=%q\n' "$PHP_FPM_START_SERVERS"
+    printf 'PHP_FPM_MIN_SPARE_SERVERS=%q\n' "$PHP_FPM_MIN_SPARE_SERVERS"
+    printf 'PHP_FPM_MAX_SPARE_SERVERS=%q\n' "$PHP_FPM_MAX_SPARE_SERVERS"
+    printf 'OPCACHE_MEMORY=%q\n' "$OPCACHE_MEMORY"
+    printf 'REDIS_MEMORY=%q\n' "$REDIS_MEMORY"
+    printf 'MYSQL_BUFFER=%q\n' "$MYSQL_BUFFER"
+    printf 'MYSQL_MAX_CONNECTIONS=%q\n' "$MYSQL_MAX_CONNECTIONS"
     printf 'BACKUP_RETENTION_DAYS=%q\n' "$backup_retention_days"
     printf 'UFW_PMA_ALLOWED_SOURCES=%q\n' "$ufw_pma_allowed_sources"
     printf 'UFW_PMA_RESTRICTED=%q\n' "$ufw_pma_restricted"
@@ -5867,7 +6009,7 @@ create_project() {
   fi
 
   install_base
-  detect_tuning
+  verify_server_capacity_or_exit "create project" "$app_profile"
 
   if [ -e "${PROXY_PROJECTS_DIR}/${project_name}" ]; then
     echo "A project already exists with the name: ${project_name}"
@@ -5923,7 +6065,7 @@ create_project() {
     echo "Document-root apps like WordPress belong in ${app_dir}/public/."
   fi
   echo "If you change the uploaded layout later, run 'Update project' to regenerate Nginx."
-  echo "Applied profile based on RAM: ${RAM_MB} MB"
+  echo "Applied capacity profile: ${PROFILE_NAME} (${RAM_MB} MB RAM, ${CPU_CORES} CPU core(s))"
   echo ""
   print_project_env_template "$app_profile" "$db_name" "$db_user"
   echo ""
@@ -5951,7 +6093,6 @@ change_project_domain() {
 
   app_dir="$(resolve_project_dir "$project_name")"
   ensure_project_exists "$project_name" "$app_dir"
-  detect_tuning
 
   if [ ! -f "${app_dir}/.project-meta" ]; then
     echo "Project metadata not found at ${app_dir}/.project-meta"
@@ -6212,11 +6353,18 @@ list_projects() {
       [ -d "$dir" ] || continue
 
       if [ -f "${dir}/.project-meta" ]; then
+        local saved_capacity_profile saved_capacity_ram saved_capacity_cpu
+        saved_capacity_profile="$(read_project_meta_var "$dir" "SERVER_CAPACITY_PROFILE")"
+        saved_capacity_ram="$(read_project_meta_var "$dir" "SERVER_RAM_MB")"
+        saved_capacity_cpu="$(read_project_meta_var "$dir" "SERVER_CPU_CORES")"
         # shellcheck disable=SC1090
         # shellcheck disable=SC1091
         source "${dir}/.project-meta"
         echo "Project: ${project_name}"
         echo "Profile: ${APP_PROFILE:-$(detect_project_profile "$dir")}"
+        if [ -n "$saved_capacity_profile" ]; then
+          echo "Capacity: ${saved_capacity_profile} (${saved_capacity_ram:-unknown} MB RAM, ${saved_capacity_cpu:-unknown} CPU core(s))"
+        fi
         echo "Domain : ${DOMAIN}"
         echo "Path   : ${APP_DIR}"
         if [ -n "${DB_NAME:-}" ]; then
@@ -6243,11 +6391,18 @@ list_projects() {
     project_name="$(basename "$dir")"
 
     if [ -f "${dir}/.project-meta" ]; then
+      local saved_capacity_profile saved_capacity_ram saved_capacity_cpu
+      saved_capacity_profile="$(read_project_meta_var "$dir" "SERVER_CAPACITY_PROFILE")"
+      saved_capacity_ram="$(read_project_meta_var "$dir" "SERVER_RAM_MB")"
+      saved_capacity_cpu="$(read_project_meta_var "$dir" "SERVER_CPU_CORES")"
       # shellcheck disable=SC1090
       # shellcheck disable=SC1091
       source "${dir}/.project-meta"
       echo "Project: ${project_name}"
       echo "Profile: ${APP_PROFILE:-$(detect_project_profile "$dir")}"
+      if [ -n "$saved_capacity_profile" ]; then
+        echo "Capacity: ${saved_capacity_profile} (${saved_capacity_ram:-unknown} MB RAM, ${saved_capacity_cpu:-unknown} CPU core(s))"
+      fi
       echo "Domain : ${DOMAIN}"
       echo "Path   : ${APP_DIR}"
       if [ -n "${DB_NAME:-}" ]; then
@@ -6501,14 +6656,13 @@ update_project() {
 
   ensure_project_exists "$project_name" "$app_dir"
 
-  detect_tuning
-
   # shellcheck disable=SC1090
   # shellcheck disable=SC1091
   source "${app_dir}/.project-meta"
   require_nonempty "PROJECT_NAME" "${PROJECT_NAME}"
   require_nonempty "DOMAIN" "${DOMAIN}"
   app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
+  verify_server_capacity_or_exit "update project" "$app_profile"
   if [ "$app_profile" != "node" ]; then
     require_nonempty "DB_NAME" "${DB_NAME}"
     require_nonempty "DB_USER" "${DB_USER}"
@@ -6566,7 +6720,6 @@ phpmyadmin_manage() {
 
   app_dir="$(resolve_project_dir "$project_name")"
   ensure_project_exists "$project_name" "$app_dir"
-  detect_tuning
 
   if [ ! -f "${app_dir}/.project-meta" ]; then
     echo "Project metadata not found at ${app_dir}/.project-meta"
@@ -7020,7 +7173,6 @@ reset_database_passwords() {
 
   app_dir="$(resolve_project_dir "$project_name")"
   ensure_project_exists "$project_name" "$app_dir"
-  detect_tuning
 
   if [ ! -f "${app_dir}/.project-meta" ]; then
     echo "Project metadata not found at ${app_dir}/.project-meta"
@@ -7185,7 +7337,6 @@ manage_reverb() {
 
   app_dir="$(resolve_project_dir "$project_name")"
   ensure_project_exists "$project_name" "$app_dir"
-  detect_tuning
 
   if [ ! -f "${app_dir}/.project-meta" ]; then
     echo "Project metadata not found at ${app_dir}/.project-meta"
@@ -7469,7 +7620,6 @@ manage_guacamole_proxy() {
 
   app_dir="$(resolve_project_dir "$project_name")"
   ensure_project_exists "$project_name" "$app_dir"
-  detect_tuning
 
   if [ ! -f "${app_dir}/.project-meta" ]; then
     echo "Project metadata not found at ${app_dir}/.project-meta"
@@ -8075,6 +8225,16 @@ fi
 if [ "${1:-}" = "setup-cron" ]; then
   ensure_cron_jobs
   echo "Cron jobs installed/updated."
+  exit 0
+fi
+
+if [ "${1:-}" = "capacity-check" ] || [ "${1:-}" = "check-capacity" ]; then
+  app_profile="${2:-laravel}"
+  if ! app_profile="$(normalize_project_profile "$app_profile")"; then
+    echo "Invalid app profile. Use one of: laravel, thinkphp, generic, node."
+    exit 1
+  fi
+  verify_server_capacity_or_exit "capacity check" "$app_profile"
   exit 0
 fi
 
