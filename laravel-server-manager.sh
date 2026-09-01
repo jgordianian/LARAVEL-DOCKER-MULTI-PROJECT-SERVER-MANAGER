@@ -3042,9 +3042,89 @@ setup_backup_cron() {
     | crontab -
 }
 
+laravel_scheduler_cron_line_for_project() {
+  local project_name="$1"
+  local php_container="$2"
+  local artisan_rel="$3"
+  local docker_bin="${4:-/usr/bin/docker}"
+  local artisan_dir_rel container_workdir
+
+  artisan_dir_rel="$(dirname "$artisan_rel")"
+  if [ "$artisan_dir_rel" = "." ]; then
+    container_workdir="/var/www"
+  else
+    container_workdir="/var/www/${artisan_dir_rel}"
+  fi
+
+  printf '* * * * * %s exec -w %s %s php artisan schedule:run >> /var/log/laravel-scheduler-%s.log 2>&1 # laravel-manager scheduler %s\n' \
+    "$docker_bin" \
+    "$container_workdir" \
+    "$php_container" \
+    "$project_name" \
+    "$project_name"
+}
+
+setup_laravel_scheduler_crons() {
+  local docker_bin tmp generated_tmp meta_file count
+
+  docker_bin="$(command -v docker 2>/dev/null || true)"
+  docker_bin="${docker_bin:-/usr/bin/docker}"
+  tmp="$(mktemp)"
+  generated_tmp="$(mktemp)"
+
+  (crontab -l 2>/dev/null || true) \
+    | awk 'index($0,"# laravel-manager scheduler ")==0 && $0 !~ /# [[:alnum:]_.-]+ laravel scheduler$/ {print}' \
+    > "$tmp"
+
+  for meta_file in "$PROJECTS_BASE"/*/.project-meta; do
+    [ -f "$meta_file" ] || continue
+
+    (
+      set +u
+      PROJECT_NAME=""
+      PHP_CONTAINER=""
+      APP_DIR=""
+      APP_PROFILE=""
+
+      # shellcheck disable=SC1090
+      # shellcheck disable=SC1091
+      source "$meta_file" >/dev/null 2>&1 || exit 0
+
+      project_name="${PROJECT_NAME:-$(basename "$(dirname "$meta_file")")}"
+      app_dir="${APP_DIR:-$(dirname "$meta_file")}"
+      if [ -n "${APP_PROFILE:-}" ]; then
+        app_profile="$(normalize_project_profile "$APP_PROFILE" 2>/dev/null || true)"
+      else
+        app_profile="$(detect_project_profile "$app_dir" 2>/dev/null || true)"
+      fi
+
+      [ "$app_profile" = "laravel" ] || exit 0
+
+      artisan_rel="$(detect_project_artisan_rel "$app_dir" 2>/dev/null || true)"
+      [ -n "$artisan_rel" ] || exit 0
+
+      php_container="${PHP_CONTAINER:-${project_name}-php}"
+      [ -n "$php_container" ] || exit 0
+
+      laravel_scheduler_cron_line_for_project "$project_name" "$php_container" "$artisan_rel" "$docker_bin"
+    ) >> "$generated_tmp"
+  done
+
+  if [ -s "$generated_tmp" ]; then
+    cat "$generated_tmp" >> "$tmp"
+  fi
+
+  crontab "$tmp"
+  count="$(wc -l < "$generated_tmp" | tr -d '[:space:]')"
+  rm -f "$tmp" "$generated_tmp"
+
+  echo "Laravel scheduler cron jobs installed/updated: ${count:-0} project(s)."
+}
+
 ensure_cron_jobs() {
   setup_ssl_renew_cron
   setup_backup_cron
+  setup_laravel_scheduler_crons
 }
 
 normalize_domain() {

@@ -20,6 +20,7 @@ The script creates one shared Nginx reverse proxy with Certbot, then creates one
 - Optional Apache Guacamole proxy and managed VNC server
 - Per-project access restrictions through Nginx
 - RAM/CPU-based tuning when projects are created or updated
+- Automatic Laravel scheduler cron entries for Laravel projects
 
 ## Requirements
 
@@ -65,7 +66,7 @@ Back up all projects:
 sudo /root/laravel-server-manager.sh backup-all
 ```
 
-Install or refresh cron jobs:
+Install or refresh cron jobs for SSL renewal, backups, and Laravel schedulers:
 
 ```bash
 sudo /root/laravel-server-manager.sh setup-cron
@@ -88,7 +89,7 @@ sudo /root/laravel-server-manager.sh manage-vnc
 
 | Profile | Use for | Managed services |
 | --- | --- | --- |
-| `laravel` | Laravel apps | PHP-FPM, MariaDB, Redis, queue worker |
+| `laravel` | Laravel apps | PHP-FPM, MariaDB, Redis, queue worker, scheduler cron |
 | `generic` | WordPress or plain PHP apps | PHP-FPM, MariaDB, Redis |
 | `thinkphp` | ThinkPHP/FastAdmin apps | PHP-FPM, MariaDB, Redis |
 | `node` | Node apps or games | Node container |
@@ -181,6 +182,12 @@ Check generated project files:
 cd /var/www/projects/<project>
 docker compose ps
 docker compose logs
+```
+
+Check a Laravel project's scheduler log:
+
+```bash
+tail -f /var/log/laravel-scheduler-<project>.log
 ```
 
 Check the reverse proxy:
