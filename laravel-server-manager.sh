@@ -100,6 +100,8 @@ LARAVEL_QUEUE_MAX_TIME=""
 SERVER_RAM_MB=""
 SERVER_CPU_CORES=""
 SERVER_CAPACITY_PROFILE=""
+PROJECT_TUNING_MODE=""
+PROJECT_TUNING_PRESET=""
 RAM_MB=""
 CPU_CORES=""
 PROFILE_NAME=""
@@ -1739,6 +1741,10 @@ clamp_int() {
   local min_value="$2"
   local max_value="$3"
 
+  if [ "$max_value" -lt "$min_value" ]; then
+    max_value="$min_value"
+  fi
+
   if [ "$value" -lt "$min_value" ]; then
     echo "$min_value"
   elif [ "$value" -gt "$max_value" ]; then
@@ -1746,6 +1752,29 @@ clamp_int() {
   else
     echo "$value"
   fi
+}
+
+normalize_memory_mb_value() {
+  local value
+  value="$(trim_whitespace "${1:-}")"
+  value="${value,,}"
+
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo "$value"
+    return 0
+  fi
+
+  if [[ "$value" =~ ^([0-9]+)m(b)?$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  if [[ "$value" =~ ^([0-9]+)g(b)?$ ]]; then
+    echo "$((BASH_REMATCH[1] * 1024))"
+    return 0
+  fi
+
+  return 1
 }
 
 format_memory_mb_for_redis() {
@@ -1758,10 +1787,52 @@ format_memory_mb_for_redis() {
   fi
 }
 
-detect_tuning() {
-  local app_profile="${1:-}"
-  local detected_ram detected_cpu redis_memory_mb mysql_buffer_mb php_max_by_ram
+normalize_project_tuning_mode() {
+  local mode="${1:-}"
+  mode="${mode,,}"
 
+  case "$mode" in
+    auto|automatic|"")
+      echo "auto"
+      ;;
+    preset|presets|prefab|prebuilt|optimal)
+      echo "preset"
+      ;;
+    custom|personalized|personalizada|manual)
+      echo "custom"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+normalize_project_tuning_preset() {
+  local preset="${1:-}"
+  preset="${preset,,}"
+  preset="${preset//_/-}"
+
+  case "$preset" in
+    conservative|safe|small|low|bajo|conservador)
+      echo "conservative"
+      ;;
+    balanced|normal|medium|medio|"")
+      echo "balanced"
+      ;;
+    performance|high|alto|fast)
+      echo "performance"
+      ;;
+    maximum|max|aggressive|agresivo)
+      echo "maximum"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+detect_server_capacity_or_exit() {
+  local detected_ram detected_cpu
   detected_ram="$(server_ram_total_mb)"
   detected_cpu="$(server_cpu_cores)"
 
@@ -1777,8 +1848,35 @@ detect_tuning() {
     echo "Could not detect server CPU cores."
     exit 1
   fi
+}
+
+derive_php_fpm_tuning() {
+  PHP_FPM_START_SERVERS="$(clamp_int "$((PHP_FPM_CHILDREN / 4))" 1 8)"
+  PHP_FPM_MIN_SPARE_SERVERS="$PHP_FPM_START_SERVERS"
+  PHP_FPM_MAX_SPARE_SERVERS="$(clamp_int "$((PHP_FPM_CHILDREN / 2))" "$PHP_FPM_MIN_SPARE_SERVERS" 24)"
+}
+
+print_tuning_summary() {
+  local app_profile="${1:-}"
 
   echo "Detected server capacity: ${RAM_MB} MB RAM, ${CPU_CORES} CPU core(s)"
+  echo "Tuning mode: ${PROJECT_TUNING_MODE:-auto}${PROJECT_TUNING_PRESET:+/${PROJECT_TUNING_PRESET}}"
+  echo "Applied profile: ${PROFILE_NAME}"
+  if [ "$app_profile" = "node" ]; then
+    echo "Project tuning: Node container can use available host CPU/RAM; no PHP/MariaDB/Redis tuning generated."
+  else
+    echo "Project tuning: PHP-FPM max_children=${PHP_FPM_CHILDREN}, MariaDB buffer=${MYSQL_BUFFER}, Redis maxmemory=${REDIS_MEMORY}"
+  fi
+}
+
+detect_tuning() {
+  local app_profile="${1:-}"
+  local quiet="${2:-no}"
+  local redis_memory_mb mysql_buffer_mb php_max_by_ram
+
+  detect_server_capacity_or_exit
+  PROJECT_TUNING_MODE="auto"
+  PROJECT_TUNING_PRESET=""
 
   if [ "$RAM_MB" -le 2048 ] || [ "$CPU_CORES" -le 1 ]; then
     PROFILE_NAME="LOW CAPACITY"
@@ -1805,18 +1903,268 @@ detect_tuning() {
     MYSQL_MAX_CONNECTIONS="$(clamp_int "$((CPU_CORES * 75))" 150 600)"
   fi
 
-  PHP_FPM_START_SERVERS="$(clamp_int "$((PHP_FPM_CHILDREN / 4))" 1 8)"
-  PHP_FPM_MIN_SPARE_SERVERS="$PHP_FPM_START_SERVERS"
-  PHP_FPM_MAX_SPARE_SERVERS="$(clamp_int "$((PHP_FPM_CHILDREN / 2))" "$PHP_FPM_MIN_SPARE_SERVERS" 24)"
+  derive_php_fpm_tuning
   REDIS_MEMORY="$(format_memory_mb_for_redis "$redis_memory_mb")"
   MYSQL_BUFFER="${mysql_buffer_mb}M"
 
-  echo "Applied profile: ${PROFILE_NAME}"
-  if [ "$app_profile" = "node" ]; then
-    echo "Project tuning: Node container can use available host CPU/RAM; no PHP/MariaDB/Redis tuning generated."
-  else
-    echo "Project tuning: PHP-FPM max_children=${PHP_FPM_CHILDREN}, MariaDB buffer=${MYSQL_BUFFER}, Redis maxmemory=${REDIS_MEMORY}"
+  if [ "$quiet" != "quiet" ]; then
+    print_tuning_summary "$app_profile"
   fi
+}
+
+apply_project_tuning_preset() {
+  local preset="$1"
+  local app_profile="${2:-}"
+  local quiet="${3:-no}"
+  local redis_memory_mb mysql_buffer_mb php_max_by_ram
+
+  preset="$(normalize_project_tuning_preset "$preset")" || {
+    echo "Invalid tuning preset. Use one of: conservative, balanced, performance, maximum."
+    exit 1
+  }
+
+  detect_server_capacity_or_exit
+  PROJECT_TUNING_MODE="preset"
+  PROJECT_TUNING_PRESET="$preset"
+
+  case "$preset" in
+    conservative)
+      PROFILE_NAME="PRESET CONSERVATIVE"
+      php_max_by_ram="$(clamp_int "$((RAM_MB / 256))" 4 24)"
+      PHP_FPM_CHILDREN="$(clamp_int "$((CPU_CORES * 3))" 4 "$php_max_by_ram")"
+      OPCACHE_MEMORY="$(clamp_int "$((RAM_MB / 64))" 128 256)"
+      redis_memory_mb="$(clamp_int "$((RAM_MB / 12))" 128 1024)"
+      mysql_buffer_mb="$(clamp_int "$((RAM_MB / 10))" 128 1024)"
+      MYSQL_MAX_CONNECTIONS="$(clamp_int "$((CPU_CORES * 35))" 75 200)"
+      ;;
+    balanced)
+      PROFILE_NAME="PRESET BALANCED"
+      php_max_by_ram="$(clamp_int "$((RAM_MB / 192))" 8 40)"
+      PHP_FPM_CHILDREN="$(clamp_int "$((CPU_CORES * 5))" 8 "$php_max_by_ram")"
+      OPCACHE_MEMORY="$(clamp_int "$((RAM_MB / 48))" 192 384)"
+      redis_memory_mb="$(clamp_int "$((RAM_MB / 8))" 256 2048)"
+      mysql_buffer_mb="$(clamp_int "$((RAM_MB / 8))" 256 2048)"
+      MYSQL_MAX_CONNECTIONS="$(clamp_int "$((CPU_CORES * 50))" 100 350)"
+      ;;
+    performance)
+      PROFILE_NAME="PRESET PERFORMANCE"
+      php_max_by_ram="$(clamp_int "$((RAM_MB / 160))" 12 80)"
+      PHP_FPM_CHILDREN="$(clamp_int "$((CPU_CORES * 8))" 12 "$php_max_by_ram")"
+      OPCACHE_MEMORY="$(clamp_int "$((RAM_MB / 32))" 256 768)"
+      redis_memory_mb="$(clamp_int "$((RAM_MB / 6))" 512 4096)"
+      mysql_buffer_mb="$(clamp_int "$((RAM_MB / 5))" 512 4096)"
+      MYSQL_MAX_CONNECTIONS="$(clamp_int "$((CPU_CORES * 75))" 150 600)"
+      ;;
+    maximum)
+      PROFILE_NAME="PRESET MAXIMUM"
+      php_max_by_ram="$(clamp_int "$((RAM_MB / 128))" 16 160)"
+      PHP_FPM_CHILDREN="$(clamp_int "$((CPU_CORES * 12))" 16 "$php_max_by_ram")"
+      OPCACHE_MEMORY="$(clamp_int "$((RAM_MB / 24))" 384 1024)"
+      redis_memory_mb="$(clamp_int "$((RAM_MB / 4))" 1024 8192)"
+      mysql_buffer_mb="$(clamp_int "$((RAM_MB / 3))" 1024 8192)"
+      MYSQL_MAX_CONNECTIONS="$(clamp_int "$((CPU_CORES * 100))" 200 1000)"
+      ;;
+  esac
+
+  derive_php_fpm_tuning
+  REDIS_MEMORY="$(format_memory_mb_for_redis "$redis_memory_mb")"
+  MYSQL_BUFFER="${mysql_buffer_mb}M"
+
+  if [ "$quiet" != "quiet" ]; then
+    print_tuning_summary "$app_profile"
+  fi
+}
+
+set_custom_project_tuning_values() {
+  local php_children="$1"
+  local opcache_memory_mb="$2"
+  local redis_memory_mb="$3"
+  local mysql_buffer_mb="$4"
+  local mysql_max_connections="$5"
+
+  PHP_FPM_CHILDREN="$php_children"
+  OPCACHE_MEMORY="$opcache_memory_mb"
+  REDIS_MEMORY="$(format_memory_mb_for_redis "$redis_memory_mb")"
+  MYSQL_BUFFER="${mysql_buffer_mb}M"
+  MYSQL_MAX_CONNECTIONS="$mysql_max_connections"
+  PROJECT_TUNING_MODE="custom"
+  PROJECT_TUNING_PRESET=""
+  PROFILE_NAME="CUSTOM"
+  derive_php_fpm_tuning
+}
+
+validate_int_between() {
+  local value="${1:-}"
+  local min_value="$2"
+  local max_value="$3"
+
+  [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  [ "$value" -ge "$min_value" ] && [ "$value" -le "$max_value" ]
+}
+
+load_custom_project_tuning() {
+  local app_dir="$1"
+  local php_children opcache_memory redis_memory mysql_buffer mysql_max_connections
+  local redis_memory_mb mysql_buffer_mb
+
+  php_children="${PHP_FPM_CHILDREN:-$(read_project_meta_var "$app_dir" "PHP_FPM_CHILDREN")}"
+  opcache_memory="${OPCACHE_MEMORY:-$(read_project_meta_var "$app_dir" "OPCACHE_MEMORY")}"
+  redis_memory="${REDIS_MEMORY:-$(read_project_meta_var "$app_dir" "REDIS_MEMORY")}"
+  mysql_buffer="${MYSQL_BUFFER:-$(read_project_meta_var "$app_dir" "MYSQL_BUFFER")}"
+  mysql_max_connections="${MYSQL_MAX_CONNECTIONS:-$(read_project_meta_var "$app_dir" "MYSQL_MAX_CONNECTIONS")}"
+
+  redis_memory_mb="$(normalize_memory_mb_value "$redis_memory" 2>/dev/null || true)"
+  mysql_buffer_mb="$(normalize_memory_mb_value "$mysql_buffer" 2>/dev/null || true)"
+
+  validate_int_between "$php_children" 1 500 || return 1
+  validate_int_between "$opcache_memory" 32 4096 || return 1
+  validate_int_between "$redis_memory_mb" 16 65536 || return 1
+  validate_int_between "$mysql_buffer_mb" 16 131072 || return 1
+  validate_int_between "$mysql_max_connections" 10 5000 || return 1
+
+  set_custom_project_tuning_values "$php_children" "$opcache_memory" "$redis_memory_mb" "$mysql_buffer_mb" "$mysql_max_connections"
+}
+
+resolve_project_tuning() {
+  local app_dir="$1"
+  local app_profile="${2:-}"
+  local quiet="${3:-no}"
+  local tuning_mode tuning_preset
+
+  if [ "$app_profile" = "node" ]; then
+    detect_tuning "$app_profile" "$quiet"
+    return 0
+  fi
+
+  tuning_mode="${PROJECT_TUNING_MODE:-$(read_project_meta_var "$app_dir" "PROJECT_TUNING_MODE")}"
+  if ! tuning_mode="$(normalize_project_tuning_mode "$tuning_mode" 2>/dev/null)"; then
+    tuning_mode="auto"
+  fi
+
+  case "$tuning_mode" in
+    auto)
+      detect_tuning "$app_profile" "$quiet"
+      ;;
+    preset)
+      tuning_preset="${PROJECT_TUNING_PRESET:-$(read_project_meta_var "$app_dir" "PROJECT_TUNING_PRESET")}"
+      if ! tuning_preset="$(normalize_project_tuning_preset "$tuning_preset" 2>/dev/null)"; then
+        tuning_preset="balanced"
+      fi
+      apply_project_tuning_preset "$tuning_preset" "$app_profile" "$quiet"
+      ;;
+    custom)
+      detect_server_capacity_or_exit
+      if load_custom_project_tuning "$app_dir"; then
+        if [ "$quiet" != "quiet" ]; then
+          print_tuning_summary "$app_profile"
+        fi
+      else
+        echo "Warning: saved custom tuning is invalid or incomplete; falling back to auto tuning."
+        detect_tuning "$app_profile" "$quiet"
+      fi
+      ;;
+  esac
+}
+
+prompt_project_tuning() {
+  local app_dir="$1"
+  local app_profile="$2"
+  local action="${3:-project}"
+  local saved_mode saved_preset default_mode mode preset
+  local current_php current_opcache current_redis current_mysql current_connections
+  local php_children opcache_memory redis_memory mysql_buffer mysql_connections
+  local redis_memory_mb mysql_buffer_mb
+
+  detect_server_capacity_or_exit
+
+  if [ "$RAM_MB" -lt 1024 ]; then
+    echo "Server capacity check failed for ${action}: at least 1024 MB RAM is required."
+    exit 1
+  fi
+
+  if [ "$CPU_CORES" -lt 1 ]; then
+    echo "Server capacity check failed for ${action}: at least 1 CPU core is required."
+    exit 1
+  fi
+
+  if [ "$app_profile" = "node" ]; then
+    echo "Node profile does not generate PHP/MariaDB/Redis tuning; using auto capacity metadata."
+    detect_tuning "$app_profile"
+    return 0
+  fi
+
+  saved_mode="${PROJECT_TUNING_MODE:-$(read_project_meta_var "$app_dir" "PROJECT_TUNING_MODE")}"
+  if ! default_mode="$(normalize_project_tuning_mode "$saved_mode" 2>/dev/null)"; then
+    default_mode="auto"
+  fi
+
+  echo ""
+  echo "Project tuning"
+  echo "--------------------------------------------------------------"
+  echo "Server capacity: ${RAM_MB} MB RAM, ${CPU_CORES} CPU core(s)"
+  echo "Modes:"
+  echo "  auto   - choose values automatically from server RAM/CPU"
+  echo "  preset - choose a prefabricated profile"
+  echo "  custom - enter exact PHP/MariaDB/Redis values"
+  echo "Presets: conservative, balanced, performance, maximum"
+  echo "--------------------------------------------------------------"
+  prompt mode "Tuning mode [auto/preset/custom] [${default_mode}]: " "$default_mode"
+  if ! mode="$(normalize_project_tuning_mode "$mode")"; then
+    echo "Invalid tuning mode. Use one of: auto, preset, custom."
+    exit 1
+  fi
+
+  case "$mode" in
+    auto)
+      detect_tuning "$app_profile"
+      ;;
+    preset)
+      saved_preset="${PROJECT_TUNING_PRESET:-$(read_project_meta_var "$app_dir" "PROJECT_TUNING_PRESET")}"
+      if ! saved_preset="$(normalize_project_tuning_preset "$saved_preset" 2>/dev/null)"; then
+        saved_preset="balanced"
+      fi
+      prompt preset "Tuning preset [conservative/balanced/performance/maximum] [${saved_preset}]: " "$saved_preset"
+      apply_project_tuning_preset "$preset" "$app_profile"
+      ;;
+    custom)
+      current_php="${PHP_FPM_CHILDREN:-$(read_project_meta_var "$app_dir" "PHP_FPM_CHILDREN")}"
+      current_opcache="${OPCACHE_MEMORY:-$(read_project_meta_var "$app_dir" "OPCACHE_MEMORY")}"
+      current_redis="${REDIS_MEMORY:-$(read_project_meta_var "$app_dir" "REDIS_MEMORY")}"
+      current_mysql="${MYSQL_BUFFER:-$(read_project_meta_var "$app_dir" "MYSQL_BUFFER")}"
+      current_connections="${MYSQL_MAX_CONNECTIONS:-$(read_project_meta_var "$app_dir" "MYSQL_MAX_CONNECTIONS")}"
+
+      if ! redis_memory_mb="$(normalize_memory_mb_value "$current_redis" 2>/dev/null)" \
+        || ! mysql_buffer_mb="$(normalize_memory_mb_value "$current_mysql" 2>/dev/null)" \
+        || ! validate_int_between "$current_php" 1 500 \
+        || ! validate_int_between "$current_opcache" 32 4096 \
+        || ! validate_int_between "$current_connections" 10 5000; then
+        detect_tuning "$app_profile" "quiet"
+        current_php="$PHP_FPM_CHILDREN"
+        current_opcache="$OPCACHE_MEMORY"
+        redis_memory_mb="$(normalize_memory_mb_value "$REDIS_MEMORY")"
+        mysql_buffer_mb="$(normalize_memory_mb_value "$MYSQL_BUFFER")"
+        current_connections="$MYSQL_MAX_CONNECTIONS"
+      fi
+
+      prompt php_children "PHP-FPM max_children [${current_php}]: " "$current_php"
+      prompt opcache_memory "OPcache memory MB [${current_opcache}]: " "$current_opcache"
+      prompt redis_memory "Redis maxmemory MB [${redis_memory_mb}]: " "$redis_memory_mb"
+      prompt mysql_buffer "MariaDB buffer pool MB [${mysql_buffer_mb}]: " "$mysql_buffer_mb"
+      prompt mysql_connections "MariaDB max_connections [${current_connections}]: " "$current_connections"
+
+      redis_memory_mb="$(normalize_memory_mb_value "$redis_memory" 2>/dev/null || true)"
+      mysql_buffer_mb="$(normalize_memory_mb_value "$mysql_buffer" 2>/dev/null || true)"
+
+      validate_int_between "$php_children" 1 500 || { echo "Invalid PHP-FPM max_children. Use 1-500."; exit 1; }
+      validate_int_between "$opcache_memory" 32 4096 || { echo "Invalid OPcache memory. Use 32-4096 MB."; exit 1; }
+      validate_int_between "$redis_memory_mb" 16 65536 || { echo "Invalid Redis memory. Use 16-65536 MB."; exit 1; }
+      validate_int_between "$mysql_buffer_mb" 16 131072 || { echo "Invalid MariaDB buffer. Use 16-131072 MB."; exit 1; }
+      validate_int_between "$mysql_connections" 10 5000 || { echo "Invalid MariaDB max_connections. Use 10-5000."; exit 1; }
+
+      set_custom_project_tuning_values "$php_children" "$opcache_memory" "$redis_memory_mb" "$mysql_buffer_mb" "$mysql_connections"
+      print_tuning_summary "$app_profile"
+      ;;
+  esac
 }
 
 verify_server_capacity_or_exit() {
@@ -1851,6 +2199,92 @@ ensure_project_exists() {
     echo "docker-compose.yml not found in ${app_dir}"
     exit 1
   fi
+}
+
+project_dir_is_safe_for_permission_fix() {
+  local app_dir="$1"
+  local resolved_app_dir resolved_projects_base
+
+  resolved_app_dir="$(readlink -f "$app_dir" 2>/dev/null || true)"
+  resolved_projects_base="$(readlink -f "$PROJECTS_BASE" 2>/dev/null || true)"
+
+  [ -n "$resolved_app_dir" ] || return 1
+  [ -d "$resolved_app_dir" ] || return 1
+  [ -f "${resolved_app_dir}/docker-compose.yml" ] || [ -f "${resolved_app_dir}/.project-meta" ] || return 1
+
+  case "$resolved_app_dir" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/www)
+      return 1
+      ;;
+  esac
+
+  if [ -n "$resolved_projects_base" ] && [ "$resolved_app_dir" = "$resolved_projects_base" ]; then
+    return 1
+  fi
+
+  return 0
+}
+
+fix_project_writable_path() {
+  local path="$1"
+  local owner="$2"
+  local dir_mode="${3:-0775}"
+  local file_mode="${4:-0664}"
+
+  [ -e "$path" ] || return 0
+
+  find "$path" -xdev -exec chown -h "$owner" {} + 2>/dev/null || true
+  find "$path" -xdev -type d -exec chmod "$dir_mode" {} + 2>/dev/null || true
+  find "$path" -xdev -type f -exec chmod "$file_mode" {} + 2>/dev/null || true
+}
+
+apply_project_permissions() {
+  local app_dir="$1"
+  local app_profile="${2:-}"
+  local php_runtime_owner="82:82"
+  local php_runtime_group="82"
+  local resolved_app_dir writable_path env_file
+
+  if ! project_dir_is_safe_for_permission_fix "$app_dir"; then
+    echo "Warning: skipping project permission fix for unsafe path: ${app_dir}"
+    return 0
+  fi
+
+  resolved_app_dir="$(readlink -f "$app_dir" 2>/dev/null || true)"
+  if [ -n "$resolved_app_dir" ]; then
+    app_dir="$resolved_app_dir"
+  fi
+
+  echo "Fixing project ownership and permissions..."
+
+  find "$app_dir" -xdev -path "${app_dir}/.git" -prune -o -exec chown -h root:root {} + 2>/dev/null || true
+  find "$app_dir" -xdev -path "${app_dir}/.git" -prune -o -type d -exec chmod 0755 {} + 2>/dev/null || true
+  find "$app_dir" -xdev -path "${app_dir}/.git" -prune -o -type f -exec chmod u+rw,go+r,go-w {} + 2>/dev/null || true
+
+  if [ -f "${app_dir}/.project-meta" ]; then
+    chown root:root "${app_dir}/.project-meta" 2>/dev/null || true
+    chmod 0600 "${app_dir}/.project-meta" 2>/dev/null || true
+  fi
+
+  while IFS= read -r env_file; do
+    [ -n "$env_file" ] || continue
+    chown "root:${php_runtime_group}" "$env_file" 2>/dev/null || true
+    chmod 0640 "$env_file" 2>/dev/null || true
+  done < <(find "$app_dir" -xdev -path "${app_dir}/.git" -prune -o -type f -name .env -print 2>/dev/null || true)
+
+  if [ "$app_profile" = "node" ]; then
+    fix_project_writable_path "${app_dir}/data" "root:root" 0750 0640
+    return 0
+  fi
+
+  for writable_path in \
+    "${app_dir}/storage" \
+    "${app_dir}/bootstrap/cache" \
+    "${app_dir}/public/storage" \
+    "${app_dir}/public/uploads" \
+    "${app_dir}/public/wp-content"; do
+    fix_project_writable_path "$writable_path" "$php_runtime_owner" 0775 0664
+  done
 }
 
 write_project_files() {
@@ -1918,7 +2352,7 @@ write_project_files() {
   project_access_allowed_sources="$(read_project_access_allowed_sources "$app_dir")"
   project_access_restricted="$(read_project_access_restricted "$app_dir")"
   project_domains="$(normalize_project_domain_list "$domain" "$project_domains" 2>/dev/null || echo "$domain")"
-  detect_tuning "$app_profile"
+  resolve_project_tuning "$app_dir" "$app_profile" "quiet"
 
   if [ "$app_profile" = "node" ]; then
     local node_container="${project_name}-node"
@@ -1992,6 +2426,8 @@ EOF
       printf 'SERVER_RAM_MB=%q\n' "$RAM_MB"
       printf 'SERVER_CPU_CORES=%q\n' "$CPU_CORES"
       printf 'SERVER_CAPACITY_PROFILE=%q\n' "$PROFILE_NAME"
+      printf 'PROJECT_TUNING_MODE=%q\n' "${PROJECT_TUNING_MODE:-auto}"
+      printf 'PROJECT_TUNING_PRESET=%q\n' "${PROJECT_TUNING_PRESET:-}"
       printf 'BACKUP_RETENTION_DAYS=%q\n' "$backup_retention_days"
       printf 'UFW_PMA_ALLOWED_SOURCES=%q\n' "$ufw_pma_allowed_sources"
       printf 'UFW_PMA_RESTRICTED=%q\n' "$ufw_pma_restricted"
@@ -2000,6 +2436,7 @@ EOF
       printf 'PROJECT_ACCESS_RESTRICTED=%q\n' "$project_access_restricted"
     } > "${app_dir}/.project-meta"
 
+    apply_project_permissions "$app_dir" "$app_profile"
     return 0
   fi
 
@@ -2286,6 +2723,8 @@ EOF
     printf 'SERVER_RAM_MB=%q\n' "$RAM_MB"
     printf 'SERVER_CPU_CORES=%q\n' "$CPU_CORES"
     printf 'SERVER_CAPACITY_PROFILE=%q\n' "$PROFILE_NAME"
+    printf 'PROJECT_TUNING_MODE=%q\n' "${PROJECT_TUNING_MODE:-auto}"
+    printf 'PROJECT_TUNING_PRESET=%q\n' "${PROJECT_TUNING_PRESET:-}"
     printf 'PHP_FPM_CHILDREN=%q\n' "$PHP_FPM_CHILDREN"
     printf 'PHP_FPM_START_SERVERS=%q\n' "$PHP_FPM_START_SERVERS"
     printf 'PHP_FPM_MIN_SPARE_SERVERS=%q\n' "$PHP_FPM_MIN_SPARE_SERVERS"
@@ -2307,6 +2746,8 @@ EOF
     printf 'LARAVEL_QUEUE_TIMEOUT=%q\n' "$laravel_queue_timeout"
     printf 'LARAVEL_QUEUE_MAX_TIME=%q\n' "$laravel_queue_max_time"
   } > "${app_dir}/.project-meta"
+
+  apply_project_permissions "$app_dir" "$app_profile"
 }
 
 write_proxy_config_http() {
@@ -6089,7 +6530,7 @@ create_project() {
   fi
 
   install_base
-  verify_server_capacity_or_exit "create project" "$app_profile"
+  prompt_project_tuning "$app_dir" "$app_profile" "create project"
 
   if [ -e "${PROXY_PROJECTS_DIR}/${project_name}" ]; then
     echo "A project already exists with the name: ${project_name}"
@@ -6433,15 +6874,20 @@ list_projects() {
       [ -d "$dir" ] || continue
 
       if [ -f "${dir}/.project-meta" ]; then
-        local saved_capacity_profile saved_capacity_ram saved_capacity_cpu
+        local saved_capacity_profile saved_capacity_ram saved_capacity_cpu saved_tuning_mode saved_tuning_preset
         saved_capacity_profile="$(read_project_meta_var "$dir" "SERVER_CAPACITY_PROFILE")"
         saved_capacity_ram="$(read_project_meta_var "$dir" "SERVER_RAM_MB")"
         saved_capacity_cpu="$(read_project_meta_var "$dir" "SERVER_CPU_CORES")"
+        saved_tuning_mode="$(read_project_meta_var "$dir" "PROJECT_TUNING_MODE")"
+        saved_tuning_preset="$(read_project_meta_var "$dir" "PROJECT_TUNING_PRESET")"
         # shellcheck disable=SC1090
         # shellcheck disable=SC1091
         source "${dir}/.project-meta"
         echo "Project: ${project_name}"
         echo "Profile: ${APP_PROFILE:-$(detect_project_profile "$dir")}"
+        if [ -n "$saved_tuning_mode" ]; then
+          echo "Tuning : ${saved_tuning_mode}${saved_tuning_preset:+/${saved_tuning_preset}}"
+        fi
         if [ -n "$saved_capacity_profile" ]; then
           echo "Capacity: ${saved_capacity_profile} (${saved_capacity_ram:-unknown} MB RAM, ${saved_capacity_cpu:-unknown} CPU core(s))"
         fi
@@ -6471,15 +6917,20 @@ list_projects() {
     project_name="$(basename "$dir")"
 
     if [ -f "${dir}/.project-meta" ]; then
-      local saved_capacity_profile saved_capacity_ram saved_capacity_cpu
+      local saved_capacity_profile saved_capacity_ram saved_capacity_cpu saved_tuning_mode saved_tuning_preset
       saved_capacity_profile="$(read_project_meta_var "$dir" "SERVER_CAPACITY_PROFILE")"
       saved_capacity_ram="$(read_project_meta_var "$dir" "SERVER_RAM_MB")"
       saved_capacity_cpu="$(read_project_meta_var "$dir" "SERVER_CPU_CORES")"
+      saved_tuning_mode="$(read_project_meta_var "$dir" "PROJECT_TUNING_MODE")"
+      saved_tuning_preset="$(read_project_meta_var "$dir" "PROJECT_TUNING_PRESET")"
       # shellcheck disable=SC1090
       # shellcheck disable=SC1091
       source "${dir}/.project-meta"
       echo "Project: ${project_name}"
       echo "Profile: ${APP_PROFILE:-$(detect_project_profile "$dir")}"
+      if [ -n "$saved_tuning_mode" ]; then
+        echo "Tuning : ${saved_tuning_mode}${saved_tuning_preset:+/${saved_tuning_preset}}"
+      fi
       if [ -n "$saved_capacity_profile" ]; then
         echo "Capacity: ${saved_capacity_profile} (${saved_capacity_ram:-unknown} MB RAM, ${saved_capacity_cpu:-unknown} CPU core(s))"
       fi
@@ -6742,13 +7193,14 @@ update_project() {
   require_nonempty "PROJECT_NAME" "${PROJECT_NAME}"
   require_nonempty "DOMAIN" "${DOMAIN}"
   app_profile="${APP_PROFILE:-$(detect_project_profile "$app_dir")}"
-  verify_server_capacity_or_exit "update project" "$app_profile"
   if [ "$app_profile" != "node" ]; then
     require_nonempty "DB_NAME" "${DB_NAME}"
     require_nonempty "DB_USER" "${DB_USER}"
     require_nonempty "DB_PASSWORD" "${DB_PASSWORD}"
     require_nonempty "DB_ROOT_PASSWORD" "${DB_ROOT_PASSWORD}"
   fi
+
+  prompt_project_tuning "$app_dir" "$app_profile" "update project"
 
   pma_port="${PMA_PORT:-$(pma_default_port "$PROJECT_NAME")}"
   pma_bind_ip="${PMA_BIND_IP:-127.0.0.1}"

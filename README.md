@@ -20,6 +20,7 @@ The script creates one shared Nginx reverse proxy with Certbot, then creates one
 - Optional Apache Guacamole proxy and managed VNC server
 - Per-project access restrictions through Nginx
 - RAM/CPU-based tuning when projects are created or updated
+- Project ownership and permission repair on create/update
 - Automatic Laravel scheduler cron entries for Laravel projects
 
 ## Requirements
@@ -133,7 +134,13 @@ For Node projects, HTTP traffic is proxied to port `8080` and WebSocket traffic 
 
 ## Capacity Tuning
 
-When a project is created or updated, the script checks the server's total RAM and CPU cores. It uses that capacity to tune generated settings such as:
+When a project is created or updated, the script checks the server's total RAM and CPU cores and asks how tuning should be applied:
+
+- `auto`: choose values automatically from server RAM/CPU.
+- `preset`: choose `conservative`, `balanced`, `performance`, or `maximum`.
+- `custom`: enter exact PHP/MariaDB/Redis values.
+
+Generated settings include:
 
 - PHP-FPM process counts
 - OPcache memory
@@ -142,7 +149,17 @@ When a project is created or updated, the script checks the server's total RAM a
 
 The script does not use disk/storage capacity for this decision. It also does not subtract capacity for other projects. Each project is tuned against the full server capacity, and Docker CPU/RAM hard limits are not applied.
 
-The detected values and applied profile are stored in `.project-meta`.
+The tuning mode, detected capacity, and applied values are stored in `.project-meta`.
+
+## Permissions
+
+When a project is created or updated, the script normalizes ownership and permissions for the project directory.
+
+- App code is owned by `root:root` and kept readable by the containers.
+- `.project-meta` is restricted to root.
+- `.env` files are readable by the PHP runtime group but not world-readable.
+- Laravel/WordPress writable paths such as `storage`, `bootstrap/cache`, and `public/wp-content` are owned by the PHP runtime user.
+- Node project `data` is kept writable by the Node container.
 
 ## Typical Workflow
 
