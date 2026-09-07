@@ -11,11 +11,13 @@ PROXY_PROJECTS_DIR="${PROXY_BASE}/projects"
 PROJECTS_BASE="/var/www/projects"
 BACKUPS_BASE="/var/backups/laravel-projects"
 MANAGER_ETC_DIR="/etc/laravel-manager"
+BACKUP_STATE_DIR="/var/lib/laravel-manager/backup-state"
 DOCKER_PMA_FIREWALL_RULES_FILE="${MANAGER_ETC_DIR}/docker-pma-firewall.rules"
 DOCKER_PMA_FIREWALL_APPLY_SCRIPT="/usr/local/sbin/laravel-manager-apply-docker-pma-firewall"
 DOCKER_PMA_FIREWALL_SERVICE_FILE="/etc/systemd/system/laravel-manager-docker-pma-firewall.service"
 DOCKER_PMA_FIREWALL_CHAIN="LARAVEL-PMA-FW"
 DEFAULT_BACKUP_RETENTION_DAYS="14"
+DEFAULT_BACKUP_INTERVAL_HOURS="24"
 SHARED_NETWORK="laravel-shared"
 PROXY_COMPOSE="${PROXY_BASE}/docker-compose.yml"
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -86,6 +88,12 @@ GUACAMOLE_STACK_VERSION=""
 GUACAMOLE_JSON_SECRET_KEY=""
 APP_PROFILE=""
 BACKUP_RETENTION_DAYS=""
+BACKUP_INTERVAL_HOURS=""
+BACKUP_CLOUD_ENABLED=""
+BACKUP_CLOUD_SCOPE=""
+BACKUP_CLOUD_PROVIDER=""
+BACKUP_CLOUD_REMOTE=""
+BACKUP_CLOUD_FOLDER=""
 UFW_PMA_ALLOWED_SOURCES=""
 UFW_PMA_RESTRICTED=""
 UFW_PMA_PORT=""
@@ -191,6 +199,12 @@ validate_backup_retention_days() {
   local days="${1:-}"
   [[ "$days" =~ ^[0-9]+$ ]] || return 1
   [ "$days" -ge 1 ] && [ "$days" -le 3650 ]
+}
+
+validate_backup_interval_hours() {
+  local hours="${1:-}"
+  [[ "$hours" =~ ^[0-9]+$ ]] || return 1
+  [ "$hours" -ge 1 ] && [ "$hours" -le 24 ]
 }
 
 trim_whitespace() {
@@ -373,6 +387,64 @@ read_project_backup_retention_days() {
   else
     echo "$DEFAULT_BACKUP_RETENTION_DAYS"
   fi
+}
+
+read_project_backup_interval_hours() {
+  local app_dir="$1"
+  local configured_hours
+  configured_hours="$(read_project_meta_var "$app_dir" "BACKUP_INTERVAL_HOURS")"
+
+  if validate_backup_interval_hours "$configured_hours"; then
+    echo "$configured_hours"
+  else
+    echo "$DEFAULT_BACKUP_INTERVAL_HOURS"
+  fi
+}
+
+read_project_backup_cloud_enabled() {
+  local app_dir="$1"
+  local enabled
+  enabled="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_ENABLED")"
+
+  if [ "${enabled,,}" = "yes" ]; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+read_project_backup_cloud_scope() {
+  local app_dir="$1"
+  local scope
+  scope="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_SCOPE")"
+
+  case "${scope,,}" in
+    manual|automatic|both) echo "${scope,,}" ;;
+    *) echo "automatic" ;;
+  esac
+}
+
+should_replicate_backup_to_cloud() {
+  local app_dir="$1"
+  local backup_kind="$2"
+  local enabled scope
+
+  enabled="$(read_project_backup_cloud_enabled "$app_dir")"
+  [ "$enabled" = "yes" ] || return 1
+  scope="$(read_project_backup_cloud_scope "$app_dir")"
+
+  case "${backup_kind}:${scope}" in
+    manual:manual|manual:both|auto:automatic|auto:both) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_backup_cloud_folder() {
+  local folder
+  folder="$(trim_whitespace "${1:-}")"
+  folder="${folder#/}"
+  folder="${folder%/}"
+  printf '%s' "$folder"
 }
 
 prune_project_backups() {
@@ -1654,7 +1726,7 @@ install_base() {
   export DEBIAN_FRONTEND=noninteractive
   export NEEDRESTART_MODE=a
   apt-get update -y
-  apt-get install -y docker.io curl tar gzip coreutils procps rsync cron
+  apt-get install -y docker.io curl tar gzip coreutils procps rsync cron util-linux
 
   if ! docker compose version >/dev/null 2>&1; then
     local arch
@@ -2310,7 +2382,9 @@ write_project_files() {
   local redis_container="${project_name}-redis"
   local pma_container="${project_name}-phpmyadmin"
   local php_image_tag redis_command redis_healthcheck mysql_sql_mode_line
-  local backup_retention_days ufw_pma_allowed_sources ufw_pma_restricted ufw_pma_port
+  local backup_retention_days backup_interval_hours backup_cloud_enabled
+  local backup_cloud_scope backup_cloud_provider backup_cloud_remote backup_cloud_folder
+  local ufw_pma_allowed_sources ufw_pma_restricted ufw_pma_port
   local project_access_allowed_sources project_access_restricted
   local laravel_queue_connection="" laravel_queue_names="" laravel_queue_sleep="" laravel_queue_tries=""
   local laravel_queue_timeout="" laravel_queue_max_time="" laravel_queue_stopwaitsecs=""
@@ -2346,6 +2420,12 @@ write_project_files() {
   fi
 
   backup_retention_days="$(read_project_backup_retention_days "$app_dir")"
+  backup_interval_hours="$(read_project_backup_interval_hours "$app_dir")"
+  backup_cloud_enabled="$(read_project_backup_cloud_enabled "$app_dir")"
+  backup_cloud_scope="$(read_project_backup_cloud_scope "$app_dir")"
+  backup_cloud_provider="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_PROVIDER")"
+  backup_cloud_remote="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_REMOTE")"
+  backup_cloud_folder="$(normalize_backup_cloud_folder "$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_FOLDER")")"
   ufw_pma_allowed_sources="$(read_project_ufw_pma_allowed_sources "$app_dir")"
   ufw_pma_restricted="$(read_project_ufw_pma_restricted "$app_dir")"
   ufw_pma_port="$(read_project_ufw_pma_port "$app_dir" "$pma_port")"
@@ -2429,6 +2509,12 @@ EOF
       printf 'PROJECT_TUNING_MODE=%q\n' "${PROJECT_TUNING_MODE:-auto}"
       printf 'PROJECT_TUNING_PRESET=%q\n' "${PROJECT_TUNING_PRESET:-}"
       printf 'BACKUP_RETENTION_DAYS=%q\n' "$backup_retention_days"
+      printf 'BACKUP_INTERVAL_HOURS=%q\n' "$backup_interval_hours"
+      printf 'BACKUP_CLOUD_ENABLED=%q\n' "$backup_cloud_enabled"
+      printf 'BACKUP_CLOUD_SCOPE=%q\n' "$backup_cloud_scope"
+      printf 'BACKUP_CLOUD_PROVIDER=%q\n' "$backup_cloud_provider"
+      printf 'BACKUP_CLOUD_REMOTE=%q\n' "$backup_cloud_remote"
+      printf 'BACKUP_CLOUD_FOLDER=%q\n' "$backup_cloud_folder"
       printf 'UFW_PMA_ALLOWED_SOURCES=%q\n' "$ufw_pma_allowed_sources"
       printf 'UFW_PMA_RESTRICTED=%q\n' "$ufw_pma_restricted"
       printf 'UFW_PMA_PORT=%q\n' ""
@@ -2734,6 +2820,12 @@ EOF
     printf 'MYSQL_BUFFER=%q\n' "$MYSQL_BUFFER"
     printf 'MYSQL_MAX_CONNECTIONS=%q\n' "$MYSQL_MAX_CONNECTIONS"
     printf 'BACKUP_RETENTION_DAYS=%q\n' "$backup_retention_days"
+    printf 'BACKUP_INTERVAL_HOURS=%q\n' "$backup_interval_hours"
+    printf 'BACKUP_CLOUD_ENABLED=%q\n' "$backup_cloud_enabled"
+    printf 'BACKUP_CLOUD_SCOPE=%q\n' "$backup_cloud_scope"
+    printf 'BACKUP_CLOUD_PROVIDER=%q\n' "$backup_cloud_provider"
+    printf 'BACKUP_CLOUD_REMOTE=%q\n' "$backup_cloud_remote"
+    printf 'BACKUP_CLOUD_FOLDER=%q\n' "$backup_cloud_folder"
     printf 'UFW_PMA_ALLOWED_SOURCES=%q\n' "$ufw_pma_allowed_sources"
     printf 'UFW_PMA_RESTRICTED=%q\n' "$ufw_pma_restricted"
     printf 'UFW_PMA_PORT=%q\n' "$ufw_pma_port"
@@ -3477,9 +3569,9 @@ setup_ssl_renew_cron() {
 
 setup_backup_cron() {
   local cron_cmd="/bin/bash ${SCRIPT_PATH}"
-  local cron_line="30 2 * * * ${cron_cmd} backup-all >/var/log/laravel-backup.log 2>&1"
+  local cron_line="30 * * * * /usr/bin/flock -n /run/lock/laravel-manager-backup.lock ${cron_cmd} backup-due >>/var/log/laravel-backup.log 2>&1"
   (crontab -l 2>/dev/null || true) \
-    | awk -v add="$cron_line" 'index($0," backup-all >/var/log/laravel-backup.log")==0 {print} END{print add}' \
+    | awk -v add="$cron_line" 'index($0," backup-all >/var/log/laravel-backup.log")==0 && index($0," backup-due >>/var/log/laravel-backup.log")==0 {print} END{print add}' \
     | crontab -
 }
 
@@ -6593,7 +6685,7 @@ create_project() {
   if [ "$app_profile" = "laravel" ]; then
     echo "The queue worker runs under Supervisor inside the PHP container."
   fi
-  echo "Daily automatic backup scheduled at 02:30."
+  echo "Automatic backup checks run hourly at minute 30 (default interval: ${DEFAULT_BACKUP_INTERVAL_HOURS} hours)."
   echo "=============================================================="
 }
 
@@ -6852,6 +6944,7 @@ delete_project() {
 
   echo "Removing project backups..."
   rm -rf "${BACKUPS_BASE:?}/${project_name:?}" || true
+  rm -f "$(backup_state_file "$project_name")"
 
   echo "Restarting reverse proxy..."
   proxy_dc restart reverse-proxy
@@ -6948,6 +7041,278 @@ list_projects() {
   done
 }
 
+ensure_rclone_installed() {
+  if command -v rclone >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "Installing rclone for cloud backups..."
+  export DEBIAN_FRONTEND=noninteractive
+  if ! apt-get update -y || ! apt-get install -y rclone; then
+    echo "Unable to install rclone. Cloud backup configuration cannot continue."
+    return 1
+  fi
+}
+
+rclone_remote_type() {
+  local remote="$1"
+  rclone config show "$remote" 2>/dev/null \
+    | awk -F '=' '/^[[:space:]]*type[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}'
+}
+
+SELECTED_RCLONE_REMOTE=""
+select_rclone_remote() {
+  local provider="$1"
+  local expected_type remote_line remote remote_type choice index
+  local -a compatible_remotes=()
+
+  case "$provider" in
+    google-drive) expected_type="drive" ;;
+    onedrive) expected_type="onedrive" ;;
+    *) return 1 ;;
+  esac
+
+  SELECTED_RCLONE_REMOTE=""
+  while true; do
+    compatible_remotes=()
+    while IFS= read -r remote_line; do
+      remote="${remote_line%:}"
+      [ -n "$remote" ] || continue
+      remote_type="$(rclone_remote_type "$remote")"
+      [ "$remote_type" = "$expected_type" ] && compatible_remotes+=("$remote")
+    done < <(rclone listremotes 2>/dev/null || true)
+
+    echo ""
+    echo "Configured ${provider} remotes:"
+    if [ "${#compatible_remotes[@]}" -eq 0 ]; then
+      echo "  (none)"
+    else
+      for index in "${!compatible_remotes[@]}"; do
+        echo "$((index + 1))) ${compatible_remotes[$index]}"
+      done
+    fi
+    echo "n) Configure a new cloud account with rclone"
+    echo "q) Cancel"
+    read -r -p "Selection: " choice
+
+    case "${choice,,}" in
+      n)
+        echo ""
+        echo "rclone's configuration wizard will now open."
+        echo "Choose provider type '${expected_type}', finish OAuth authorization, then quit the wizard."
+        if ! rclone config; then
+          echo "rclone configuration did not complete successfully."
+          return 1
+        fi
+        ;;
+      q) return 1 ;;
+      *)
+        if [[ "$choice" =~ ^[0-9]+$ ]] \
+          && [ "$choice" -ge 1 ] \
+          && [ "$choice" -le "${#compatible_remotes[@]}" ]; then
+          SELECTED_RCLONE_REMOTE="${compatible_remotes[$((choice - 1))]}"
+          return 0
+        fi
+        echo "Invalid selection."
+        ;;
+    esac
+  done
+}
+
+SELECTED_RCLONE_FOLDER=""
+browse_rclone_folder() {
+  local remote="$1"
+  local current
+  current="$(normalize_backup_cloud_folder "${2:-}")"
+  local listing folder choice new_folder index remote_path
+  local -a folders=()
+
+  SELECTED_RCLONE_FOLDER=""
+  while true; do
+    remote_path="${remote}:${current}"
+    if ! listing="$(rclone lsf "$remote_path" --dirs-only --max-depth 1 2>/dev/null)"; then
+      echo "Unable to list ${remote_path}. Check the remote connection and permissions."
+      if [ -n "$current" ]; then
+        echo "Returning to the remote root."
+        current=""
+        continue
+      fi
+      return 1
+    fi
+
+    folders=()
+    while IFS= read -r folder; do
+      folder="${folder%/}"
+      [ -n "$folder" ] && folders+=("$folder")
+    done <<< "$listing"
+
+    echo ""
+    echo "Cloud folder: ${remote}:${current:-/}"
+    echo "0) Use this folder"
+    for index in "${!folders[@]}"; do
+      echo "$((index + 1))) ${folders[$index]}"
+    done
+    echo "u) Go to parent folder"
+    echo "n) Create a new folder"
+    echo "q) Cancel"
+    read -r -p "Selection: " choice
+
+    case "${choice,,}" in
+      0)
+        if ! rclone mkdir "$remote_path"; then
+          echo "Unable to access the selected folder."
+          continue
+        fi
+        SELECTED_RCLONE_FOLDER="$current"
+        return 0
+        ;;
+      u)
+        if [[ "$current" == */* ]]; then
+          current="${current%/*}"
+        else
+          current=""
+        fi
+        ;;
+      n)
+        prompt new_folder "New folder name: "
+        new_folder="$(trim_whitespace "$new_folder")"
+        if [ -z "$new_folder" ] || [ "$new_folder" = "." ] || [ "$new_folder" = ".." ] || [[ "$new_folder" == *"/"* ]]; then
+          echo "Invalid folder name. Use a single folder name without '/'."
+          continue
+        fi
+        if [ -n "$current" ]; then
+          current="${current}/${new_folder}"
+        else
+          current="$new_folder"
+        fi
+        if ! rclone mkdir "${remote}:${current}"; then
+          echo "Unable to create the folder."
+          if [[ "$current" == */* ]]; then
+            current="${current%/*}"
+          else
+            current=""
+          fi
+        fi
+        ;;
+      q) return 1 ;;
+      *)
+        if [[ "$choice" =~ ^[0-9]+$ ]] \
+          && [ "$choice" -ge 1 ] \
+          && [ "$choice" -le "${#folders[@]}" ]; then
+          if [ -n "$current" ]; then
+            current="${current}/${folders[$((choice - 1))]}"
+          else
+            current="${folders[$((choice - 1))]}"
+          fi
+        else
+          echo "Invalid selection."
+        fi
+        ;;
+    esac
+  done
+}
+
+upload_backup_to_cloud() {
+  local project_name="$1"
+  local app_dir="$2"
+  local archive_path="$3"
+  local retention_days="$4"
+  local backup_kind="$5"
+  local enabled provider remote folder remote_dir archive_name
+
+  enabled="$(read_project_backup_cloud_enabled "$app_dir")"
+  [ "$enabled" = "yes" ] || return 0
+
+  provider="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_PROVIDER")"
+  remote="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_REMOTE")"
+  folder="$(normalize_backup_cloud_folder "$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_FOLDER")")"
+
+  if [ "$provider" != "google-drive" ] && [ "$provider" != "onedrive" ]; then
+    echo "Cloud backup is enabled but the provider is invalid for ${project_name}."
+    return 1
+  fi
+  if [ -z "$remote" ] || ! command -v rclone >/dev/null 2>&1; then
+    echo "Cloud backup is enabled for ${project_name}, but rclone or its remote is unavailable."
+    return 1
+  fi
+
+  remote_dir="${remote}:${folder}"
+  archive_name="$(basename "$archive_path")"
+  echo "Uploading ${backup_kind} backup to ${provider} (${remote_dir})..."
+  if ! rclone copyto "$archive_path" "${remote_dir}/${archive_name}" --retries 3 --low-level-retries 10; then
+    echo "Cloud upload failed for ${project_name}."
+    return 1
+  fi
+
+  echo "Pruning cloud backups older than ${retention_days} day(s)..."
+  if ! rclone delete "$remote_dir" \
+    --min-age "${retention_days}d" \
+    --include "${project_name}-*.tar.gz" \
+    --max-depth 1; then
+    echo "Cloud retention cleanup failed for ${project_name}."
+    return 1
+  fi
+
+  echo "Cloud backup uploaded: ${remote_dir}/${archive_name}"
+}
+
+backup_state_file() {
+  local project_name="$1"
+  printf '%s/%s.last-success' "$BACKUP_STATE_DIR" "$project_name"
+}
+
+last_automatic_backup_time() {
+  local project_name="$1"
+  local state_file last_success latest_archive_time
+  state_file="$(backup_state_file "$project_name")"
+  last_success=""
+
+  if [ -f "$state_file" ]; then
+    read -r last_success < "$state_file" || true
+  fi
+  if [[ "$last_success" =~ ^[0-9]+$ ]]; then
+    echo "$last_success"
+    return 0
+  fi
+
+  latest_archive_time=""
+  if [ -d "${BACKUPS_BASE}/${project_name}" ]; then
+    latest_archive_time="$(
+      find "${BACKUPS_BASE}/${project_name}" -maxdepth 1 -type f -name "${project_name}-*-auto.tar.gz" -printf '%T@\n' 2>/dev/null \
+        | sort -nr \
+        | awk 'NR == 1 {printf "%d", $1}'
+    )"
+  fi
+  if [[ "$latest_archive_time" =~ ^[0-9]+$ ]]; then
+    echo "$latest_archive_time"
+  else
+    echo "0"
+  fi
+}
+
+project_automatic_backup_due() {
+  local project_name="$1"
+  local app_dir="$2"
+  local now="$3"
+  local interval_hours last_success interval_seconds
+  interval_hours="$(read_project_backup_interval_hours "$app_dir")"
+  last_success="$(last_automatic_backup_time "$project_name")"
+  interval_seconds=$((interval_hours * 3600))
+
+  [ "$last_success" -eq 0 ] || [ $((now - last_success)) -ge "$interval_seconds" ]
+}
+
+mark_automatic_backup_success() {
+  local project_name="$1"
+  local started_at="$2"
+  local state_file
+  mkdir -p "$BACKUP_STATE_DIR"
+  chmod 700 "$BACKUP_STATE_DIR"
+  state_file="$(backup_state_file "$project_name")"
+  printf '%s\n' "$started_at" > "$state_file"
+  chmod 600 "$state_file"
+}
+
 backup_project_internal() {
   local project_name="$1"
   local suffix="${2:-manual}"
@@ -6976,24 +7341,34 @@ backup_project_internal() {
   archive_name="${project_name}-${timestamp}-${suffix}.tar.gz"
   archive_path="${BACKUPS_BASE}/${project_name}/${archive_name}"
 
-  mkdir -p "$backup_dir"
-  : > "$tmp_sql"
+  if ! mkdir -p "$backup_dir" || ! : > "$tmp_sql"; then
+    echo "Unable to prepare backup directory: ${backup_dir}"
+    return 1
+  fi
 
   if [ "$app_profile" = "node" ]; then
     echo "Skipping database export for node project."
   else
     echo "Exporting database..."
     if docker_container_exists "${DB_CONTAINER}"; then
-      docker exec "${DB_CONTAINER}" sh -c \
-        "exec mariadb-dump -u root -p'${DB_ROOT_PASSWORD}' '${DB_NAME}'" > "$tmp_sql"
+      if ! docker exec "${DB_CONTAINER}" sh -c \
+        "exec mariadb-dump -u root -p'${DB_ROOT_PASSWORD}' '${DB_NAME}'" > "$tmp_sql"; then
+        echo "Database export failed for ${project_name}."
+        rm -rf "$backup_dir" || true
+        return 1
+      fi
     else
       echo "Warning: DB container does not exist (${DB_CONTAINER}). Backup without database."
     fi
   fi
 
   echo "Copying project files..."
-  mkdir -p "${backup_dir}/project"
-  rsync -a \
+  if ! mkdir -p "${backup_dir}/project"; then
+    echo "Unable to prepare the project backup directory."
+    rm -rf "$backup_dir" || true
+    return 1
+  fi
+  if ! rsync -a \
     --exclude vendor \
     --exclude node_modules \
     --exclude storage/logs \
@@ -7001,23 +7376,42 @@ backup_project_internal() {
     --exclude storage/framework/sessions \
     --exclude storage/framework/views \
     --exclude .git \
-    "${app_dir}/" "${backup_dir}/project/"
+    "${app_dir}/" "${backup_dir}/project/"; then
+    echo "Project file copy failed for ${project_name}."
+    rm -rf "$backup_dir" || true
+    return 1
+  fi
 
-  cp "${app_dir}/.project-meta" "${backup_dir}/.project-meta"
+  if ! cp "${app_dir}/.project-meta" "${backup_dir}/.project-meta"; then
+    echo "Unable to include project metadata in the backup."
+    rm -rf "$backup_dir" || true
+    return 1
+  fi
 
   echo "Compressing backup..."
-  tar -czf "$archive_path" -C "${backup_dir}" .
+  if ! tar -czf "$archive_path" -C "${backup_dir}" .; then
+    echo "Backup compression failed for ${project_name}."
+    rm -rf "$backup_dir" || true
+    rm -f "$archive_path" || true
+    return 1
+  fi
 
-  rm -rf "$backup_dir"
+  rm -rf "$backup_dir" || true
 
   echo "Backup created: ${archive_path}"
 
   echo "Pruning backups older than ${backup_retention_days} day(s)..."
   prune_project_backups "$project_name" "$backup_retention_days"
+
+  if should_replicate_backup_to_cloud "$app_dir" "$suffix"; then
+    if ! upload_backup_to_cloud "$project_name" "$app_dir" "$archive_path" "$backup_retention_days" "$suffix"; then
+      return 3
+    fi
+  fi
 }
 
 backup_project() {
-  local project_slug project_name
+  local project_slug project_name backup_status
   echo ""
   echo "Existing projects:"
   print_existing_projects
@@ -7028,31 +7422,110 @@ backup_project() {
     echo "Invalid project short name."
     exit 1
   fi
-  backup_project_internal "$project_name" "manual"
+  if backup_project_internal "$project_name" "manual"; then
+    return 0
+  else
+    backup_status=$?
+  fi
+
+  if [ "$backup_status" -eq 3 ]; then
+    echo "Local manual backup succeeded for ${project_name}, but its cloud copy failed."
+    return 1
+  fi
+  return "$backup_status"
+}
+
+backup_project_for_run() {
+  local project_name="$1"
+  local mode="$2"
+  local app_dir interval_hours started_at
+  app_dir="$(resolve_project_dir "$project_name")"
+
+  if [ "$mode" = "scheduled" ]; then
+    interval_hours="$(read_project_backup_interval_hours "$app_dir")"
+    started_at="$(date +%s)"
+    if ! project_automatic_backup_due "$project_name" "$app_dir" "$started_at"; then
+      echo "Skipping ${project_name}: next automatic backup is not due (${interval_hours}-hour interval)."
+      return 2
+    fi
+  else
+    started_at="$(date +%s)"
+  fi
+
+  echo "Starting automatic backup for ${project_name}..."
+  local backup_status
+  if (backup_project_internal "$project_name" "auto"); then
+    backup_status=0
+  else
+    backup_status=$?
+  fi
+
+  case "$backup_status" in
+    0)
+      mark_automatic_backup_success "$project_name" "$started_at"
+      return 0
+      ;;
+    3)
+      mark_automatic_backup_success "$project_name" "$started_at"
+      echo "Local backup succeeded for ${project_name}, but its cloud copy failed."
+      return 1
+      ;;
+    *)
+      echo "Automatic backup failed for ${project_name}."
+      return 1
+      ;;
+  esac
 }
 
 backup_all() {
+  local mode="${1:-force}"
+  local failures=0 backed_up=0 skipped=0 project_name
+
+  if [ "$mode" != "force" ] && [ "$mode" != "scheduled" ]; then
+    echo "Invalid backup mode: ${mode}"
+    return 1
+  fi
+
   if [ -d "$PROXY_PROJECTS_DIR" ] && [ -n "$(ls -A "$PROXY_PROJECTS_DIR" 2>/dev/null)" ]; then
     for link in "$PROXY_PROJECTS_DIR"/*; do
       [ -e "$link" ] || continue
-      backup_project_internal "$(basename "$link")" "auto"
+      project_name="$(basename "$link")"
+      if backup_project_for_run "$project_name" "$mode"; then
+        backed_up=$((backed_up + 1))
+      else
+        case "$?" in
+          2) skipped=$((skipped + 1)) ;;
+          *) failures=$((failures + 1)) ;;
+        esac
+      fi
     done
-    return
-  fi
-
-  if [ ! -d "$PROJECTS_BASE" ] || [ -z "$(ls -A "$PROJECTS_BASE" 2>/dev/null)" ]; then
+  elif [ ! -d "$PROJECTS_BASE" ] || [ -z "$(ls -A "$PROJECTS_BASE" 2>/dev/null)" ]; then
     echo "No projects to back up."
-    return
+    return 0
+  else
+    for dir in "$PROJECTS_BASE"/*; do
+      [ -d "$dir" ] || continue
+      project_name="$(basename "$dir")"
+      if backup_project_for_run "$project_name" "$mode"; then
+        backed_up=$((backed_up + 1))
+      else
+        case "$?" in
+          2) skipped=$((skipped + 1)) ;;
+          *) failures=$((failures + 1)) ;;
+        esac
+      fi
+    done
   fi
 
-  for dir in "$PROJECTS_BASE"/*; do
-    [ -d "$dir" ] || continue
-    backup_project_internal "$(basename "$dir")" "auto"
-  done
+  echo "Automatic backup run complete: ${backed_up} created, ${skipped} not due, ${failures} failed."
+  [ "$failures" -eq 0 ]
 }
 
 manage_backup_settings() {
-  local project_slug project_name app_dir current_days new_days
+  local project_slug project_name app_dir current_days new_days current_hours new_hours
+  local current_cloud_enabled current_cloud_scope current_provider current_remote current_folder
+  local enable_cloud scope_choice scope_default provider_choice
+  local new_cloud_enabled="no" new_cloud_scope="automatic" new_provider="" new_remote="" new_folder=""
 
   echo ""
   echo "Existing projects:"
@@ -7075,10 +7548,23 @@ manage_backup_settings() {
   fi
 
   current_days="$(read_project_backup_retention_days "$app_dir")"
+  current_hours="$(read_project_backup_interval_hours "$app_dir")"
+  current_cloud_enabled="$(read_project_backup_cloud_enabled "$app_dir")"
+  current_cloud_scope="$(read_project_backup_cloud_scope "$app_dir")"
+  new_cloud_scope="$current_cloud_scope"
+  current_provider="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_PROVIDER")"
+  current_remote="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_REMOTE")"
+  current_folder="$(normalize_backup_cloud_folder "$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_FOLDER")")"
 
   echo ""
   echo "Backup settings for ${project_name}"
   echo "Current retention: keep backups for the last ${current_days} day(s)."
+  echo "Current automatic interval: every ${current_hours} hour(s)."
+  if [ "$current_cloud_enabled" = "yes" ]; then
+    echo "Current cloud copy: ${current_provider} (${current_remote}:${current_folder:-/}); scope: ${current_cloud_scope}."
+  else
+    echo "Current cloud copy: disabled."
+  fi
   prompt new_days "Days of backups to keep (e.g. 60): " "$current_days"
 
   if ! validate_backup_retention_days "$new_days"; then
@@ -7086,13 +7572,98 @@ manage_backup_settings() {
     exit 1
   fi
 
+  prompt new_hours "Hours between automatic backups (1-24): " "$current_hours"
+  if ! validate_backup_interval_hours "$new_hours"; then
+    echo "Invalid interval. Use a whole number between 1 and 24."
+    exit 1
+  fi
+
+  prompt enable_cloud "Replicate backups to Google Drive or OneDrive? (yes/no): " "$current_cloud_enabled"
+  if ! new_cloud_enabled="$(normalize_yes_no "$enable_cloud")"; then
+    echo "Invalid choice. Use yes or no."
+    exit 1
+  fi
+
+  if [ "$new_cloud_enabled" = "yes" ]; then
+    echo ""
+    echo "Backups to replicate:"
+    echo "1) Manual backups only"
+    echo "2) Automatic backups only"
+    echo "3) Manual and automatic backups"
+    case "$current_cloud_scope" in
+      manual) scope_default="1" ;;
+      both) scope_default="3" ;;
+      *) scope_default="2" ;;
+    esac
+    prompt scope_choice "Selection: " "$scope_default"
+    case "$scope_choice" in
+      1) new_cloud_scope="manual" ;;
+      2) new_cloud_scope="automatic" ;;
+      3) new_cloud_scope="both" ;;
+      *) echo "Invalid backup replication scope."; exit 1 ;;
+    esac
+
+    if ! ensure_rclone_installed; then
+      exit 1
+    fi
+
+    echo ""
+    echo "Cloud provider:"
+    echo "1) Google Drive"
+    echo "2) OneDrive"
+    if [ "$current_provider" = "onedrive" ]; then
+      prompt provider_choice "Selection: " "2"
+    else
+      prompt provider_choice "Selection: " "1"
+    fi
+    case "$provider_choice" in
+      1) new_provider="google-drive" ;;
+      2) new_provider="onedrive" ;;
+      *) echo "Invalid cloud provider."; exit 1 ;;
+    esac
+
+    if ! select_rclone_remote "$new_provider"; then
+      echo "Cloud backup configuration cancelled. No backup settings were changed."
+      return 1
+    fi
+    new_remote="$SELECTED_RCLONE_REMOTE"
+
+    if [ "$new_remote" = "$current_remote" ]; then
+      current_folder="$(normalize_backup_cloud_folder "$current_folder")"
+    else
+      current_folder=""
+    fi
+    if ! browse_rclone_folder "$new_remote" "$current_folder"; then
+      echo "Cloud folder selection cancelled. No backup settings were changed."
+      return 1
+    fi
+    new_folder="$SELECTED_RCLONE_FOLDER"
+  fi
+
   set_project_meta_var "${app_dir}/.project-meta" "BACKUP_RETENTION_DAYS" "$new_days"
+  set_project_meta_var "${app_dir}/.project-meta" "BACKUP_INTERVAL_HOURS" "$new_hours"
+  set_project_meta_var "${app_dir}/.project-meta" "BACKUP_CLOUD_ENABLED" "$new_cloud_enabled"
+  set_project_meta_var "${app_dir}/.project-meta" "BACKUP_CLOUD_SCOPE" "$new_cloud_scope"
+  set_project_meta_var "${app_dir}/.project-meta" "BACKUP_CLOUD_PROVIDER" "$new_provider"
+  set_project_meta_var "${app_dir}/.project-meta" "BACKUP_CLOUD_REMOTE" "$new_remote"
+  set_project_meta_var "${app_dir}/.project-meta" "BACKUP_CLOUD_FOLDER" "$new_folder"
+  chmod 600 "${app_dir}/.project-meta"
+  setup_backup_cron
 
   echo ""
-  echo "Backup retention updated."
+  echo "Backup settings updated."
   echo "Project: ${project_name}"
   echo "Keep backups for the last ${new_days} day(s)."
-  echo "Old backups are pruned when the next backup runs."
+  echo "Automatic backup interval: every ${new_hours} hour(s)."
+  if [ "$new_cloud_enabled" = "yes" ]; then
+    echo "Cloud copy: ${new_provider} (${new_remote}:${new_folder:-/})."
+    echo "Cloud replication scope: ${new_cloud_scope}."
+    echo "Cloud copies use the same ${new_days}-day retention as local backups."
+  else
+    echo "Cloud copy: disabled."
+  fi
+  echo "Old local backups are pruned whenever a backup runs."
+  echo "Old cloud backups are pruned whenever a backup is replicated."
 }
 
 restore_project() {
@@ -8750,7 +9321,12 @@ menu() {
 require_root
 
 if [ "${1:-}" = "backup-all" ]; then
-  backup_all
+  backup_all force
+  exit 0
+fi
+
+if [ "${1:-}" = "backup-due" ]; then
+  backup_all scheduled
   exit 0
 fi
 

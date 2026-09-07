@@ -13,7 +13,7 @@ The script creates one shared Nginx reverse proxy with Certbot, then creates one
 - Laravel, generic PHP/WordPress, ThinkPHP/FastAdmin, and Node profiles
 - MariaDB, Redis, PHP-FPM, Composer, Node.js, and npm for PHP projects
 - Optional phpMyAdmin per project
-- Backups and restores
+- Backups and restores with per-project schedules and optional Google Drive/OneDrive copies
 - Multiple domains per project
 - Laravel Reverb support
 - Optional Roundcube webmail and docker-mailserver management
@@ -61,7 +61,7 @@ Run the interactive menu:
 sudo /root/laravel-server-manager.sh
 ```
 
-Back up all projects:
+Back up all projects immediately (ignores their automatic intervals):
 
 ```bash
 sudo /root/laravel-server-manager.sh backup-all
@@ -180,7 +180,16 @@ By default, project backups are stored in:
 /var/backups/laravel-projects/<project>/
 ```
 
-Retention can be managed from the menu with `18) Backup settings`.
+Use `18) Backup settings` to configure each project independently:
+
+- The number of days local backups are retained (14 by default).
+- How many hours must pass between automatic backups, using a 1-to-24-hour daily cycle (24 by default).
+- Optional replication of manual backups, automatic backups, or both to Google Drive or OneDrive through `rclone`.
+- Interactive navigation and folder creation when selecting the destination in the configured cloud account.
+
+The manager checks for due backups hourly at minute 30. It prevents overlapping scheduled runs and records successful runs in `/var/lib/laravel-manager/backup-state`. When cloud copies are enabled, each project can replicate manual backups only, automatic backups only, or both. The same per-project retention period is applied to local and cloud copies.
+
+If `rclone` is not installed when cloud copies are enabled, the manager installs it and opens its account-configuration wizard. OAuth credentials remain in rclone's root-user configuration; they are not written to `.project-meta`.
 
 ## Security Notes
 
