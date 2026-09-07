@@ -7041,17 +7041,36 @@ list_projects() {
   done
 }
 
-ensure_rclone_installed() {
-  if command -v rclone >/dev/null 2>&1; then
-    return 0
-  fi
+ensure_latest_stable_rclone() {
+  local installer_file
 
-  echo "Installing rclone for cloud backups..."
-  export DEBIAN_FRONTEND=noninteractive
-  if ! apt-get update -y || ! apt-get install -y rclone; then
-    echo "Unable to install rclone. Cloud backup configuration cannot continue."
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "curl is required to install rclone."
     return 1
   fi
+
+  installer_file="$(mktemp)"
+  echo "Checking the latest stable rclone release from rclone.org..."
+  if ! curl --proto '=https' --tlsv1.2 -fsSL https://rclone.org/install.sh -o "$installer_file"; then
+    echo "Unable to download the official rclone installer."
+    rm -f "$installer_file"
+    return 1
+  fi
+
+  if ! bash -n "$installer_file" || ! bash "$installer_file"; then
+    echo "Unable to install the latest stable rclone release."
+    rm -f "$installer_file"
+    return 1
+  fi
+  rm -f "$installer_file"
+  hash -r
+
+  if ! command -v rclone >/dev/null 2>&1; then
+    echo "rclone installation completed without an available executable."
+    return 1
+  fi
+
+  echo "rclone ready: $(rclone version | head -n 1)"
 }
 
 rclone_remote_type() {
@@ -7603,7 +7622,7 @@ manage_backup_settings() {
       *) echo "Invalid backup replication scope."; exit 1 ;;
     esac
 
-    if ! ensure_rclone_installed; then
+    if ! ensure_latest_stable_rclone; then
       exit 1
     fi
 
