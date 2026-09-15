@@ -7042,35 +7042,68 @@ list_projects() {
 }
 
 ensure_latest_stable_rclone() {
-  local installer_file
+  local installer_file latest_release installed_release
 
   if ! command -v curl >/dev/null 2>&1; then
     echo "curl is required to install rclone."
     return 1
   fi
 
-  installer_file="$(mktemp)"
   echo "Checking the latest stable rclone release from rclone.org..."
+  if ! latest_release="$(curl --proto '=https' --tlsv1.2 -fsSL https://downloads.rclone.org/version.txt)"; then
+    echo "Unable to determine the latest stable rclone release."
+    return 1
+  fi
+  latest_release="${latest_release%%$'\n'*}"
+  latest_release="${latest_release%$'\r'}"
+  if [[ ! "$latest_release" =~ ^rclone\ v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "The official rclone release manifest returned an unexpected version."
+    return 1
+  fi
+
+  installed_release=""
+  if command -v rclone >/dev/null 2>&1; then
+    installed_release="$(rclone version 2>/dev/null | head -n 1 | tr -d '\r')" || installed_release=""
+  fi
+  if [ "$installed_release" = "$latest_release" ]; then
+    echo "rclone ready: ${installed_release}"
+    return 0
+  fi
+
+  installer_file="$(mktemp)"
   if ! curl --proto '=https' --tlsv1.2 -fsSL https://rclone.org/install.sh -o "$installer_file"; then
     echo "Unable to download the official rclone installer."
     rm -f "$installer_file"
     return 1
   fi
 
-  if ! bash -n "$installer_file" || ! bash "$installer_file"; then
-    echo "Unable to install the latest stable rclone release."
+  if ! bash -n "$installer_file"; then
+    echo "The downloaded rclone installer is not a valid shell script."
     rm -f "$installer_file"
     return 1
+  fi
+  # The official installer may return a non-zero status when no files need to
+  # change. Verify the resulting version instead of treating that status alone
+  # as an installation failure.
+  if ! bash "$installer_file"; then
+    echo "The rclone installer returned a non-zero status; verifying the installed version..."
   fi
   rm -f "$installer_file"
   hash -r
 
-  if ! command -v rclone >/dev/null 2>&1; then
-    echo "rclone installation completed without an available executable."
+  installed_release=""
+  if command -v rclone >/dev/null 2>&1; then
+    installed_release="$(rclone version 2>/dev/null | head -n 1 | tr -d '\r')" || installed_release=""
+  fi
+  if [ "$installed_release" != "$latest_release" ]; then
+    echo "Unable to install the latest stable rclone release (${latest_release})."
+    if [ -n "$installed_release" ]; then
+      echo "Installed version: ${installed_release}"
+    fi
     return 1
   fi
 
-  echo "rclone ready: $(rclone version | head -n 1)"
+  echo "rclone ready: ${installed_release}"
 }
 
 rclone_remote_type() {

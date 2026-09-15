@@ -189,7 +189,7 @@ Use `18) Backup settings` to configure each project independently:
 
 The manager checks for due backups hourly at minute 30. It prevents overlapping scheduled runs and records successful runs in `/var/lib/laravel-manager/backup-state`. When cloud copies are enabled, each project can replicate manual backups only, automatic backups only, or both. The same per-project retention period is applied to local and cloud copies.
 
-When cloud copies are enabled, the manager uses rclone's official HTTPS installer to install or update to the latest stable release before opening the account-configuration wizard. It does not install the outdated Ubuntu repository package. OAuth credentials remain in rclone's root-user configuration; they are not written to `.project-meta`.
+When cloud copies are enabled, the manager compares the installed rclone version with the official stable-release manifest. It runs rclone's official HTTPS installer only when rclone is missing or outdated, and verifies the resulting version before opening the account-configuration wizard. It does not install the outdated Ubuntu repository package. OAuth credentials remain in rclone's root-user configuration; they are not written to `.project-meta`.
 
 ## Security Notes
 
