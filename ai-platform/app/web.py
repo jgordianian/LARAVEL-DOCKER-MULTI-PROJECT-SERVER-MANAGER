@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import logging
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -8,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -27,6 +29,8 @@ from .capabilities import (
 from .config import get_settings
 from .db import SessionLocal, get_db
 from .environment import load_environment_snapshot
+from .i18n import SUPPORTED_LANGUAGES, normalize_language, translate
+from .mail import SMTPConfiguration, send_email, smtp_configuration
 from .models import (
     APIKey,
     AuditLog,
@@ -36,6 +40,7 @@ from .models import (
     ModelInstance,
     ModelPermission,
     ModelRecord,
+    PasswordResetToken,
     Quota,
     ServiceAccount,
     SystemSetting,
@@ -64,11 +69,27 @@ CONTAINER_PLATFORM_ROOT = Path("/platform")
 DATA_ROOT = CONTAINER_PLATFORM_ROOT if settings.ai_runtime_mode == "docker" and CONTAINER_PLATFORM_ROOT.is_dir() else settings.ai_platform_root
 ENVIRONMENT_SNAPSHOT_PATH = DATA_ROOT / "hardware" / "environment.json"
 NOTEBOOKS_ROOT = DATA_ROOT / "notebooks"
+BRANDING_ROOT = DATA_ROOT / "generated" / "branding"
+BRANDING_ROOT.mkdir(parents=True, exist_ok=True)
 templates = Jinja2Templates(directory=str(BASE / "templates"))
 redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
+logger = logging.getLogger("ai.web")
 app = FastAPI(title="vLLM AI Platform", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
+app.mount("/branding", StaticFiles(directory=str(BRANDING_ROOT)), name="branding")
 ADMIN_ROLES = {"super_admin", "administrator"}
+REASONING_EFFORTS = {"none", "low", "medium", "high"}
+BRANDING_DEFAULTS = {
+    "brand_name": "Aperture AI",
+    "browser_title": "AI Platform",
+    "footer_text": f"vLLM AI Platform {__version__}",
+    "logo_light_url": "",
+    "logo_dark_url": "",
+    "login_logo_url": "",
+    "favicon_url": "",
+}
+BRAND_ASSET_SLOTS = {"logo_light", "logo_dark", "login_logo", "favicon"}
+MAX_BRAND_ASSET_BYTES = 2 * 1024 * 1024
 
 
 @app.middleware("http")
@@ -147,16 +168,144 @@ def audit(db: Session, session: WebSession | None, request: Request, action: str
     ))
 
 
+def setting_values(db: Session, keys: set[str]) -> dict[str, Any]:
+    return {
+        row.key: row.value
+        for row in db.scalars(select(SystemSetting).where(SystemSetting.key.in_(keys))).all()
+    }
+
+
+def save_setting(db: Session, key: str, value: Any, *, secret: bool = False) -> None:
+    setting = db.get(SystemSetting, key)
+    if setting is None:
+        db.add(SystemSetting(key=key, value=value, secret=secret))
+    else:
+        setting.value = value
+        setting.secret = secret
+
+
+def site_presentation() -> dict[str, Any]:
+    keys = set(BRANDING_DEFAULTS) | {"smtp_enabled", "system_language"}
+    with SessionLocal() as presentation_db:
+        values = setting_values(presentation_db, keys)
+    branding = {
+        key: str(values.get(key, default) or default)
+        for key, default in BRANDING_DEFAULTS.items()
+    }
+    for slot in BRAND_ASSET_SLOTS:
+        setting_key = f"{slot}_url"
+        branding[setting_key] = versioned_brand_asset_url(branding[setting_key])
+    return {
+        "branding": branding,
+        "password_reset_enabled": bool(values.get("smtp_enabled", False)),
+        "system_language": normalize_language(values.get("system_language")),
+    }
+
+
+def versioned_brand_asset_url(value: Any) -> str:
+    url = str(value or "").strip()
+    path = url.split("?", 1)[0]
+    if not path.startswith("/branding/"):
+        return url
+    filename = Path(path).name
+    candidate = BRANDING_ROOT / filename
+    if filename != path.removeprefix("/branding/") or not candidate.is_file():
+        return path
+    stat = candidate.stat()
+    return f"{path}?v={stat.st_mtime_ns:x}-{stat.st_size:x}"
+
+
+def normalized_reasoning_effort(value: Any) -> str:
+    effort = str(value or "medium").strip().lower()
+    if effort not in REASONING_EFFORTS:
+        raise HTTPException(422, "reasoning effort must be none, low, medium or high")
+    return effort
+
+
+def password_reset_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def password_reset_url(token: str) -> str:
+    domain = settings.ai_domain.strip().rstrip("/")
+    if not domain.startswith(("http://", "https://")):
+        domain = f"{'https' if settings.cookie_secure else 'http'}://{domain}"
+    return f"{domain}/reset-password?token={token}"
+
+
+def brand_asset_extension(body: bytes, *, favicon: bool) -> str:
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if body.startswith(b"\xff\xd8\xff") and not favicon:
+        return "jpg"
+    if len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP" and not favicon:
+        return "webp"
+    if body.startswith(b"\x00\x00\x01\x00") and favicon:
+        return "ico"
+    expected = "PNG or ICO" if favicon else "PNG, JPEG or WebP"
+    raise HTTPException(422, f"unsupported image format; upload {expected}")
+
+
+async def store_brand_asset(slot: str, upload: UploadFile | None) -> str | None:
+    if upload is None or not upload.filename:
+        return None
+    if slot not in BRAND_ASSET_SLOTS:
+        raise HTTPException(422, "invalid brand asset")
+    body = await upload.read(MAX_BRAND_ASSET_BYTES + 1)
+    await upload.close()
+    if not body or len(body) > MAX_BRAND_ASSET_BYTES:
+        raise HTTPException(422, "brand images must be between 1 byte and 2 MB")
+    extension = brand_asset_extension(body, favicon=slot == "favicon")
+    destination = BRANDING_ROOT / f"{slot}.{extension}"
+    temporary = BRANDING_ROOT / f".{slot}.{secrets.token_hex(8)}.tmp"
+    temporary.write_bytes(body)
+    temporary.chmod(0o644)
+    temporary.replace(destination)
+    for previous in BRANDING_ROOT.glob(f"{slot}.*"):
+        if previous != destination and previous.is_file():
+            previous.unlink()
+    return f"/branding/{destination.name}"
+
+
+def remove_brand_asset(slot: str) -> None:
+    if slot not in BRAND_ASSET_SLOTS:
+        return
+    for path in BRANDING_ROOT.glob(f"{slot}.*"):
+        if path.is_file():
+            path.unlink()
+
+
 def render(request: Request, name: str, session: WebSession | None = None, **context):
-    return templates.TemplateResponse(request, name, {"session": session, "settings": settings, "version": __version__, **context})
+    presentation = site_presentation()
+    locale = normalize_language(session.user.preferred_language, presentation["system_language"]) if session else presentation["system_language"]
+    return_path = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+    return templates.TemplateResponse(
+        request,
+        name,
+        {
+            "session": session,
+            "settings": settings,
+            "version": __version__,
+            **presentation,
+            "locale": locale,
+            "language_return_path": return_path,
+            **context,
+        },
+    )
 
 
 @app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request, db: Session = Depends(get_db)):
+def login_page(request: Request, reset: str = "", db: Session = Depends(get_db)):
     if session_for(request, db):
         return RedirectResponse("/", 303)
     token = secrets.token_urlsafe(32)
-    response = render(request, "login.html", login_csrf=token, error=None)
+    response = render(
+        request,
+        "login.html",
+        login_csrf=token,
+        error=None,
+        success="Your password has been reset. You can now sign in." if reset == "1" else None,
+    )
     response.set_cookie("ai_login_csrf", token, secure=settings.cookie_secure, httponly=True, samesite="strict", max_age=600)
     return response
 
@@ -203,6 +352,231 @@ def logout(request: Request, csrf_token: str = Form(), db: Session = Depends(get
     return response
 
 
+@app.post("/profile/language")
+def language_preference_update(
+    request: Request,
+    preferred_language: str = Form(""),
+    return_path: str = Form("/"),
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    session = require_session(request, db)
+    verify_csrf(request, session, csrf_token)
+    preferred_language = preferred_language.strip().lower()
+    if preferred_language and preferred_language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(422, "unsupported language")
+    before = session.user.preferred_language
+    session.user.preferred_language = preferred_language or None
+    audit(
+        db,
+        session,
+        request,
+        "user.language_changed",
+        "user",
+        session.user_id,
+        before={"preferred_language": before},
+        after={"preferred_language": session.user.preferred_language},
+    )
+    db.commit()
+    if not return_path.startswith("/") or return_path.startswith("//"):
+        return_path = "/"
+    return RedirectResponse(return_path, 303)
+
+
+@app.get("/forgot-password", response_class=HTMLResponse)
+def forgot_password_page(request: Request, db: Session = Depends(get_db)):
+    token = secrets.token_urlsafe(32)
+    configuration = smtp_configuration(db)
+    response = render(
+        request,
+        "forgot_password.html",
+        reset_csrf=token,
+        error=None if configuration.ready else "Password reset email is not configured. Contact an administrator.",
+        success=None,
+    )
+    response.set_cookie(
+        "ai_reset_csrf",
+        token,
+        secure=settings.cookie_secure,
+        httponly=True,
+        samesite="strict",
+        max_age=600,
+    )
+    return response
+
+
+@app.post("/forgot-password", response_class=HTMLResponse)
+def forgot_password_request(
+    request: Request,
+    email: str = Form(),
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    cookie_csrf = request.cookies.get("ai_reset_csrf", "")
+    if not cookie_csrf or not secrets.compare_digest(cookie_csrf, csrf_token):
+        raise HTTPException(403, "CSRF validation failed")
+    configuration = smtp_configuration(db)
+    if not configuration.ready:
+        return render(
+            request,
+            "forgot_password.html",
+            reset_csrf=csrf_token,
+            error="Password reset email is not configured. Contact an administrator.",
+            success=None,
+        )
+
+    normalized_email = email.strip().lower()
+    identity_hash = hashlib.sha256(normalized_email.encode("utf-8")).hexdigest()
+    ip_key = f"aip:password-reset:ip:{request.state.client_ip}"
+    email_key = f"aip:password-reset:email:{identity_hash}"
+    ip_attempts = int(redis_client.incr(ip_key))
+    email_attempts = int(redis_client.incr(email_key))
+    if ip_attempts == 1:
+        redis_client.expire(ip_key, 3600)
+    if email_attempts == 1:
+        redis_client.expire(email_key, 3600)
+
+    generic_success = "If that address belongs to an active account, a reset link has been sent."
+    if ip_attempts <= 10 and email_attempts <= 5:
+        user = db.scalar(select(User).where(func.lower(User.email) == normalized_email, User.enabled.is_(True)))
+        if user is not None:
+            raw_token = secrets.token_urlsafe(32)
+            db.query(PasswordResetToken).filter(
+                PasswordResetToken.user_id == user.id,
+                PasswordResetToken.used_at.is_(None),
+            ).delete(synchronize_session=False)
+            db.add(
+                PasswordResetToken(
+                    user_id=user.id,
+                    token_hash=password_reset_token_hash(raw_token),
+                    requested_ip=request.state.client_ip,
+                    expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+                )
+            )
+            try:
+                presentation = site_presentation()
+                brand_name = presentation["branding"]["brand_name"]
+                email_language = normalize_language(user.preferred_language, presentation["system_language"])
+                reset_url = password_reset_url(raw_token)
+                send_email(
+                    configuration,
+                    user.email,
+                    translate(email_language, "Reset your {brand_name} password", brand_name=brand_name),
+                    translate(
+                        email_language,
+                        "A password reset was requested for your account.\n\nOpen this link within 30 minutes:\n{url}\n\nIf you did not request this, you can ignore this email.",
+                        url=reset_url,
+                    ),
+                )
+                audit(db, None, request, "user.password_reset_requested", "user", user.id)
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                logger.warning("password reset email delivery failed type=%s", type(exc).__name__)
+
+    return render(
+        request,
+        "forgot_password.html",
+        reset_csrf=csrf_token,
+        error=None,
+        success=generic_success,
+    )
+
+
+def valid_password_reset(db: Session, token: str) -> PasswordResetToken | None:
+    if not token or len(token) > 256:
+        return None
+    return db.scalar(
+        select(PasswordResetToken).where(
+            PasswordResetToken.token_hash == password_reset_token_hash(token),
+            PasswordResetToken.used_at.is_(None),
+            PasswordResetToken.expires_at > datetime.now(timezone.utc),
+        )
+    )
+
+
+@app.get("/reset-password", response_class=HTMLResponse)
+def reset_password_page(request: Request, token: str = "", db: Session = Depends(get_db)):
+    reset = valid_password_reset(db, token)
+    csrf_token = secrets.token_urlsafe(32)
+    response = render(
+        request,
+        "reset_password.html",
+        token=token,
+        reset_csrf=csrf_token,
+        error=None if reset and reset.user.enabled else "This password reset link is invalid or has expired.",
+        valid=bool(reset and reset.user.enabled),
+    )
+    response.set_cookie(
+        "ai_reset_csrf",
+        csrf_token,
+        secure=settings.cookie_secure,
+        httponly=True,
+        samesite="strict",
+        max_age=600,
+    )
+    return response
+
+
+@app.post("/reset-password", response_class=HTMLResponse)
+def reset_password(
+    request: Request,
+    token: str = Form(),
+    new_password: str = Form(),
+    confirm_password: str = Form(),
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    cookie_csrf = request.cookies.get("ai_reset_csrf", "")
+    if not cookie_csrf or not secrets.compare_digest(cookie_csrf, csrf_token):
+        raise HTTPException(403, "CSRF validation failed")
+    reset = valid_password_reset(db, token)
+    if reset is None or not reset.user.enabled:
+        return render(
+            request,
+            "reset_password.html",
+            token=token,
+            reset_csrf=csrf_token,
+            error="This password reset link is invalid or has expired.",
+            valid=False,
+        )
+    if new_password != confirm_password:
+        return render(
+            request,
+            "reset_password.html",
+            token=token,
+            reset_csrf=csrf_token,
+            error="New passwords do not match.",
+            valid=True,
+        )
+    try:
+        reset.user.password_hash = hash_password(new_password)
+    except ValueError as exc:
+        return render(
+            request,
+            "reset_password.html",
+            token=token,
+            reset_csrf=csrf_token,
+            error=str(exc),
+            valid=True,
+        )
+    now = datetime.now(timezone.utc)
+    for active_token in db.scalars(
+        select(PasswordResetToken).where(
+            PasswordResetToken.user_id == reset.user_id,
+            PasswordResetToken.used_at.is_(None),
+        )
+    ).all():
+        active_token.used_at = now
+    reset.user.force_password_reset = False
+    db.query(WebSession).filter(WebSession.user_id == reset.user_id).delete(synchronize_session=False)
+    audit(db, None, request, "user.password_reset_completed", "user", reset.user_id)
+    db.commit()
+    response = RedirectResponse("/login?reset=1", 303)
+    response.delete_cookie("ai_reset_csrf")
+    return response
+
+
 @app.get("/profile/password", response_class=HTMLResponse)
 def password_page(request: Request, db: Session = Depends(get_db)):
     session = require_session(request, db)
@@ -210,7 +584,15 @@ def password_page(request: Request, db: Session = Depends(get_db)):
 
 
 @app.post("/profile/password", response_class=HTMLResponse)
-def password_change(request: Request, current_password: str = Form(), new_password: str = Form(), confirm_password: str = Form(), csrf_token: str = Form(), db: Session = Depends(get_db)):
+def password_change(
+    request: Request,
+    current_password: str = Form(),
+    new_password: str = Form(),
+    confirm_password: str = Form(),
+    return_path: str = Form(""),
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
     session = require_session(request, db)
     verify_csrf(request, session, csrf_token)
     error = None
@@ -224,9 +606,12 @@ def password_change(request: Request, current_password: str = Form(), new_passwo
             session.user.force_password_reset = False
             audit(db, session, request, "user.password_changed", "user", session.user_id)
             db.commit()
-            return RedirectResponse("/", 303)
+            destination = "/profile?result=password-saved" if return_path == "/profile" else "/"
+            return RedirectResponse(destination, 303)
         except ValueError as exc:
             error = str(exc)
+    if return_path == "/profile" and not session.user.force_password_reset:
+        return profile_response(request, session, db, error=error)
     return render(request, "password.html", session=session, error=error, success=None)
 
 
@@ -237,6 +622,132 @@ def permitted_models(db: Session, user_id: int) -> list[ModelRecord]:
         return active
     allowed = {permission.model_id for permission in permissions}
     return [model for model in active if model.id in allowed]
+
+
+def profile_response(
+    request: Request,
+    session: WebSession,
+    db: Session,
+    *,
+    notice: str | None = None,
+    error: str | None = None,
+    values: dict[str, str] | None = None,
+):
+    models = permitted_models(db, session.user_id)
+    profile_values = values or {
+        "name": session.user.name,
+        "email": session.user.email,
+        "preferred_language": session.user.preferred_language or "",
+        "default_model_alias": session.user.default_model_alias or "",
+        "reasoning_effort": session.user.reasoning_effort or "medium",
+        "system_prompt": session.user.system_prompt or "",
+    }
+    return render(
+        request,
+        "profile.html",
+        session=session,
+        models=models,
+        profile_values=profile_values,
+        current_model_available=profile_values["default_model_alias"] in {model.alias for model in models},
+        notice=notice,
+        error=error,
+    )
+
+
+@app.get("/profile", response_class=HTMLResponse)
+def profile_page(request: Request, result: str = "", db: Session = Depends(get_db)):
+    session = require_session(request, db)
+    notices = {"saved": "Profile saved.", "password-saved": "Password changed."}
+    return profile_response(request, session, db, notice=notices.get(result))
+
+
+@app.post("/profile", response_class=HTMLResponse)
+def profile_update(
+    request: Request,
+    name: str = Form(),
+    email: str = Form(),
+    preferred_language: str = Form(""),
+    default_model_alias: str = Form(""),
+    reasoning_effort: str = Form("medium"),
+    system_prompt: str = Form(""),
+    current_password: str = Form(""),
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    session = require_session(request, db)
+    verify_csrf(request, session, csrf_token)
+    draft = {
+        "name": name.strip(),
+        "email": email.strip(),
+        "preferred_language": preferred_language.strip().lower(),
+        "default_model_alias": default_model_alias.strip(),
+        "reasoning_effort": reasoning_effort.strip().lower(),
+        "system_prompt": system_prompt.strip(),
+    }
+    error = None
+    normalized_email = session.user.email
+    if not draft["name"]:
+        error = "Display name is required."
+    elif len(draft["name"]) > 160:
+        error = "Display name is too long."
+    elif draft["preferred_language"] and draft["preferred_language"] not in SUPPORTED_LANGUAGES:
+        error = "Unsupported preferred language."
+    elif len(draft["system_prompt"]) > 12000:
+        error = "Personal system prompt is too long."
+    else:
+        try:
+            normalized_email = normalize_email(draft["email"])
+            draft["reasoning_effort"] = normalized_reasoning_effort(draft["reasoning_effort"])
+        except (ValueError, HTTPException) as exc:
+            error = str(exc.detail if isinstance(exc, HTTPException) else exc)
+
+    available_aliases = {model.alias for model in permitted_models(db, session.user_id)}
+    if not error and draft["default_model_alias"] and draft["default_model_alias"] not in available_aliases and draft["default_model_alias"] != (session.user.default_model_alias or ""):
+        error = "The selected default model is not available to your account."
+    email_changed = normalized_email != session.user.email
+    if not error and email_changed and not verify_password(session.user.password_hash, current_password):
+        error = "Current password is required to change your email address."
+    if not error and email_changed and db.scalar(select(User).where(func.lower(User.email) == normalized_email, User.id != session.user_id)):
+        error = "Email already exists."
+    if error:
+        return profile_response(request, session, db, error=error, values=draft)
+
+    before = {
+        "name": session.user.name,
+        "email": session.user.email,
+        "preferred_language": session.user.preferred_language,
+        "default_model_alias": session.user.default_model_alias,
+        "reasoning_effort": session.user.reasoning_effort,
+        "system_prompt_configured": bool(session.user.system_prompt),
+    }
+    session.user.name = draft["name"]
+    session.user.email = normalized_email
+    session.user.preferred_language = draft["preferred_language"] or None
+    session.user.default_model_alias = draft["default_model_alias"] or None
+    session.user.reasoning_effort = draft["reasoning_effort"]
+    session.user.system_prompt = draft["system_prompt"] or None
+    if email_changed:
+        db.query(WebSession).filter(WebSession.user_id == session.user_id, WebSession.id != session.id).delete(synchronize_session=False)
+    audit(
+        db,
+        session,
+        request,
+        "user.profile_changed",
+        "user",
+        session.user_id,
+        before=before,
+        after={
+            "name": session.user.name,
+            "email": session.user.email,
+            "preferred_language": session.user.preferred_language,
+            "default_model_alias": session.user.default_model_alias,
+            "reasoning_effort": session.user.reasoning_effort,
+            "system_prompt_configured": bool(session.user.system_prompt),
+            "other_sessions_terminated": email_changed,
+        },
+    )
+    db.commit()
+    return RedirectResponse("/profile?result=saved", 303)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -254,10 +765,26 @@ def chat_page(request: Request, q: str = "", db: Session = Depends(get_db)):
     portal_setting = db.get(SystemSetting, "portal_default_model")
     system_default = next((model.alias for model in models if model.is_default), None)
     preferred = session.user.default_model_alias or (portal_setting.value if portal_setting and isinstance(portal_setting.value, str) else None) or system_default
+    try:
+        reasoning_effort = normalized_reasoning_effort(session.user.reasoning_effort)
+    except HTTPException:
+        reasoning_effort = "medium"
     return render(
         request, "chat.html", session=session, conversations=conversations, models=models, search=q,
         preferred_model=preferred, default_unavailable=bool(preferred and preferred not in {model.alias for model in models}),
+        reasoning_effort=reasoning_effort,
     )
+
+
+@app.post("/api/preferences/reasoning")
+async def reasoning_preference(request: Request, db: Session = Depends(get_db)):
+    session = require_chat_session(request, db)
+    data = await request.json()
+    verify_csrf(request, session, str(data.get("csrf_token", "")))
+    effort = normalized_reasoning_effort(data.get("reasoning_effort"))
+    session.user.reasoning_effort = effort
+    db.commit()
+    return {"status": "ok", "reasoning_effort": effort}
 
 
 @app.get("/api/conversations")
@@ -335,9 +862,14 @@ async def portal_chat(request: Request, db: Session = Depends(get_db)):
     conversation = db.scalar(select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == session.user_id))
     if conversation is None:
         raise HTTPException(404, "conversation not found")
-    allowed = {model.alias for model in permitted_models(db, session.user_id)}
-    if conversation.model_alias not in allowed:
+    allowed = {model.alias: model for model in permitted_models(db, session.user_id)}
+    selected_model = allowed.get(conversation.model_alias)
+    if selected_model is None:
         raise HTTPException(409, "the selected model is no longer available")
+    reasoning_effort = normalized_reasoning_effort(data.get("reasoning_effort", session.user.reasoning_effort))
+    if reasoning_effort != "none" and "reasoning" not in model_capabilities(selected_model):
+        raise HTTPException(422, "the selected model is not configured for reasoning")
+    session.user.reasoning_effort = reasoning_effort
     if regenerate:
         last_assistant = db.scalar(
             select(Message)
@@ -355,7 +887,12 @@ async def portal_chat(request: Request, db: Session = Depends(get_db)):
     db.commit()
     db.expire(conversation, ["messages"])
     messages = [{"role": message.role, "content": message.content, **({"tool_calls": message.tool_calls} if message.tool_calls else {})} for message in conversation.messages]
-    payload = {"model": conversation.model_alias, "messages": messages, "stream": True}
+    payload = {
+        "model": conversation.model_alias,
+        "messages": messages,
+        "stream": True,
+        "reasoning_effort": reasoning_effort,
+    }
     client = httpx.AsyncClient(timeout=httpx.Timeout(600, connect=10))
     upstream_request = client.build_request(
         "POST", f"{settings.gateway_internal_url}/v1/chat/completions", json=payload,
@@ -1209,15 +1746,29 @@ async def performance_apply(
 
 
 @app.get("/admin/settings", response_class=HTMLResponse)
-def settings_page(request: Request, db: Session = Depends(get_db)):
+def settings_page(request: Request, result: str = "", db: Session = Depends(get_db)):
     session = require_admin(request, db)
     global_prompt = db.get(SystemSetting, "global_system_prompt")
     api_default = db.get(SystemSetting, "api_default_model")
     portal_default = db.get(SystemSetting, "portal_default_model")
+    presentation = site_presentation()
+    smtp = smtp_configuration(db)
+    notices = {
+        "general-saved": "General AI settings saved.",
+        "branding-saved": "Branding settings saved.",
+        "localization-saved": "Localization settings saved.",
+        "smtp-saved": "SMTP settings saved.",
+        "smtp-tested": "SMTP settings saved and the test email was accepted by the mail server.",
+    }
+    errors = {
+        "smtp-test-failed": "SMTP settings were saved, but the test email could not be delivered. Verify the server, port, security mode and credentials.",
+    }
     return render(
         request, "settings.html", session=session, global_system_prompt=global_prompt.value if global_prompt else "",
         api_default_model=api_default.value if api_default else "", portal_default_model=portal_default.value if portal_default else "",
-        models=db.scalars(select(ModelRecord).order_by(ModelRecord.alias)).all(),
+        models=db.scalars(select(ModelRecord).order_by(ModelRecord.alias)).all(), branding=presentation["branding"],
+        system_language=presentation["system_language"], smtp=smtp, smtp_password_configured=bool(smtp.password),
+        notice=notices.get(result), error=errors.get(result),
     )
 
 
@@ -1236,14 +1787,196 @@ def settings_update(request: Request, global_system_prompt: str = Form(""), api_
         "portal_default_model": portal_default_model,
     }
     for key, value in values.items():
-        setting = db.get(SystemSetting, key)
-        if setting is None:
-            db.add(SystemSetting(key=key, value=value, secret=False))
-        else:
-            setting.value = value
+        save_setting(db, key, value)
     audit(db, session, request, "settings.changed", "system_setting", "defaults", after={"global_prompt_configured": bool(values["global_system_prompt"]), "api_default_model": api_default_model, "portal_default_model": portal_default_model})
     db.commit()
-    return RedirectResponse("/admin/settings", 303)
+    return RedirectResponse("/admin/settings?result=general-saved", 303)
+
+
+@app.post("/admin/settings/localization")
+def localization_update(
+    request: Request,
+    system_language: str = Form(),
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    session = require_admin(request, db)
+    verify_csrf(request, session, csrf_token)
+    system_language = system_language.strip().lower()
+    if system_language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(422, "unsupported system language")
+    before = site_presentation()["system_language"]
+    save_setting(db, "system_language", system_language)
+    audit(
+        db,
+        session,
+        request,
+        "settings.localization_changed",
+        "system_setting",
+        "localization",
+        before={"system_language": before},
+        after={"system_language": system_language},
+    )
+    db.commit()
+    return RedirectResponse("/admin/settings?result=localization-saved", 303)
+
+
+@app.post("/admin/settings/branding")
+async def branding_update(
+    request: Request,
+    brand_name: str = Form(),
+    browser_title: str = Form(),
+    footer_text: str = Form(),
+    csrf_token: str = Form(),
+    logo_light: UploadFile | None = File(None),
+    logo_dark: UploadFile | None = File(None),
+    login_logo: UploadFile | None = File(None),
+    favicon: UploadFile | None = File(None),
+    remove_logo_light: bool = Form(False),
+    remove_logo_dark: bool = Form(False),
+    remove_login_logo: bool = Form(False),
+    remove_favicon: bool = Form(False),
+    db: Session = Depends(get_db),
+):
+    session = require_admin(request, db)
+    verify_csrf(request, session, csrf_token)
+    brand_name = brand_name.strip()[:80]
+    browser_title = browser_title.strip()[:120]
+    footer_text = footer_text.strip()[:160]
+    if not brand_name or not browser_title:
+        raise HTTPException(422, "application name and browser title are required")
+
+    current_values = setting_values(db, set(BRANDING_DEFAULTS))
+    current = {
+        key: str(current_values.get(key, default) or default)
+        for key, default in BRANDING_DEFAULTS.items()
+    }
+    assets = {
+        "logo_light": (logo_light, remove_logo_light),
+        "logo_dark": (logo_dark, remove_logo_dark),
+        "login_logo": (login_logo, remove_login_logo),
+        "favicon": (favicon, remove_favicon),
+    }
+    updated_urls: dict[str, str] = {}
+    for slot, (upload, remove) in assets.items():
+        setting_key = f"{slot}_url"
+        if remove:
+            remove_brand_asset(slot)
+            updated_urls[setting_key] = ""
+        else:
+            stored = await store_brand_asset(slot, upload)
+            updated_urls[setting_key] = stored if stored is not None else str(current.get(setting_key, ""))
+
+    values = {
+        "brand_name": brand_name,
+        "browser_title": browser_title,
+        "footer_text": footer_text,
+        **updated_urls,
+    }
+    for key, value in values.items():
+        save_setting(db, key, value)
+    audit(
+        db,
+        session,
+        request,
+        "settings.branding_changed",
+        "system_setting",
+        "branding",
+        after={"brand_name": brand_name, "browser_title": browser_title, "configured_assets": sorted(key for key, value in updated_urls.items() if value)},
+    )
+    db.commit()
+    return RedirectResponse("/admin/settings?result=branding-saved", 303)
+
+
+@app.post("/admin/settings/smtp")
+def smtp_update(
+    request: Request,
+    smtp_enabled: bool = Form(False),
+    smtp_host: str = Form(""),
+    smtp_port: int = Form(587),
+    smtp_security: str = Form("starttls"),
+    smtp_username: str = Form(""),
+    smtp_password: str = Form(""),
+    smtp_from_email: str = Form(""),
+    smtp_from_name: str = Form(""),
+    test_recipient: str = Form(""),
+    action: str = Form("save"),
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    session = require_admin(request, db)
+    verify_csrf(request, session, csrf_token)
+    smtp_host = smtp_host.strip()[:255]
+    smtp_username = smtp_username.strip()[:320]
+    smtp_from_name = smtp_from_name.strip()[:160] or site_presentation()["branding"]["brand_name"]
+    if smtp_security not in {"none", "starttls", "ssl"}:
+        raise HTTPException(422, "invalid SMTP security mode")
+    if not 1 <= smtp_port <= 65535:
+        raise HTTPException(422, "SMTP port must be between 1 and 65535")
+    if smtp_host and any(character.isspace() for character in smtp_host):
+        raise HTTPException(422, "SMTP host cannot contain whitespace")
+    try:
+        smtp_from_email = normalize_email(smtp_from_email) if smtp_from_email.strip() else ""
+        recipient = normalize_email(test_recipient) if test_recipient.strip() else session.user.email
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    if smtp_enabled and (not smtp_host or not smtp_from_email):
+        raise HTTPException(422, "enabled SMTP requires a host and sender email")
+
+    existing = smtp_configuration(db)
+    effective_password = smtp_password if smtp_password else existing.password
+    values: dict[str, Any] = {
+        "smtp_enabled": smtp_enabled,
+        "smtp_host": smtp_host,
+        "smtp_port": smtp_port,
+        "smtp_security": smtp_security,
+        "smtp_username": smtp_username,
+        "smtp_from_email": smtp_from_email,
+        "smtp_from_name": smtp_from_name,
+    }
+    for key, value in values.items():
+        save_setting(db, key, value)
+    if smtp_password:
+        save_setting(db, "smtp_password", smtp_password, secret=True)
+
+    result = "smtp-saved"
+    test_succeeded = None
+    if action == "test":
+        configuration = SMTPConfiguration(password=effective_password, **{key.removeprefix("smtp_"): value for key, value in values.items()})
+        test_language = normalize_language(session.user.preferred_language, site_presentation()["system_language"])
+        try:
+            send_email(
+                configuration,
+                recipient,
+                translate(test_language, "{brand_name} SMTP test", brand_name=configuration.from_name),
+                translate(test_language, "SMTP is configured correctly. Password reset emails can now be delivered."),
+            )
+            result = "smtp-tested"
+            test_succeeded = True
+        except Exception as exc:
+            logger.warning("SMTP test failed type=%s", type(exc).__name__)
+            result = "smtp-test-failed"
+            test_succeeded = False
+    audit(
+        db,
+        session,
+        request,
+        "settings.smtp_changed",
+        "system_setting",
+        "smtp",
+        after={
+            "enabled": smtp_enabled,
+            "host": smtp_host,
+            "port": smtp_port,
+            "security": smtp_security,
+            "username_configured": bool(smtp_username),
+            "password_configured": bool(effective_password),
+            "test_succeeded": test_succeeded,
+        },
+        result="success" if test_succeeded is not False else "failure",
+    )
+    db.commit()
+    return RedirectResponse(f"/admin/settings?result={result}", 303)
 
 
 @app.get("/admin/audit", response_class=HTMLResponse)
@@ -1257,4 +1990,3 @@ def audit_page(request: Request, db: Session = Depends(get_db)):
 def operations_page(request: Request, db: Session = Depends(get_db)):
     session = require_admin(request, db)
     return render(request, "operations.html", session=session)
-

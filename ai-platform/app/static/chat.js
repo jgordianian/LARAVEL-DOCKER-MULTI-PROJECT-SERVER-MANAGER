@@ -7,12 +7,22 @@
   const composer = document.getElementById('composer');
   const prompt = document.getElementById('prompt');
   const model = document.getElementById('model-select');
+  const reasoning = document.getElementById('reasoning-select');
+  const reasoningSaveState = document.getElementById('reasoning-save-state');
   const stop = document.getElementById('stop');
   const send = document.getElementById('send');
   const rename = document.getElementById('rename-chat');
   const remove = document.getElementById('delete-chat');
   let conversationId = null;
   let aborter = null;
+  let savedReasoning = reasoning.dataset.savedValue || reasoning.value;
+
+  const modelSupportsReasoning = () => model.selectedOptions[0]?.dataset.reasoning === 'true';
+  const effectiveReasoning = () => modelSupportsReasoning() ? reasoning.value : 'none';
+  const syncReasoningAvailability = () => {
+    reasoning.disabled = !modelSupportsReasoning();
+    reasoning.title = reasoning.disabled ? 'The selected model is not configured for reasoning.' : '';
+  };
 
   const escapeHtml = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const highlight = value => value.replace(/\b(const|let|var|function|class|def|return|if|else|for|while|async|await|import|from|try|catch|except|true|false|null|None)\b/g, '<span class="syntax-keyword">$1</span>');
@@ -105,6 +115,7 @@
     const data = await response.json();
     conversationId = data.id;
     model.value = data.model;
+    syncReasoningAvailability();
     document.getElementById('chat-title').textContent = data.title;
     rename.hidden = false; remove.hidden = false;
     messages.innerHTML = '';
@@ -123,7 +134,7 @@
     try {
       const response = await fetch('/api/chat', {
         method: 'POST', headers: {'Content-Type':'application/json'}, signal:aborter.signal,
-        body: JSON.stringify({conversation_id:conversationId, content, regenerate, csrf_token:csrf})
+        body: JSON.stringify({conversation_id:conversationId, content, regenerate, reasoning_effort:effectiveReasoning(), csrf_token:csrf})
       });
       if (!response.ok) {
         const err = await response.json();
@@ -193,6 +204,35 @@
     }
   });
   stop.addEventListener('click', () => aborter?.abort());
+  model.addEventListener('change', syncReasoningAvailability);
+  reasoning.addEventListener('change', async () => {
+    const selected = reasoning.value;
+    reasoning.disabled = true;
+    reasoningSaveState.classList.remove('error');
+    reasoningSaveState.textContent = 'Saving…';
+    try {
+      const response = await fetch('/api/preferences/reasoning', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({reasoning_effort:selected, csrf_token:csrf})
+      });
+      if (!response.ok) throw new Error('Unable to save reasoning preference');
+      const data = await response.json();
+      savedReasoning = data.reasoning_effort;
+      reasoning.value = savedReasoning;
+      reasoning.dataset.savedValue = savedReasoning;
+      reasoningSaveState.textContent = 'Saved';
+      setTimeout(() => {
+        if (!reasoningSaveState.classList.contains('error')) reasoningSaveState.textContent = '';
+      }, 1600);
+    } catch (error) {
+      reasoning.value = savedReasoning;
+      reasoningSaveState.classList.add('error');
+      reasoningSaveState.textContent = 'Unable to save';
+      console.warn(error);
+    } finally {
+      syncReasoningAvailability();
+    }
+  });
   prompt.addEventListener('input', () => {
     prompt.style.height = 'auto';
     prompt.style.height = `${Math.min(prompt.scrollHeight, 180)}px`;
@@ -207,5 +247,6 @@
   });
 
   const initial = new URLSearchParams(location.search).get('conversation');
+  syncReasoningAvailability();
   if (initial) loadConversation(initial);
 })();

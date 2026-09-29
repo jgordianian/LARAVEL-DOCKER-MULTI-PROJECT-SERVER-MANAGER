@@ -9435,7 +9435,7 @@ ai_cli() {
     }
     (
       cd "$AI_PLATFORM_BASE" || exit 1
-      "$python" -m app.cli "$@"
+      runuser -u "$AI_NATIVE_SERVICE_USER" -- "$python" -m app.cli "$@"
     )
   else
     ai_dc exec -T controller python -m app.cli "$@"
@@ -9746,6 +9746,8 @@ ai_native_install_environments() {
       --torch-backend=auto \
       "vllm==${version}"
   fi
+  env -u PYTHONHOME -u PYTHONPATH "${AI_NATIVE_VLLM_VENV}/bin/python" \
+    "${AI_PLATFORM_BASE}/scripts/patch_vllm_responses_thinking_budget.py"
   "${AI_NATIVE_VLLM_VENV}/bin/vllm" --version
 }
 

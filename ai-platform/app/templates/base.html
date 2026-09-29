@@ -1,20 +1,41 @@
 <!doctype html>
-<html lang="en">
+<html lang="{{ locale }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{% block title %}AI Platform{% endblock %}</title>
-  <link rel="stylesheet" href="/static/app.css">
-  <link rel="stylesheet" href="/static/chat-extra.css">
+  <title>{% block title %}{{ branding.browser_title }}{% endblock %}</title>
+  {% if branding.favicon_url %}<link rel="icon" href="{{ branding.favicon_url }}">{% endif %}
+  <link rel="stylesheet" href="/static/app.css?v=1.2.0-localization2">
+  <link rel="stylesheet" href="/static/chat-extra.css?v=1.2.0-profile6">
+  <script src="/static/i18n.js?v=1.2.0-profile6" defer></script>
 </head>
 <body>
 {% if session %}
 <header class="topbar">
-  <a class="brand" href="/">Aperture AI</a>
+  <a class="brand{% if branding.logo_dark_url or branding.logo_light_url %} with-logo{% endif %}" href="/">
+    {% if branding.logo_dark_url or branding.logo_light_url %}
+      <picture><source media="(prefers-color-scheme: light)" srcset="{{ branding.logo_light_url or branding.logo_dark_url }}"><img src="{{ branding.logo_dark_url or branding.logo_light_url }}" alt=""></picture>
+    {% endif %}
+    <span>{{ branding.brand_name }}</span>
+  </a>
   <nav>
+    <details class="language-menu">
+      <summary aria-label="Language" title="Language">
+        <span class="language-icon" aria-hidden="true">◎</span>
+        <span class="language-current">{% if session.user.preferred_language == 'en' %}English{% elif session.user.preferred_language == 'es' %}Spanish{% else %}System{% endif %}</span>
+        <span class="language-chevron" aria-hidden="true"></span>
+      </summary>
+      <form method="post" action="/profile/language" class="language-menu-options">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <input type="hidden" name="return_path" value="{{ language_return_path }}">
+        <button type="submit" name="preferred_language" value=""{% if not session.user.preferred_language %} class="selected" aria-current="true"{% endif %}><span>System</span><span class="language-check" aria-hidden="true">✓</span></button>
+        <button type="submit" name="preferred_language" value="en"{% if session.user.preferred_language == 'en' %} class="selected" aria-current="true"{% endif %}><span>English</span><span class="language-check" aria-hidden="true">✓</span></button>
+        <button type="submit" name="preferred_language" value="es"{% if session.user.preferred_language == 'es' %} class="selected" aria-current="true"{% endif %}><span>Spanish</span><span class="language-check" aria-hidden="true">✓</span></button>
+      </form>
+    </details>
     {% if settings.chat_portal_enabled %}<a href="/">Chat</a>{% endif %}
     {% if session.user.role in ['super_admin', 'administrator'] and settings.admin_panel_enabled %}<a href="/admin">Administration</a>{% endif %}
-    <a href="/profile/password">Profile</a>
+    <a href="{% if session.user.force_password_reset %}/profile/password{% else %}/profile{% endif %}">Profile</a>
     <form method="post" action="/logout" class="inline"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="link-button">Sign out</button></form>
   </nav>
 </header>
@@ -22,7 +43,6 @@
 <main class="{% block main_class %}page{% endblock %}">
   {% block content %}{% endblock %}
 </main>
-<footer>vLLM AI Platform {{ version }}</footer>
+<footer>{{ branding.footer_text }}</footer>
 </body>
 </html>
-

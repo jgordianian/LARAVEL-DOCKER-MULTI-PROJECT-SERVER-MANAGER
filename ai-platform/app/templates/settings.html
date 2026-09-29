@@ -1,3 +1,89 @@
 {% extends "base.html" %}
-{% block title %}Settings · AI Platform{% endblock %}
-{% block content %}<div class="admin-layout">{% include "admin_nav.html" %}<section><h1>Settings</h1><p class="muted">System-prompt precedence is client prompt (when permitted), user prompt, model prompt, then global prompt.</p><article class="panel"><form method="post" class="stack"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><label>Global system prompt<textarea name="global_system_prompt" rows="10">{{ global_system_prompt }}</textarea></label><label>API default model<select name="api_default_model"><option value="">Use system default</option>{% for model in models %}<option value="{{ model.alias }}" {% if api_default_model == model.alias %}selected{% endif %}>{{ model.alias }}</option>{% endfor %}</select></label><label>Portal default model<select name="portal_default_model"><option value="">Use system default</option>{% for model in models %}<option value="{{ model.alias }}" {% if portal_default_model == model.alias %}selected{% endif %}>{{ model.alias }}</option>{% endfor %}</select></label><button class="primary">Save settings</button></form></article><div class="alert warning">Domain, CORS, portal enablement, prompt logging and secrets are host-managed settings. Change them through “Manage vLLM AI Platform” so services are validated and recreated safely.</div></section></div>{% endblock %}
+{% block title %}Settings · {{ branding.browser_title }}{% endblock %}
+{% block content %}
+<div class="admin-layout">
+  {% include "admin_nav.html" %}
+  <section>
+    <h1>Settings</h1>
+    <p class="muted">Configure AI defaults, application branding and password-reset email.</p>
+    {% if notice %}<div class="alert success">{{ notice }}</div>{% endif %}
+    {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+
+    <article class="panel">
+      <h2>AI defaults</h2>
+      <p class="muted">System-prompt precedence is client prompt (when permitted), user prompt, model prompt, then global prompt.</p>
+      <form method="post" action="/admin/settings" class="stack">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label>Global system prompt<textarea name="global_system_prompt" rows="8">{{ global_system_prompt }}</textarea></label>
+        <div class="form-grid">
+          <label>API default model<select name="api_default_model"><option value="">Use system default</option>{% for model in models %}<option value="{{ model.alias }}" {% if api_default_model == model.alias %}selected{% endif %}>{{ model.alias }}</option>{% endfor %}</select></label>
+          <label>Portal default model<select name="portal_default_model"><option value="">Use system default</option>{% for model in models %}<option value="{{ model.alias }}" {% if portal_default_model == model.alias %}selected{% endif %}>{{ model.alias }}</option>{% endfor %}</select></label>
+        </div>
+        <button class="primary">Save AI settings</button>
+      </form>
+    </article>
+
+    <article class="panel">
+      <h2>Branding</h2>
+      <p class="muted">Customize the portal identity. Images are limited to 2 MB; logos accept PNG, JPEG or WebP, and the favicon accepts PNG or ICO.</p>
+      <form method="post" action="/admin/settings/branding" enctype="multipart/form-data" class="stack">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <div class="form-grid">
+          <label>Application name<input name="brand_name" value="{{ branding.brand_name }}" maxlength="80" required></label>
+          <label>Browser title<input name="browser_title" value="{{ branding.browser_title }}" maxlength="120" required></label>
+        </div>
+        <label>Footer text<input name="footer_text" value="{{ branding.footer_text }}" maxlength="160"></label>
+        <div class="brand-assets">
+          {% for field, label, url in [
+            ('logo_light', 'Logo for light backgrounds', branding.logo_light_url),
+            ('logo_dark', 'Logo for dark backgrounds', branding.logo_dark_url),
+            ('login_logo', 'Sign-in logo', branding.login_logo_url),
+            ('favicon', 'Favicon', branding.favicon_url)
+          ] %}
+          <div class="brand-asset">
+            <label>{{ label }}<input type="file" name="{{ field }}" accept="{% if field == 'favicon' %}image/png,image/x-icon,.ico{% else %}image/png,image/jpeg,image/webp{% endif %}"></label>
+            {% if url %}<div class="brand-preview"><img src="{{ url }}" alt="Current {{ label|lower }}"><span>Current asset</span></div><label class="checkbox"><input type="checkbox" name="remove_{{ field }}" value="true"> Remove current asset</label>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+        <button class="primary">Save branding</button>
+      </form>
+    </article>
+
+    <article class="panel">
+      <h2>Localization</h2>
+      <p class="muted">Choose the default language for guests and users who inherit the system preference.</p>
+      <form method="post" action="/admin/settings/localization" class="stack">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label>System default language<select name="system_language"><option value="en" {% if system_language == 'en' %}selected{% endif %}>English</option><option value="es" {% if system_language == 'es' %}selected{% endif %}>Spanish</option></select></label>
+        <button class="primary">Save localization</button>
+      </form>
+    </article>
+
+    <article class="panel">
+      <h2>SMTP and password recovery</h2>
+      <p class="muted">When enabled, the sign-in page offers password recovery using single-use links that expire after 30 minutes.</p>
+      <form method="post" action="/admin/settings/smtp" class="stack">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label class="checkbox"><input type="checkbox" name="smtp_enabled" value="true" {% if smtp.enabled %}checked{% endif %}> Enable password-reset email</label>
+        <div class="form-grid">
+          <label>SMTP host<input name="smtp_host" value="{{ smtp.host }}" placeholder="smtp.example.com"></label>
+          <label>SMTP port<input name="smtp_port" type="number" min="1" max="65535" value="{{ smtp.port }}"></label>
+          <label>Security<select name="smtp_security"><option value="starttls" {% if smtp.security == 'starttls' %}selected{% endif %}>STARTTLS</option><option value="ssl" {% if smtp.security == 'ssl' %}selected{% endif %}>TLS/SSL</option><option value="none" {% if smtp.security == 'none' %}selected{% endif %}>None</option></select></label>
+          <label>Username<input name="smtp_username" value="{{ smtp.username }}" autocomplete="off"></label>
+          <label>Password<input name="smtp_password" type="password" autocomplete="new-password" placeholder="{% if smtp_password_configured %}Configured — leave blank to keep{% else %}SMTP password{% endif %}"></label>
+          <label>Sender email<input name="smtp_from_email" type="email" value="{{ smtp.from_email }}" placeholder="no-reply@example.com"></label>
+          <label>Sender name<input name="smtp_from_name" value="{{ smtp.from_name }}" placeholder="{{ branding.brand_name }}"></label>
+          <label>Test recipient<input name="test_recipient" type="email" placeholder="{{ session.user.email }}"><small>Blank sends the test to your account.</small></label>
+        </div>
+        <div class="actions">
+          <button class="primary" name="action" value="save">Save SMTP settings</button>
+          <button class="secondary" name="action" value="test">Save and send test</button>
+        </div>
+      </form>
+    </article>
+
+    <div class="alert warning">Domain, CORS, portal enablement and prompt logging remain host-managed settings. Change them through “Manage vLLM AI Platform” so services are validated safely.</div>
+  </section>
+</div>
+{% endblock %}

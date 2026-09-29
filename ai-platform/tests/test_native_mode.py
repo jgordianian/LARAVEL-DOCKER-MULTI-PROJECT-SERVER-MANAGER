@@ -69,6 +69,13 @@ def test_native_example_defaults_to_private_external_exposure():
     assert "CLOUDFLARED_TOKEN_FILE=/opt/vllm-ai-platform/secrets/cloudflare_tunnel_token" in environment
 
 
+def test_native_cli_runs_as_the_service_account():
+    manager = (Path(__file__).resolve().parents[2] / "laravel-server-manager.sh").read_text(encoding="utf-8")
+    native_cli = manager.split("ai_cli() {", 1)[1].split("ai_env_value() {", 1)[0]
+
+    assert 'runuser -u "$AI_NATIVE_SERVICE_USER" -- "$python" -m app.cli "$@"' in native_cli
+
+
 def test_curated_catalog_contains_pinned_current_stable_models():
     platform_root = Path(__file__).resolve().parents[1]
     catalog = json.loads((platform_root / "config" / "model-catalog.json").read_text(encoding="utf-8"))
@@ -78,6 +85,9 @@ def test_curated_catalog_contains_pinned_current_stable_models():
     assert catalog["validated_vllm_version"] == "0.30.0"
     assert {"Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B"} <= {model["model_id"] for model in models}
     assert len({model["key"] for model in models}) == len(models)
+    qwen3_models = [model for model in models if model["model_id"].startswith("Qwen/Qwen3")]
+    assert qwen3_models
+    assert all(model.get("reasoning_parser") == "qwen3" for model in qwen3_models)
     for model in models:
         assert model["release_channel"] == "stable"
         assert re.fullmatch(r"[0-9a-f]{40}", model["revision"])

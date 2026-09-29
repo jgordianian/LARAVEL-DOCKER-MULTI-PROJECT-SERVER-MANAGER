@@ -34,6 +34,8 @@ class User(TimestampMixin, Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     default_model_alias: Mapped[str | None] = mapped_column(String(160))
     system_prompt: Mapped[str | None] = mapped_column(Text)
+    reasoning_effort: Mapped[str] = mapped_column(String(16), default="medium", nullable=False)
+    preferred_language: Mapped[str | None] = mapped_column(String(8))
 
 
 class WebSession(Base):
@@ -47,6 +49,19 @@ class WebSession(Base):
     user_agent: Mapped[str] = mapped_column(String(512), default="", nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    user: Mapped[User] = relationship()
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    requested_ip: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     user: Mapped[User] = relationship()
 
 
@@ -304,4 +319,3 @@ class BackupRecord(Base):
     checksum: Mapped[str | None] = mapped_column(String(128))
     schema_version: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String(32), default="complete")
-

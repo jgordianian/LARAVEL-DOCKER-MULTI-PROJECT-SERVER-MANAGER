@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from app import gateway
 from app.capabilities import normalize_capabilities, normalize_endpoints
 from app.config import get_settings
-from app.models import APIKey, ModelInstance, ModelRecord, ServiceAccount, UsageRecord
+from app.models import APIKey, ModelInstance, ModelPermission, ModelRecord, ServiceAccount, UsageRecord, User
 from app.policy import PolicyDenied, require_endpoint_access
 from app.security import generate_api_key
 
@@ -95,6 +95,51 @@ def test_coding_capability_metadata_and_endpoint_validation():
         normalize_capabilities(["pretend-capability"])
     with pytest.raises(ValueError, match="unsupported API endpoints"):
         normalize_endpoints(["/execute-shell"])
+
+
+def test_super_admin_can_use_agentic_models_without_explicit_permissions(db):
+    super_admin = User(
+        name="Super Admin",
+        email="super-admin@example.com",
+        password_hash="unused-in-policy-test",
+        role="super_admin",
+    )
+    regular_user = User(
+        name="Regular User",
+        email="regular-agentic@example.com",
+        password_hash="unused-in-policy-test",
+        role="user",
+    )
+    coder = ModelRecord(
+        hf_model_id="org/agentic",
+        alias="omnivis-agentic",
+        download_status="downloaded",
+        capabilities=["chat", "coding", "agentic"],
+    )
+    db.add_all([super_admin, regular_user, coder])
+    db.flush()
+
+    assert gateway._user_model_allowed(db, super_admin.id, coder, coding_requested=True)
+    assert not gateway._user_model_allowed(db, regular_user.id, coder, coding_requested=True)
+
+    db.add(
+        ModelPermission(
+            subject_type="user",
+            subject_id=regular_user.id,
+            model_id=coder.id,
+            can_chat=True,
+            can_use_tools=True,
+            can_code=True,
+        )
+    )
+    db.flush()
+    assert gateway._user_model_allowed(
+        db,
+        regular_user.id,
+        coder,
+        tools_requested=True,
+        coding_requested=True,
+    )
 
 
 def test_developer_and_production_models_are_logically_separated(db):
@@ -212,6 +257,74 @@ def test_coding_ip_endpoint_tools_and_responses_passthrough(db, monkeypatch):
     assert usage.total_tokens == 13
 
 
+@pytest.mark.parametrize(
+    ("effort", "budget"),
+    [("low", 2_048), ("medium", 4_096), ("high", 8_192)],
+)
+def test_responses_reasoning_effort_maps_to_vllm_budget(db, monkeypatch, effort, budget):
+    _, _, _, _, keys = coding_fixture(db)
+    captured = {}
+    original_async_client = httpx.AsyncClient
+
+    async def upstream(request):
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "resp_reasoning", "output": [], "usage": {}})
+
+    monkeypatch.setattr(
+        gateway.httpx,
+        "AsyncClient",
+        lambda **kwargs: original_async_client(transport=httpx.MockTransport(upstream), timeout=kwargs.get("timeout")),
+    )
+    response = TestClient(gateway.app, client=("198.51.100.7", 50000)).post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {keys['coding']}"},
+        json={"model": "omnivis-coder", "input": "think", "reasoning": {"effort": effort}},
+    )
+    assert response.status_code == 200
+    assert captured["payload"]["reasoning"]["effort"] == effort
+    assert captured["payload"]["thinking_token_budget"] == budget
+
+
+def test_reasoning_none_disables_thinking_without_budget(db, monkeypatch):
+    _, _, _, _, keys = coding_fixture(db)
+    captured = {}
+    original_async_client = httpx.AsyncClient
+
+    async def upstream(request):
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "resp_direct", "output": [], "usage": {}})
+
+    monkeypatch.setattr(
+        gateway.httpx,
+        "AsyncClient",
+        lambda **kwargs: original_async_client(transport=httpx.MockTransport(upstream), timeout=kwargs.get("timeout")),
+    )
+    response = TestClient(gateway.app, client=("198.51.100.7", 50000)).post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {keys['coding']}"},
+        json={
+            "model": "omnivis-coder",
+            "input": "answer directly",
+            "reasoning": {"effort": "none"},
+            "thinking_token_budget": 99_999,
+        },
+    )
+    assert response.status_code == 200
+    assert captured["payload"]["reasoning"]["effort"] == "none"
+    assert "thinking_token_budget" not in captured["payload"]
+
+
+def test_unknown_reasoning_effort_is_rejected(db):
+    _, _, _, _, keys = coding_fixture(db)
+    response = TestClient(gateway.app, client=("198.51.100.7", 50000)).post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {keys['coding']}"},
+        json={"model": "omnivis-coder", "input": "think", "reasoning": {"effort": "ultra"}},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_reasoning_effort"
+
+
 def test_coding_chat_streaming_and_tool_calls_are_preserved(db, monkeypatch):
     _, _, _, development, keys = coding_fixture(db)
     original_async_client = httpx.AsyncClient
@@ -282,4 +395,3 @@ def test_usage_accounting_distinguishes_production_and_coding(db, monkeypatch):
     assert by_model["omnivis-coder"].service_account_id == development.id
     assert by_model["omnivis-general"].endpoint == "/v1/chat/completions"
     assert by_model["omnivis-coder"].endpoint == "/v1/responses"
-

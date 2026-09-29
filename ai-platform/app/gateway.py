@@ -41,6 +41,12 @@ redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
 REQUESTS = Counter("ai_gateway_requests_total", "Gateway requests", ["endpoint", "status"])
 LATENCY = Histogram("ai_gateway_latency_seconds", "Gateway latency", ["endpoint"])
 
+REASONING_TOKEN_BUDGETS = {
+    "low": 2_048,
+    "medium": 4_096,
+    "high": 8_192,
+}
+
 app = FastAPI(title="vLLM AI Gateway", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
 if settings.cors_origins:
     app.add_middleware(
@@ -180,6 +186,10 @@ def _user_model_allowed(
     tools_requested: bool = False,
     coding_requested: bool = False,
 ) -> bool:
+    user = db.get(User, user_id)
+    if user is not None and user.enabled and user.role == "super_admin":
+        return True
+
     permissions = db.scalars(
         select(ModelPermission).where(ModelPermission.subject_type == "user", ModelPermission.subject_id == user_id)
     ).all()
@@ -240,6 +250,31 @@ def _model_supports(model: ModelRecord, endpoint: str) -> bool:
         supported = runtime_support.get("endpoints", [])
         return f"/v1/{endpoint}" in supported
     return True
+
+
+def _apply_reasoning_budget(payload: dict[str, Any], endpoint: str) -> None:
+    """Translate OpenAI reasoning effort into vLLM's enforceable token budget."""
+    effort: Any = None
+    if endpoint == "responses":
+        reasoning = payload.get("reasoning")
+        if isinstance(reasoning, dict):
+            effort = reasoning.get("effort")
+    elif endpoint == "chat/completions":
+        effort = payload.get("reasoning_effort")
+    if effort is None:
+        return
+    if not isinstance(effort, str) or effort not in {"none", *REASONING_TOKEN_BUDGETS}:
+        raise PolicyDenied(
+            "invalid_reasoning_effort",
+            "Reasoning effort must be one of: none, low, medium, high.",
+            400,
+        )
+    # `none` is handled by vLLM's enable_thinking=False translation. Do not
+    # attach a zero-token budget because no reasoning block should be opened.
+    if effort == "none":
+        payload.pop("thinking_token_budget", None)
+        return
+    payload["thinking_token_budget"] = REASONING_TOKEN_BUDGETS[effort]
 
 
 def _default_model(db: Session) -> str | None:
@@ -436,6 +471,7 @@ async def proxy(request: Request, db: Session, endpoint: str):
         scope = _scope_for(endpoint)
         authorize_model(db, principal, model, scope, f"/v1/{endpoint}", bool(payload.get("tools")))
         _apply_system_prompt(db, payload, model, principal)
+        _apply_reasoning_budget(payload, endpoint)
         estimated = approximate_tokens(payload)
         limit_key = _effective_api_key(db, principal.api_key) if principal.api_key else _virtual_user_key(db, principal.user_id or 0)
         if estimated > limit_key.max_input_tokens:
@@ -556,4 +592,3 @@ async def proxy(request: Request, db: Session, endpoint: str):
         if client:
             await client.aclose()
         raise
-

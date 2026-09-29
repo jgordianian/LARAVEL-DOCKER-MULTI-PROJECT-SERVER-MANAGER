@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Profile · {{ branding.browser_title }}{% endblock %}
+{% block content %}
+<section class="profile-page">
+  <div class="heading">
+    <div><p class="eyebrow">YOUR ACCOUNT</p><h1>Profile settings</h1><p class="muted">Manage your identity and personal AI preferences.</p></div>
+  </div>
+  {% if notice %}<div class="alert success">{{ notice }}</div>{% endif %}
+  {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+
+  <article class="panel">
+    <h2>Personal information</h2>
+    <form method="post" action="/profile" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <div class="form-grid">
+        <label>Display name<input name="name" value="{{ profile_values.name }}" maxlength="160" autocomplete="name" required></label>
+        <label>Email address<input name="email" type="email" value="{{ profile_values.email }}" maxlength="320" autocomplete="email" required></label>
+        <label>Preferred language<select name="preferred_language"><option value="" {% if not profile_values.preferred_language %}selected{% endif %}>Inherit system default</option><option value="en" {% if profile_values.preferred_language == 'en' %}selected{% endif %}>English</option><option value="es" {% if profile_values.preferred_language == 'es' %}selected{% endif %}>Spanish</option></select></label>
+        <label>Default chat model<select name="default_model_alias"><option value="">Use portal default</option>{% if profile_values.default_model_alias and not current_model_available %}<option value="{{ profile_values.default_model_alias }}" selected>{{ profile_values.default_model_alias }} (unavailable)</option>{% endif %}{% for model in models %}<option value="{{ model.alias }}" {% if profile_values.default_model_alias == model.alias %}selected{% endif %}>{{ model.alias }}</option>{% endfor %}</select></label>
+        <label>Default reasoning level<select name="reasoning_effort"><option value="none" {% if profile_values.reasoning_effort == 'none' %}selected{% endif %}>None</option><option value="low" {% if profile_values.reasoning_effort == 'low' %}selected{% endif %}>Low</option><option value="medium" {% if profile_values.reasoning_effort == 'medium' %}selected{% endif %}>Medium</option><option value="high" {% if profile_values.reasoning_effort == 'high' %}selected{% endif %}>High</option></select></label>
+        <label>Current password to change email<input type="password" name="current_password" autocomplete="current-password"><small>Required only when changing your email address.</small></label>
+      </div>
+      <label>Personal system prompt<textarea name="system_prompt" rows="5" maxlength="12000" placeholder="Optional instructions applied to your conversations.">{{ profile_values.system_prompt }}</textarea></label>
+      <button class="primary">Save profile</button>
+    </form>
+  </article>
+
+  <article class="panel">
+    <h2>Account</h2>
+    <dl class="facts">
+      <dt>Role</dt><dd>{{ session.user.role|replace('_', ' ')|title }}</dd>
+      <dt>Last sign-in</dt><dd>{{ session.user.last_login_at or 'Never' }}</dd>
+    </dl>
+  </article>
+
+  <article class="panel">
+    <h2>Security</h2>
+    <p class="muted">Change your password without leaving your profile.</p>
+    <form method="post" action="/profile/password" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <input type="hidden" name="return_path" value="/profile">
+      <label>Current password<input type="password" name="current_password" autocomplete="current-password" required></label>
+      <div class="form-grid">
+        <label>New password<input type="password" name="new_password" autocomplete="new-password" minlength="12" required></label>
+        <label>Confirm new password<input type="password" name="confirm_password" autocomplete="new-password" minlength="12" required></label>
+      </div>
+      <p class="small muted">Use at least 12 characters and three of: uppercase, lowercase, number, symbol.</p>
+      <button class="primary">Change password</button>
+    </form>
+  </article>
+</section>
+{% endblock %}

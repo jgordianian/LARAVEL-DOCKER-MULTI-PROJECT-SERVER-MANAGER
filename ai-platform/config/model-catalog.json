@@ -42,7 +42,7 @@
       "dtype": "auto",
       "quantization": "awq",
       "tool_calling": false,
-      "reasoning_parser": "deepseek_r1",
+      "reasoning_parser": "qwen3",
       "requires_hf_token": false
     },
     {
@@ -62,7 +62,7 @@
       "dtype": "auto",
       "quantization": "awq",
       "tool_calling": false,
-      "reasoning_parser": "deepseek_r1",
+      "reasoning_parser": "qwen3",
       "requires_hf_token": false
     },
     {
