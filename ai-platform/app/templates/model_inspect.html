@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · {{ model.alias }} · AI Platform{% endblock %}
+{% block content %}
+<div class="admin-layout">
+  {% include "admin_nav.html" %}
+  <section>
+    <p class="eyebrow">MODEL INSPECTION</p>
+    <div class="heading">
+      <div><h1>{{ title }}</h1><p class="muted">{{ model.alias }} · {{ model.hf_model_id }}</p></div>
+      <a class="secondary" href="/admin/models">Back to models</a>
+    </div>
+
+    {% if error %}
+    <div class="alert error"><strong>{{ title }} unavailable.</strong> {{ error }}</div>
+    {% elif view == 'compatibility' and structured %}
+    <div class="cards">
+      <article><span>Result</span><strong>{{ structured.label or ('SAFE' if structured.safe else 'BLOCKED') }}</strong></article>
+      <article><span>Estimated requirement</span><strong>{{ structured.estimated_vram_gb or 'n/a' }} GB</strong></article>
+      <article><span>Assigned VRAM</span><strong>{{ structured.assigned_vram_gb or 'n/a' }} GB</strong></article>
+      <article><span>Safe available</span><strong>{{ structured.safe_available_vram_gb or 'n/a' }} GB</strong></article>
+    </div>
+    {% if structured.estimate_notice %}<div class="alert warning">{{ structured.estimate_notice }}</div>{% endif %}
+    <article class="panel"><h2>Compatibility details</h2><pre class="inspection-output">{{ content }}</pre></article>
+    {% else %}
+    <article class="panel">
+      <h2>{{ 'Prometheus exposition' if view == 'metrics' else 'Latest sanitized runtime entries' }}</h2>
+      <p class="muted">{{ 'Metrics are shown in their original names and values for operational troubleshooting.' if view == 'metrics' else 'Secrets are redacted and the newest entries appear at the bottom.' }}</p>
+      <pre class="inspection-output">{{ content or 'No data is available yet.' }}</pre>
+    </article>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

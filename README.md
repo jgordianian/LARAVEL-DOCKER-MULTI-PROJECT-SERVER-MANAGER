@@ -22,6 +22,7 @@ The script creates one shared Nginx reverse proxy with Certbot, then creates one
 - RAM/CPU-based tuning when projects are created or updated
 - Project ownership and permission repair on create/update
 - Automatic Laravel scheduler cron entries for Laravel projects
+- Optional production vLLM platform with a private multi-model runtime, OpenAI-compatible Gateway, administration panel, authenticated chat portal, GPU-aware capacity controls, API keys, quotas, IP allowlists, usage accounting, hardware-change detection, portable backup/restore, and isolated private coding-agent/IDE access
 
 ## Requirements
 
@@ -86,6 +87,20 @@ Open the VNC manager directly:
 sudo /root/laravel-server-manager.sh manage-vnc
 ```
 
+Inspect and control the AI platform non-interactively:
+
+```bash
+sudo /root/laravel-server-manager.sh ai-status
+sudo /root/laravel-server-manager.sh ai-hardware
+sudo /root/laravel-server-manager.sh ai-gpu-info
+sudo /root/laravel-server-manager.sh ai-models
+sudo /root/laravel-server-manager.sh ai-start
+sudo /root/laravel-server-manager.sh ai-stop
+sudo /root/laravel-server-manager.sh ai-restart
+sudo /root/laravel-server-manager.sh ai-diagnostics
+sudo /root/laravel-server-manager.sh ai-backup
+```
+
 ## Project Profiles
 
 | Profile | Use for | Managed services |
@@ -104,6 +119,18 @@ sudo /root/laravel-server-manager.sh manage-vnc
 | `/var/www/projects/<project>` | Project files and Compose stack |
 | `/var/www/projects/<project>/.project-meta` | Saved project settings |
 | `/var/backups/laravel-projects/<project>` | Project backups |
+| `/opt/vllm-ai-platform` | AI services, configuration, database, cache, model registry and weights |
+| `/var/backups/vllm-ai-platform` | Restricted AI configuration/database backups |
+
+## vLLM / AI Platform
+
+Choose `22) Manage vLLM / AI Platform` to install or operate the optional subsystem. On a normal VPS it reuses the existing Nginx/Certbot stack and `laravel-shared` network; it does not publish PostgreSQL, Redis, controller, or vLLM ports on the host. The public HTTPS domain routes `/v1/` to the authenticated Gateway and the remaining paths to the optional administration/chat application.
+
+When a Vast.ai or similar CUDA container has no Docker daemon, the same manager can install an isolated native runtime instead. Native mode keeps the provider Jupyter environment unchanged, uses a dedicated platform virtual environment, a separate vLLM virtual environment, SQLite plus loopback-only Redis, and loopback-only HTTP/model listeners. Start it directly with `./laravel-server-manager.sh ai-install-native` or accept the native fallback offered by the normal installer.
+
+Native installations can be published through `21) External domain / Cloudflare Tunnel` in the AI Platform menu (or `./laravel-server-manager.sh ai-external`). The workflow stores the remotely-managed tunnel connector token in a protected file, runs `cloudflared` under the platform Supervisor, enables secure cookies/CORS for the chosen panel hostname, optionally publishes a separate API hostname, reports public health, exposes logs, and can return the platform to private SSH-only access. Cloudflare Published application routes must map the panel hostname to `http://localhost:18080` and the optional API hostname to `http://localhost:8000`; Jupyter and raw model ports are never included.
+
+The AI assets are kept in the maintainable [`ai-platform`](./ai-platform) directory rather than embedded in the Bash script. Keep that directory beside `laravel-server-manager.sh` when copying the manager to a server. Full architecture, GPU requirements, first-install, model operations, API integration, upgrades, migration, backup/restore, rollback, security, and troubleshooting instructions are in the [AI Platform operations guide](./ai-platform/README.md). Private Codex-compatible, VS Code and Continue setup is in the [coding-agent and IDE guide](./ai-platform/CODING-AGENTS.md). Existing provider-managed Jupyter/JupyterLab environments—including Vast.ai Jupyter CUDA images—are detected, preserved and exposed through read-only diagnostics; secure Gateway test notebooks can be generated without embedded credentials. See the [Jupyter integration guide](./ai-platform/JUPYTER.md).
 
 ## Project Layout
 

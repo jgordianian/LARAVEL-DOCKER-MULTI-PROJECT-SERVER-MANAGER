@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}Models · AI Platform{% endblock %}
+{% block content %}
+<div class="admin-layout">
+  {% include "admin_nav.html" %}
+  <section>
+    <h1>Models & instances</h1>
+    <p class="muted">Downloaded weights consume disk. Only active, ready instances consume GPU memory and receive traffic.</p>
+    <form method="get" class="actions">
+      <label>Capability <select name="capability"><option value="">All capabilities</option>{% for item in capability_options %}<option value="{{ item }}" {% if selected_capability == item %}selected{% endif %}>{{ item|replace('_', ' ')|title }}</option>{% endfor %}</select></label>
+      <button>Filter models</button>
+      {% if selected_capability %}<a class="secondary" href="/admin/models">Clear</a>{% endif %}
+    </form>
+    <div class="cards">
+      <article><span>Tracked model storage</span><strong>{{ '%.2f'|format(storage_used / 1073741824) }} GB</strong></article>
+      <article><span>Filesystem free</span><strong>{{ ('%.2f'|format(storage_free / 1073741824) ~ ' GB') if storage_free is not none else 'Unavailable' }}</strong></article>
+      <article><span>Required reserve</span><strong>{{ '%.0f'|format(storage_reserve / 1073741824) }} GB</strong></article>
+    </div>
+    <article class="panel">
+      <h2>Register model</h2>
+      <form method="post" class="form-grid">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label>Hugging Face model ID<input name="hf_model_id" placeholder="organization/model" required></label>
+        <label>Revision<input name="revision" value="main"></label>
+        <label>Public API alias<input name="alias" placeholder="omnivis-general" pattern="[a-z0-9][a-z0-9._-]*" required></label>
+        <label>Capabilities <small>general, chat, coding, agentic, reasoning, tool_calling, responses, embeddings, vision</small><input name="capabilities" value="chat,completions"></label>
+        <label>Estimated weight GB<input name="estimated_weight_gb" type="number" min="0" step="0.1" value="0"></label>
+        <label>Max context<input name="max_model_len" type="number" min="256" value="4096"></label>
+        <label>Quantization<input name="quantization" placeholder="awq, gptq, fp8, ..."></label>
+        <label>dtype<input name="dtype" value="auto"></label>
+        <label class="checkbox"><input type="checkbox" name="tool_calling" value="true"> Enable compatible tool calling</label>
+        <label>Tool-call parser<input name="tool_call_parser"></label>
+        <label class="checkbox"><input type="checkbox" name="trust_remote_code" value="true"> I explicitly accept remote model code</label>
+        <button class="primary">Register model</button>
+      </form>
+    </article>
+    <div class="model-grid">
+      {% for model in models %}
+      {% set usage = usage_map.get(model.alias, {}) %}
+      {% set plan = activation_plans.get(model.id, {}) %}
+      <article class="panel model">
+        <div class="heading"><div><h2>{{ model.alias }}</h2><small>{{ model.hf_model_id }} @ {{ model.revision }}</small></div>{% if model.is_default %}<span class="pill">Default</span>{% endif %}</div>
+        <p>{% for capability in capability_map.get(model.id, []) %}<span class="pill">{{ capability|replace('_', ' ')|title }}</span> {% endfor %}</p>
+        <dl class="facts">
+          <dt>Weights</dt><dd>{{ model.download_status }}{% if model.size_bytes %} · {{ '%.2f'|format(model.size_bytes / 1073741824) }} GB{% endif %}</dd>
+          <dt>Revision</dt><dd>{{ model.revision }}</dd>
+          <dt>Quantization</dt><dd>{{ model.quantization or 'none / model default' }}</dd>
+          <dt>Runtime</dt><dd>{{ model.instance.status if model.instance else 'not configured' }}</dd>
+          <dt>GPU(s)</dt><dd>{{ model.instance.gpu_assignment|join(', ') if model.instance and model.instance.gpu_assignment else 'Auto' }}</dd>
+          <dt>Context</dt><dd>{{ model.max_model_len }}</dd>
+          <dt>Capabilities</dt><dd>{{ capability_map.get(model.id, [])|join(', ') }}</dd>
+          <dt>Estimated VRAM</dt><dd>{{ model.instance.estimated_vram_gb if model.instance and model.instance.estimated_vram_gb else 'not calculated' }} GB</dd>
+          <dt>Performance</dt><dd>{{ model.instance.performance_profile if model.instance else 'not configured' }}</dd>
+          <dt>Permitted API accounts</dt><dd>{{ account_map.get(model.alias, [])|join(', ') or 'None' }}</dd>
+          <dt>Recorded usage</dt><dd>{{ usage.get('requests', 0) }} requests · {{ usage.get('tokens', 0) }} tokens</dd>
+          <dt>Responses API</dt><dd>{% set runtime_api = model.config.get('runtime_api_support', {}) %}{% if 'responses' not in capability_map.get(model.id, []) %}Not configured{% elif runtime_api.get('verified') %}{{ 'Verified' if '/v1/responses' in runtime_api.get('endpoints', []) else 'Unsupported by active runtime' }}{% else %}Configured; runtime not yet verified{% endif %}</dd>
+          <dt>Last used</dt><dd>{{ model.last_used_at or 'never' }}</dd>
+        </dl>
+        <div class="actions">
+          <a class="secondary" href="/admin/models/{{ model.id }}/inspect/compatibility">Compatibility</a>
+          <a class="secondary" href="/admin/models/{{ model.id }}/inspect/metrics">Metrics</a>
+          <a class="secondary" href="/admin/models/{{ model.id }}/inspect/logs">Logs</a>
+          <form method="post" action="/admin/models/{{ model.id }}/action/download"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button>{{ 'Update / redownload' if model.download_status == 'downloaded' else 'Download / resume' }}</button></form>
+          {% if model.instance and model.instance.status == 'ready' %}
+            <form method="post" action="/admin/models/{{ model.id }}/action/deactivate"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button>Deactivate</button></form>
+            <form method="post" action="/admin/models/{{ model.id }}/action/restart"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button>Restart</button></form>
+          {% elif model.download_status == 'downloaded' and not plan.get('requires_switch') %}
+            <form method="post" action="/admin/models/{{ model.id }}/action/activate"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="primary" {% if plan and not plan.get('can_activate') %}disabled title="Current hardware is incompatible"{% endif %}>Activate</button></form>
+          {% endif %}
+          <form method="post" action="/admin/models/{{ model.id }}/default"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button>Set default</button></form>
+        </div>
+        {% if model.download_status == 'downloaded' and plan.get('requires_switch') %}
+        <div class="alert warning">
+          <strong>Capacity switch required.</strong>
+          Estimated requirement: {{ plan.get('estimated_required_vram_gb') }} GB. Current safe free capacity: {{ plan.get('safe_available_vram_gb') }} GB; after stopping conflicts: {{ plan.get('safe_available_after_switch_gb') }} GB.
+          Currently active: {% for conflict in plan.get('active_conflicts', []) %}{{ conflict.alias }} ({{ conflict.estimated_vram_gb }} GB){% if not loop.last %}, {% endif %}{% endfor %}.
+          The downloaded weights and configuration of those models are preserved.
+          <form method="post" action="/admin/models/{{ model.id }}/action/switch" class="actions"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="primary">Stop listed model(s) and activate {{ model.alias }}</button><a class="secondary" href="/admin/models">Cancel</a></form>
+        </div>
+        {% elif model.download_status == 'downloaded' and plan and not plan.get('can_activate') %}
+        <div class="alert error"><strong>Activation blocked.</strong> {{ plan.get('reason', plan.get('label', 'Current hardware cannot safely host this model.')) }}</div>
+        {% endif %}
+        {% if model.instance %}
+        <details>
+          <summary>Configure inactive model</summary>
+          <form method="post" action="/admin/models/{{ model.id }}/configure" class="form-grid">
+            <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+            <label>Public alias<input name="alias" value="{{ model.alias }}" required></label>
+            <label>Capabilities<input name="capabilities" value="{{ capability_map.get(model.id, [])|join(',') }}"></label>
+            <label class="checkbox"><input type="checkbox" name="tool_calling" value="true" {% if model.tool_calling %}checked{% endif %}> Enable compatible tool calling</label>
+            <label>Tool-call parser<input name="tool_call_parser" value="{{ model.tool_call_parser or '' }}"></label>
+            <label>GPU indexes <small>comma-separated; blank auto</small><input name="gpu_assignment" value="{{ model.instance.gpu_assignment|join(',') }}"></label>
+            <label>Tensor parallel<input name="tensor_parallel_size" type="number" min="1" value="{{ model.instance.tensor_parallel_size }}"></label>
+            <label>Pipeline parallel<input name="pipeline_parallel_size" type="number" min="1" value="{{ model.instance.pipeline_parallel_size }}"></label>
+            <label>Maximum context<input name="max_model_len" type="number" min="256" value="{{ model.max_model_len }}"></label>
+            <label>Maximum sequences<input name="max_num_seqs" type="number" min="1" value="{{ model.instance.max_num_seqs }}"></label>
+            <label>GPU memory target<input name="gpu_memory_utilization" type="number" min="0.1" max="0.95" step="0.01" value="{{ model.instance.gpu_memory_utilization }}"></label>
+            <label>CPU offload GB<input name="cpu_offload_gb" type="number" min="0" step="0.1" value="{{ model.instance.cpu_offload_gb }}"></label>
+            <label>Swap space GB<input name="swap_space_gb" type="number" min="0" step="0.1" value="{{ model.instance.swap_space_gb }}"></label>
+            <label>Performance profile<select name="performance_profile">{% for profile in ['AUTO','CONSERVATIVE','BALANCED','PERFORMANCE','MAXIMUM','CUSTOM'] %}<option {% if model.instance.performance_profile == profile %}selected{% endif %}>{{ profile }}</option>{% endfor %}</select></label>
+            <label>Per-model system prompt<textarea name="system_prompt">{{ model.system_prompt or '' }}</textarea></label>
+            <label>Custom chat template<textarea name="chat_template">{{ model.chat_template or '' }}</textarea></label>
+            <button {% if model.instance.desired_active %}disabled title="Deactivate first"{% endif %}>Validate and save</button>
+          </form>
+        </details>
+        {% endif %}
+        {% if model.instance and model.instance.last_error %}<details><summary>Last runtime error</summary><pre>{{ model.instance.last_error }}</pre></details>{% endif %}
+        <details>
+          <summary>Delete model</summary>
+          <div class="actions">
+            <form method="post" action="/admin/models/{{ model.id }}/action/delete-record"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="danger" {% if model.instance and model.instance.desired_active %}disabled{% endif %}>Delete record; keep weights</button></form>
+            <form method="post" action="/admin/models/{{ model.id }}/action/delete-weights" class="form-grid"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><label>Type DELETE<input name="confirmation" pattern="DELETE" required></label><button class="danger" {% if model.instance and model.instance.desired_active %}disabled{% endif %}>Delete record and weights</button></form>
+          </div>
+        </details>
+      </article>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% endblock %}

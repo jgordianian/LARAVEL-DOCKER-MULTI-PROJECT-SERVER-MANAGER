@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Jupyter integration · AI Platform{% endblock %}
+{% block content %}
+<div class="admin-layout">
+  {% include "admin_nav.html" %}
+  <section>
+    <h1>Jupyter integration</h1>
+    <p class="muted">Read-only integration status. Jupyter is optional and remains independent from the Gateway, Model Manager and vLLM lifecycle.</p>
+    {% if environment %}
+      {% set jupyter = environment.get('jupyter', {}) %}
+      {% set capabilities = environment.get('capabilities', {}) %}
+      {% set cuda = environment.get('cuda', {}) %}
+      {% set pytorch = environment.get('pytorch', {}) %}
+      <div class="cards">
+        <article><span>Environment</span><strong>{{ environment.get('environment_type', 'UNKNOWN')|replace('_', ' ') }}</strong></article>
+        <article><span>Jupyter</span><strong>{{ 'Running' if jupyter.get('running') else 'Detected' if jupyter.get('detected') else 'Not detected' }}</strong></article>
+        <article><span>Management</span><strong>{{ jupyter.get('management', 'UNKNOWN')|replace('_', ' ') }}</strong></article>
+        <article><span>Provider</span><strong>{{ environment.get('provider', 'Unknown') }}</strong></article>
+      </div>
+      {% if jupyter.get('management') == 'PROVIDER_MANAGED' %}<div class="alert success"><strong>Preserve and reuse.</strong> Provider startup, authentication, proxying, TLS and configuration are not managed by this platform.</div>{% endif %}
+      {% for listener in jupyter.get('internal_listeners', []) %}{% if listener.get('scope') == 'ALL_INTERFACES' %}<div class="alert warning"><strong>Security review:</strong> detected Jupyter port {{ listener.get('port') }} on all interfaces. Verify provider authentication and access policy; diagnostics will not reconfigure it.</div>{% endif %}{% endfor %}
+      <div class="grid-2">
+        <article class="panel"><h2>Environment</h2><dl class="facts">
+          <dt>Runtime</dt><dd>{{ environment.get('runtime', {}).get('kind', 'unknown') }}</dd>
+          <dt>Container runtime</dt><dd>{{ environment.get('runtime', {}).get('container_runtime') or 'not detected' }}</dd>
+          <dt>Container image</dt><dd>{{ environment.get('runtime', {}).get('image') or 'not discoverable' }}</dd>
+          <dt>Python</dt><dd>{{ environment.get('python', {}).get('version', 'unknown') }} · {{ environment.get('python', {}).get('executable', 'unknown') }}</dd>
+          <dt>CUDA visible</dt><dd>{{ 'YES' if cuda.get('visible') else 'NO' }}{% if cuda.get('version') %} · {{ cuda.get('version') }}{% endif %}</dd>
+          <dt>GPU devices</dt><dd>{{ cuda.get('device_count', 0) }}</dd>
+          <dt>PyTorch</dt><dd>{{ 'AVAILABLE' if pytorch.get('available') else 'NOT AVAILABLE' }}</dd>
+          <dt>PyTorch GPU</dt><dd>{{ pytorch.get('gpu_status', 'NOT TESTED') }}</dd>
+        </dl></article>
+        <article class="panel"><h2>Jupyter</h2><dl class="facts">
+          <dt>JupyterLab</dt><dd>{{ 'AVAILABLE' if jupyter.get('lab_available') else 'NOT DETECTED' }}</dd>
+          <dt>Process count</dt><dd>{{ jupyter.get('process_count', 0) }}</dd>
+          <dt>Effective user</dt><dd>{{ jupyter.get('effective_user') or 'unknown' }}</dd>
+          <dt>Runtime files</dt><dd>{{ jupyter.get('runtime_files_detected', 0) }} detected; contents not read</dd>
+          <dt>Internal listeners</dt><dd>{% for item in jupyter.get('internal_listeners', []) %}{{ item.get('address') }}:{{ item.get('port') }} ({{ item.get('scope') }}){% if not loop.last %}, {% endif %}{% else %}not discoverable{% endfor %}</dd>
+          <dt>Provider access</dt><dd>{{ jupyter.get('provider_access', 'Not detected') }}</dd>
+        </dl></article>
+      </div>
+      <article class="panel"><h2>Host capability adaptation</h2><dl class="facts">
+        <dt>Root privileges</dt><dd>{{ 'YES' if capabilities.get('root_privileges') else 'NO' }}</dd>
+        <dt>Docker daemon</dt><dd>{{ 'YES' if capabilities.get('docker_daemon_available') else 'NO' }}</dd>
+        <dt>systemd</dt><dd>{{ 'YES' if capabilities.get('systemd_available') else 'NO' }}</dd>
+        <dt>CAP_SYS_ADMIN</dt><dd>{{ 'YES' if capabilities.get('cap_sys_admin') else 'NO' }}</dd>
+        <dt>Privileged container</dt><dd>{{ 'YES' if capabilities.get('privileged_container') else 'NO' }}</dd>
+        <dt>Host firewall management</dt><dd>{{ 'YES' if capabilities.get('host_firewall_management') else 'NO' }}</dd>
+        <dt>LUKS block devices</dt><dd>{{ 'YES' if capabilities.get('luks_block_devices') else 'NO' }}</dd>
+        <dt>Policy</dt><dd>{{ jupyter.get('action', 'UNKNOWN')|replace('_', ' ') }}</dd>
+      </dl></article>
+    {% else %}
+      <div class="alert warning">Environment snapshot unavailable. Run Jupyter Status from the root AI Platform manager.</div>
+    {% endif %}
+    <article class="panel"><h2>Active Gateway models</h2>{% for model in active_models %}<span class="pill good">{{ model.alias }}</span> {% else %}<p class="muted">No active ready models.</p>{% endfor %}<p class="muted">Notebooks call these models through the secured Gateway; they do not launch independent vLLM instances.</p></article>
+    <article class="panel"><h2>Generated notebooks</h2><div class="table-wrap"><table><thead><tr><th>File</th><th>Workspace path</th><th>Size</th><th>Modified UTC</th></tr></thead><tbody>{% for item in notebooks %}<tr><td>{{ item.name }}</td><td><code>{{ item.path }}</code></td><td>{{ item.size_bytes }} bytes</td><td>{{ item.modified_at }}</td></tr>{% else %}<tr><td colspan="4">No generated notebooks. Use the root manager's Jupyter Integration menu.</td></tr>{% endfor %}</tbody></table></div></article>
+    <article class="panel"><h2>Security boundary</h2><p>Notebook credentials are supplied at runtime and are not stored in generated files. Jupyter receives no encryption master keys, worker keys, mTLS private keys, Omnivis database credentials or production data. Provider-managed access must continue through the provider UI.</p></article>
+  </section>
+</div>
+{% endblock %}

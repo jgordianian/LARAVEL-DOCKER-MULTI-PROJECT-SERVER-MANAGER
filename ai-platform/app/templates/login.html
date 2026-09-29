@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Sign in · AI Platform{% endblock %}
+{% block content %}
+<section class="auth-card">
+  <div class="mark">AI</div>
+  <h1>Welcome back</h1>
+  <p class="muted">Sign in to your private AI workspace.</p>
+  {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+  <form method="post" action="/login" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
+    <label>Email<input type="email" name="email" autocomplete="username" required autofocus></label>
+    <label>Password<input type="password" name="password" autocomplete="current-password" required></label>
+    <button type="submit" class="primary">Sign in</button>
+  </form>
+  <p class="small muted">Accounts are provisioned by an administrator. Public registration is disabled.</p>
+</section>
+{% endblock %}
+

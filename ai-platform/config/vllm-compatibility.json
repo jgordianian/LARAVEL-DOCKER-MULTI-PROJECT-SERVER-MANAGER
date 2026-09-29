@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "default": [
+    "--model", "--revision", "--served-model-name", "--dtype", "--quantization",
+    "--max-model-len", "--max-num-seqs", "--max-num-batched-tokens",
+    "--gpu-memory-utilization", "--tensor-parallel-size", "--pipeline-parallel-size",
+    "--cpu-offload-gb", "--swap-space", "--enable-prefix-caching",
+    "--trust-remote-code", "--enable-auto-tool-choice", "--tool-call-parser", "--chat-template"
+  ],
+  "versions": {
+    ">=0.30.0": ["--kv-cache-dtype", "--reasoning-parser", "--enable-per-request-metrics"],
+    ">=0.8.0": ["--generation-config"]
+  },
+  "removed": {
+    ">=0.30.0": ["--swap-space"]
+  }
+}
+

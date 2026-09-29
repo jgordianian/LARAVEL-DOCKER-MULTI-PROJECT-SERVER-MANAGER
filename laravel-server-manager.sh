@@ -21,6 +21,29 @@ DEFAULT_BACKUP_INTERVAL_HOURS="24"
 SHARED_NETWORK="laravel-shared"
 PROXY_COMPOSE="${PROXY_BASE}/docker-compose.yml"
 SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+AI_PLATFORM_BASE="/opt/vllm-ai-platform"
+AI_PLATFORM_COMPOSE="${AI_PLATFORM_BASE}/compose.yaml"
+AI_PLATFORM_ENV="${AI_PLATFORM_BASE}/.env"
+AI_PLATFORM_META="${AI_PLATFORM_BASE}/.ai-platform-meta"
+AI_PLATFORM_ASSETS="${SCRIPT_DIR}/ai-platform"
+AI_PLATFORM_SHARE="/usr/local/share/laravel-server-manager/ai-platform"
+AI_INTERNAL_NETWORK="vllm-ai-internal"
+AI_EGRESS_NETWORK="vllm-ai-egress"
+AI_DEFAULT_VLLM_VERSION="v0.30.0"
+AI_DEFAULT_VLLM_IMAGE="vllm/vllm-openai:${AI_DEFAULT_VLLM_VERSION}"
+AI_DEFAULT_NATIVE_VLLM_VERSION="${AI_DEFAULT_VLLM_VERSION#v}"
+AI_SCHEMA_VERSION="2"
+AI_BACKUPS_BASE="/var/backups/vllm-ai-platform"
+AI_PROXY_CONFIG="${PROXY_CONF_DIR}/vllm-ai-platform.conf"
+AI_ENVIRONMENT_SNAPSHOT="${AI_PLATFORM_BASE}/hardware/environment.json"
+AI_NOTEBOOKS_BASE="${AI_PLATFORM_BASE}/notebooks"
+AI_NATIVE_BASE="${AI_PLATFORM_BASE}/native"
+AI_NATIVE_PLATFORM_VENV="${AI_NATIVE_BASE}/platform-venv"
+AI_NATIVE_VLLM_VENV="${AI_NATIVE_BASE}/vllm-venv"
+AI_NATIVE_SERVICE_USER="vllmai"
+AI_CLOUDFLARED_TOKEN_FILE="${AI_PLATFORM_BASE}/secrets/cloudflare_tunnel_token"
+AI_EXTERNAL_ACCESS_META="${AI_NATIVE_BASE}/external-access.env"
 MAIL_BASE="/opt/mailserver"
 MAIL_COMPOSE="${MAIL_BASE}/compose.yaml"
 MAIL_ENV_FILE="${MAIL_BASE}/mailserver.env"
@@ -3658,6 +3681,7 @@ ensure_cron_jobs() {
   setup_ssl_renew_cron
   setup_backup_cron
   setup_laravel_scheduler_crons
+  setup_ai_backup_cron
 }
 
 normalize_domain() {
@@ -9317,6 +9341,2467 @@ manage_vnc_server() {
   esac
 }
 
+ai_assets_dir() {
+  if [ -f "${AI_PLATFORM_ASSETS}/compose.yaml" ]; then
+    printf '%s\n' "$AI_PLATFORM_ASSETS"
+  elif [ -f "${AI_PLATFORM_SHARE}/compose.yaml" ]; then
+    printf '%s\n' "$AI_PLATFORM_SHARE"
+  else
+    echo "AI platform assets were not found beside the manager or in ${AI_PLATFORM_SHARE}." >&2
+    return 1
+  fi
+}
+
+setup_ai_backup_cron() {
+  local cron_line="15 2 * * * /usr/bin/flock -n /run/lock/vllm-ai-platform-backup.lock /bin/bash ${SCRIPT_PATH} ai-backup >>/var/log/vllm-ai-platform-backup.log 2>&1"
+  local hardware_line="* * * * * /usr/bin/flock -n /run/lock/vllm-ai-platform-hardware.lock /bin/bash ${SCRIPT_PATH} ai-hardware-snapshot >>/var/log/vllm-ai-platform-hardware.log 2>&1"
+  local current
+  current="$(crontab -l 2>/dev/null || true)"
+  current="$(printf '%s\n' "$current" | awk 'index($0," vllm-ai-platform-backup.lock ")==0 && index($0," vllm-ai-platform-hardware.lock ")==0 {print}')"
+  if ai_is_installed; then
+    printf '%s\n%s\n%s\n' "$current" "$cron_line" "$hardware_line" | sed '/^[[:space:]]*$/d' | crontab -
+  else
+    printf '%s\n' "$current" | sed '/^[[:space:]]*$/d' | crontab -
+  fi
+}
+
+remove_ai_cron_jobs() {
+  local current
+  command -v crontab >/dev/null 2>&1 || return 0
+  current="$(crontab -l 2>/dev/null || true)"
+  printf '%s\n' "$current" \
+    | awk 'index($0," vllm-ai-platform-backup.lock ")==0 && index($0," vllm-ai-platform-hardware.lock ")==0 {print}' \
+    | sed '/^[[:space:]]*$/d' \
+    | crontab -
+}
+
+ai_is_installed() {
+  [ -f "$AI_PLATFORM_COMPOSE" ] && [ -f "$AI_PLATFORM_ENV" ]
+}
+
+ai_require_installed() {
+  if ! ai_is_installed; then
+    echo "The vLLM AI platform is not installed. Choose installation from the AI platform menu first."
+    return 1
+  fi
+}
+
+ai_dc() {
+  local previous_dir status
+  ai_require_installed || return 1
+  previous_dir="$(pwd 2>/dev/null || true)"
+  cd "$AI_PLATFORM_BASE" || return 1
+  if dc --env-file "$AI_PLATFORM_ENV" -f "$AI_PLATFORM_COMPOSE" "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ -n "$previous_dir" ] && [ -d "$previous_dir" ]; then
+    cd "$previous_dir" || cd /
+  else
+    cd /
+  fi
+  return "$status"
+}
+
+ai_runtime_mode() {
+  local mode
+  mode="$(ai_env_value AI_RUNTIME_MODE)"
+  case "${mode,,}" in
+    native) echo native ;;
+    *) echo docker ;;
+  esac
+}
+
+ai_native() {
+  local python="${AI_NATIVE_PLATFORM_VENV}/bin/python"
+  ai_require_installed || return 1
+  if [ ! -x "$python" ]; then
+    echo "Native platform environment is unavailable: ${AI_NATIVE_PLATFORM_VENV}" >&2
+    return 1
+  fi
+  (
+    cd "$AI_PLATFORM_BASE" || exit 1
+    "$python" scripts/native_runtime.py "$@"
+  )
+}
+
+ai_cli() {
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    local python="${AI_NATIVE_PLATFORM_VENV}/bin/python"
+    [ -x "$python" ] || {
+      echo "Native platform environment is unavailable: ${AI_NATIVE_PLATFORM_VENV}" >&2
+      return 1
+    }
+    (
+      cd "$AI_PLATFORM_BASE" || exit 1
+      "$python" -m app.cli "$@"
+    )
+  else
+    ai_dc exec -T controller python -m app.cli "$@"
+  fi
+}
+
+ai_env_value() {
+  local key="$1"
+  [ -f "$AI_PLATFORM_ENV" ] || return 0
+  awk -F= -v wanted="$key" '$1 == wanted {sub(/^[^=]*=/, ""); print; exit}' "$AI_PLATFORM_ENV"
+}
+
+ai_random_secret() {
+  openssl rand -hex 32
+}
+
+ai_password_is_strong() {
+  local value="$1" categories=0
+  [ "${#value}" -ge 12 ] && [ "${#value}" -le 256 ] || return 1
+  [[ "$value" =~ [[:lower:]] ]] && categories=$((categories + 1))
+  [[ "$value" =~ [[:upper:]] ]] && categories=$((categories + 1))
+  [[ "$value" =~ [[:digit:]] ]] && categories=$((categories + 1))
+  [[ "$value" =~ [^[:alnum:]] ]] && categories=$((categories + 1))
+  [ "$categories" -ge 3 ]
+}
+
+ai_copy_assets() {
+  local source
+  source="$(ai_assets_dir)"
+  mkdir -p "$AI_PLATFORM_BASE"
+  rsync -a --delete \
+    --exclude='.env' \
+    --exclude='database/' \
+    --exclude='redis/' \
+    --exclude='models/' \
+    --exclude='hf-cache/' \
+    --exclude='hardware/' \
+    --exclude='notebooks/' \
+    --exclude='jupyter-venv/' \
+    --exclude='native/' \
+    --exclude='state/' \
+    --exclude='backups/' \
+    --exclude='logs/' \
+    --exclude='generated/' \
+    --exclude='model-configs/' \
+    --exclude='secrets/' \
+    --exclude='.ai-platform-meta' \
+    --exclude='.deployed-release.json' \
+    "${source}/" "${AI_PLATFORM_BASE}/"
+  mkdir -p \
+    "${AI_PLATFORM_BASE}/database" \
+    "${AI_PLATFORM_BASE}/redis" \
+    "${AI_PLATFORM_BASE}/models" \
+    "${AI_PLATFORM_BASE}/hf-cache" \
+    "${AI_PLATFORM_BASE}/hardware" \
+    "${AI_PLATFORM_BASE}/notebooks/diagnostics" \
+    "${AI_PLATFORM_BASE}/notebooks/benchmarks" \
+    "${AI_PLATFORM_BASE}/notebooks/examples" \
+    "${AI_PLATFORM_BASE}/state" \
+    "${AI_PLATFORM_BASE}/logs" \
+    "${AI_PLATFORM_BASE}/generated" \
+    "${AI_PLATFORM_BASE}/model-configs" \
+    "${AI_NATIVE_BASE}/cache" \
+    "${AI_PLATFORM_BASE}/secrets" \
+    "$AI_BACKUPS_BASE"
+  chmod 700 "${AI_PLATFORM_BASE}/secrets" "$AI_BACKUPS_BASE"
+}
+
+ai_environment_probe_script() {
+  if [ -f "${AI_PLATFORM_BASE}/scripts/environment_probe.py" ]; then
+    printf '%s\n' "${AI_PLATFORM_BASE}/scripts/environment_probe.py"
+  else
+    printf '%s\n' "$(ai_assets_dir)/scripts/environment_probe.py"
+  fi
+}
+
+ai_environment_refresh() {
+  local test_pytorch="${1:-no}" script
+  script="$(ai_environment_probe_script)"
+  if ! command -v python3 >/dev/null 2>&1 || [ ! -f "$script" ]; then
+    echo "Environment probe unavailable: Python 3 or the probe script is missing."
+    return 1
+  fi
+  mkdir -p "${AI_PLATFORM_BASE}/hardware"
+  local args=(--platform-root "$AI_PLATFORM_BASE" --output "$AI_ENVIRONMENT_SNAPSHOT")
+  [ "$test_pytorch" = "yes" ] && args+=(--test-pytorch)
+  python3 "$script" "${args[@]}"
+}
+
+ai_environment_value() {
+  local path="$1"
+  [ -f "$AI_ENVIRONMENT_SNAPSHOT" ] || return 0
+  python3 - "$AI_ENVIRONMENT_SNAPSHOT" "$path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+for part in sys.argv[2].split("."):
+    value = value.get(part) if isinstance(value, dict) else None
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif value is not None:
+    print(value)
+PY
+}
+
+ai_environment_preflight() {
+  local script temporary
+  script="$(ai_environment_probe_script)"
+  command -v python3 >/dev/null 2>&1 && [ -f "$script" ] || return 0
+  temporary="$(mktemp /tmp/vllm-ai-environment.XXXXXX.json)"
+  if python3 "$script" --platform-root "$AI_PLATFORM_BASE" --output "$temporary"; then
+    python3 - "$temporary" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+jupyter = value.get("jupyter", {})
+capabilities = value.get("capabilities", {})
+print("AI environment preflight:")
+print(f"  type={value.get('environment_type', 'UNKNOWN')} provider={value.get('provider', 'unknown')}")
+print(f"  jupyter={'detected' if jupyter.get('detected') else 'not-detected'} running={bool(jupyter.get('running'))} management={jupyter.get('management', 'UNKNOWN')}")
+print(f"  docker-daemon={bool(capabilities.get('docker_daemon_available'))} systemd={bool(capabilities.get('systemd_available'))} cap-sys-admin={bool(capabilities.get('cap_sys_admin'))}")
+if jupyter.get("management") == "PROVIDER_MANAGED":
+    print("  action=PRESERVE PROVIDER JUPYTER; startup, authentication, proxy and configuration will not be changed")
+PY
+  fi
+  rm -f "$temporary"
+}
+
+ai_host_mutation_allowed() {
+  [ -f "$AI_ENVIRONMENT_SNAPSHOT" ] || ai_environment_refresh no >/dev/null 2>&1 || return 1
+  jq -e '(.environment_type == "FULL_VM" or .environment_type == "BARE_METAL") and .capabilities.root_privileges == true' "$AI_ENVIRONMENT_SNAPSHOT" >/dev/null 2>&1
+}
+
+ai_prepare_marketplace_container_base() {
+  local required missing=()
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    echo "No usable Docker daemon is exposed in this marketplace container."
+    return 1
+  fi
+  if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+    echo "Docker Compose is unavailable. It will not be installed into the provider environment automatically."
+    return 1
+  fi
+  for required in python3 jq openssl rsync curl tar gzip; do
+    command -v "$required" >/dev/null 2>&1 || missing+=("$required")
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "Provider container is missing required existing commands: ${missing[*]}"
+    echo "No packages were installed automatically; use a compatible provider image or explicitly prepare it."
+    return 1
+  fi
+  mkdir -p "$PROJECTS_BASE" "$BACKUPS_BASE"
+  chmod 700 "$SCRIPT_PATH" >/dev/null 2>&1 || true
+  if ! docker network inspect "$SHARED_NETWORK" >/dev/null 2>&1; then
+    docker network create "$SHARED_NETWORK"
+  fi
+  proxy_up
+  echo "Marketplace/container mode: skipped apt, systemd, host firewall and cron mutations."
+}
+
+ai_native_base_python() {
+  local candidate
+  for candidate in /usr/bin/python3 /usr/local/bin/python3 "$(command -v python3 2>/dev/null || true)"; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 15) else 1)
+PY
+    then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ai_native_prepare_prerequisites() {
+  local base_python
+  if [ "$(uname -s)" != "Linux" ]; then
+    echo "Native vLLM mode requires Linux."
+    return 1
+  fi
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "Native NVIDIA vLLM mode requires a provider-visible NVIDIA GPU and nvidia-smi."
+    return 1
+  fi
+  if ! base_python="$(ai_native_base_python)"; then
+    echo "Native vLLM ${AI_DEFAULT_NATIVE_VLLM_VERSION} requires Python 3.10 through 3.14."
+    return 1
+  fi
+
+  local missing=()
+  command -v redis-server >/dev/null 2>&1 || missing+=(redis-server)
+  "$base_python" -c 'import ensurepip, venv' >/dev/null 2>&1 || missing+=(python3-venv)
+  command -v runuser >/dev/null 2>&1 || missing+=(util-linux)
+  if [ "${#missing[@]}" -gt 0 ]; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      echo "Missing native prerequisites: ${missing[*]}"
+      echo "No supported package manager was found. Prepare a compatible provider image and retry."
+      return 1
+    fi
+    echo "Installing isolated native-runtime prerequisites: ${missing[*]}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y --no-install-recommends ca-certificates "${missing[@]}"
+  fi
+  if [ "$(cat /proc/1/comm 2>/dev/null || true)" != "systemd" ]; then
+    local redis_unit_link redis_unit_target
+    for redis_unit_link in \
+      /etc/systemd/system/redis.service \
+      /etc/systemd/system/multi-user.target.wants/redis-server.service; do
+      [ -L "$redis_unit_link" ] || continue
+      redis_unit_target="$(readlink "$redis_unit_link")"
+      case "$redis_unit_target" in
+        /lib/systemd/system/redis-server.service|/usr/lib/systemd/system/redis-server.service)
+          rm -f -- "$redis_unit_link"
+          ;;
+      esac
+    done
+  fi
+  command -v redis-server >/dev/null 2>&1 || {
+    echo "redis-server remains unavailable after prerequisite installation."
+    return 1
+  }
+}
+
+ai_native_prepare_service_user() {
+  if ! id "$AI_NATIVE_SERVICE_USER" >/dev/null 2>&1; then
+    useradd --system --home-dir "$AI_PLATFORM_BASE" --shell /usr/sbin/nologin "$AI_NATIVE_SERVICE_USER"
+  fi
+  local service_group
+  service_group="$(id -gn "$AI_NATIVE_SERVICE_USER")"
+  mkdir -p \
+    "${AI_PLATFORM_BASE}/database" \
+    "${AI_PLATFORM_BASE}/redis" \
+    "${AI_PLATFORM_BASE}/models" \
+    "${AI_PLATFORM_BASE}/hf-cache" \
+    "${AI_PLATFORM_BASE}/hardware" \
+    "${AI_PLATFORM_BASE}/state/native-models" \
+    "${AI_PLATFORM_BASE}/logs" \
+    "${AI_PLATFORM_BASE}/generated" \
+    "${AI_PLATFORM_BASE}/model-configs" \
+    "${AI_PLATFORM_BASE}/secrets" \
+    "$AI_NATIVE_BASE"
+  chown -R "${AI_NATIVE_SERVICE_USER}:${service_group}" \
+    "${AI_PLATFORM_BASE}/database" \
+    "${AI_PLATFORM_BASE}/redis" \
+    "${AI_PLATFORM_BASE}/models" \
+    "${AI_PLATFORM_BASE}/hf-cache" \
+    "${AI_PLATFORM_BASE}/hardware" \
+    "${AI_PLATFORM_BASE}/state" \
+    "${AI_PLATFORM_BASE}/logs" \
+    "${AI_PLATFORM_BASE}/generated" \
+    "${AI_PLATFORM_BASE}/model-configs" \
+    "${AI_NATIVE_BASE}/cache"
+  chown "root:${service_group}" "$AI_PLATFORM_ENV" "${AI_PLATFORM_BASE}/secrets/hf_token"
+  chmod 640 "$AI_PLATFORM_ENV" "${AI_PLATFORM_BASE}/secrets/hf_token"
+  if [ -f "$AI_CLOUDFLARED_TOKEN_FILE" ]; then
+    chown "root:${service_group}" "$AI_CLOUDFLARED_TOKEN_FILE"
+    chmod 640 "$AI_CLOUDFLARED_TOKEN_FILE"
+  fi
+  chown "root:${service_group}" "${AI_PLATFORM_BASE}/secrets"
+  chmod 710 "${AI_PLATFORM_BASE}/secrets"
+}
+
+ai_native_resolve_venv_path() {
+  local requested="$1" resolved="$1"
+  if [ -L "$requested" ]; then
+    resolved="$(readlink -f -- "$requested")" || {
+      echo "Unable to resolve native environment link: ${requested}" >&2
+      return 1
+    }
+  fi
+  case "$resolved" in
+    "${AI_NATIVE_BASE}"/*)
+      printf '%s\n' "$resolved"
+      ;;
+    *)
+      echo "Native environment path escapes ${AI_NATIVE_BASE}: ${resolved}" >&2
+      return 1
+      ;;
+  esac
+}
+
+ai_native_install_environments() {
+  local version="$1" current="" base_python platform_venv_target vllm_venv_target
+  base_python="$(ai_native_base_python)" || {
+    echo "No compatible system Python was found for native vLLM environments."
+    return 1
+  }
+  platform_venv_target="$(ai_native_resolve_venv_path "$AI_NATIVE_PLATFORM_VENV")" || return 1
+  vllm_venv_target="$(ai_native_resolve_venv_path "$AI_NATIVE_VLLM_VENV")" || return 1
+  "$base_python" -m venv --copies "$platform_venv_target"
+  "${AI_NATIVE_PLATFORM_VENV}/bin/python" -m pip install --upgrade pip setuptools wheel
+  "${AI_NATIVE_PLATFORM_VENV}/bin/python" -m pip install -r "${AI_PLATFORM_BASE}/requirements-native.txt"
+
+  "$base_python" -m venv --copies "$vllm_venv_target"
+  "${AI_NATIVE_PLATFORM_VENV}/bin/python" -m pip install --upgrade uv
+  current="$(${AI_NATIVE_VLLM_VENV}/bin/python -c 'import importlib.metadata; print(importlib.metadata.version("vllm"))' 2>/dev/null || true)"
+  if [ "$current" != "$version" ]; then
+    echo "Installing native vLLM ${version} in an isolated environment. This can download several gigabytes."
+    "${AI_NATIVE_PLATFORM_VENV}/bin/uv" pip install \
+      --python "${AI_NATIVE_VLLM_VENV}/bin/python" \
+      --torch-backend=auto \
+      "vllm==${version}"
+  fi
+  "${AI_NATIVE_VLLM_VENV}/bin/vllm" --version
+}
+
+ai_native_initialize_environment() {
+  local version="$1"
+  if [ ! -f "$AI_PLATFORM_ENV" ]; then
+    cp "${AI_PLATFORM_BASE}/.env.example" "$AI_PLATFORM_ENV"
+    set_env_file_var "$AI_PLATFORM_ENV" "APP_SECRET" "$(ai_random_secret)"
+    set_env_file_var "$AI_PLATFORM_ENV" "API_KEY_PEPPER" "$(ai_random_secret)"
+    set_env_file_var "$AI_PLATFORM_ENV" "INTERNAL_GATEWAY_TOKEN" "$(ai_random_secret)"
+    set_env_file_var "$AI_PLATFORM_ENV" "CONTROLLER_TOKEN" "$(ai_random_secret)"
+    set_env_file_var "$AI_PLATFORM_ENV" "PROXY_SHARED_TOKEN" "$(ai_random_secret)"
+    set_env_file_var "$AI_PLATFORM_ENV" "REDIS_PASSWORD" "$(ai_random_secret)"
+  fi
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_PLATFORM_SCHEMA_VERSION" "$AI_SCHEMA_VERSION"
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_RUNTIME_MODE" "native"
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_DOMAIN" "localhost"
+  set_env_file_var "$AI_PLATFORM_ENV" "DATABASE_URL" "sqlite:////opt/vllm-ai-platform/database/platform.db"
+  set_env_file_var "$AI_PLATFORM_ENV" "REDIS_URL" "redis://:$(ai_env_value REDIS_PASSWORD)@127.0.0.1:16379/0"
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_PLATFORM_ROOT" "$AI_PLATFORM_BASE"
+  set_env_file_var "$AI_PLATFORM_ENV" "HF_TOKEN_FILE" "${AI_PLATFORM_BASE}/secrets/hf_token"
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_RUNTIME_MODE" "native"
+  set_env_file_var "$AI_PLATFORM_ENV" "NATIVE_SERVICE_USER" "$AI_NATIVE_SERVICE_USER"
+  set_env_file_var "$AI_PLATFORM_ENV" "NATIVE_VLLM_VERSION" "$version"
+  set_env_file_var "$AI_PLATFORM_ENV" "NATIVE_VLLM_EXECUTABLE" "${AI_NATIVE_VLLM_VENV}/bin/vllm"
+  set_env_file_var "$AI_PLATFORM_ENV" "NATIVE_GATEWAY_PORT" "8000"
+  set_env_file_var "$AI_PLATFORM_ENV" "NATIVE_WEB_PORT" "18080"
+  set_env_file_var "$AI_PLATFORM_ENV" "NATIVE_CONTROLLER_PORT" "8090"
+  set_env_file_var "$AI_PLATFORM_ENV" "NATIVE_REDIS_PORT" "16379"
+  set_env_file_var "$AI_PLATFORM_ENV" "NATIVE_VLLM_PORT_START" "19000"
+  set_env_file_var "$AI_PLATFORM_ENV" "NATIVE_VLLM_PORT_END" "19999"
+  set_env_file_var "$AI_PLATFORM_ENV" "GATEWAY_INTERNAL_URL" "http://127.0.0.1:8000"
+  set_env_file_var "$AI_PLATFORM_ENV" "CONTROLLER_INTERNAL_URL" "http://127.0.0.1:8090"
+  set_env_file_var "$AI_PLATFORM_ENV" "TRUSTED_PROXY_CIDRS" "127.0.0.1/32,::1/128"
+  set_env_file_var "$AI_PLATFORM_ENV" "ALLOWED_ORIGINS" ""
+  set_env_file_var "$AI_PLATFORM_ENV" "COOKIE_SECURE" "false"
+  if [ ! -f "${AI_PLATFORM_BASE}/secrets/hf_token" ]; then
+    : > "${AI_PLATFORM_BASE}/secrets/hf_token"
+  fi
+  chmod 600 "$AI_PLATFORM_ENV" "${AI_PLATFORM_BASE}/secrets/hf_token"
+}
+
+ai_install_native() {
+  local existed="no" version panel chat hf_token admin_name admin_email admin_password admin_password_confirm
+  ai_is_installed && existed="yes"
+  ai_copy_assets
+  ai_native_prepare_prerequisites
+  version="$(ai_env_value NATIVE_VLLM_VERSION)"
+  prompt version "Pinned native vLLM version: " "${version:-$AI_DEFAULT_NATIVE_VLLM_VERSION}"
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([a-zA-Z0-9._-]*)$ ]]; then
+    echo "Use a pinned native vLLM package version such as ${AI_DEFAULT_NATIVE_VLLM_VERSION}."
+    return 1
+  fi
+  ai_native_initialize_environment "$version"
+  prompt panel "Enable administrator web panel? (yes/no): " "$( [ "$(ai_env_value ADMIN_PANEL_ENABLED)" = "false" ] && echo no || echo yes )"
+  prompt chat "Enable end-user chat portal? (yes/no): " "$( [ "$(ai_env_value CHAT_PORTAL_ENABLED)" = "false" ] && echo no || echo yes )"
+  [ "${panel,,}" = "yes" ] && panel=true || panel=false
+  [ "${chat,,}" = "yes" ] && chat=true || chat=false
+  set_env_file_var "$AI_PLATFORM_ENV" "ADMIN_PANEL_ENABLED" "$panel"
+  set_env_file_var "$AI_PLATFORM_ENV" "CHAT_PORTAL_ENABLED" "$chat"
+  prompt_secret hf_token "Hugging Face token (blank keeps existing/public-only): "
+  if [ -n "$hf_token" ]; then
+    printf '%s' "$hf_token" > "${AI_PLATFORM_BASE}/secrets/hf_token"
+  fi
+
+  ai_native_prepare_service_user
+  ai_native_install_environments "$version"
+  ai_native_prepare_service_user
+  ai_hardware_refresh no
+  ai_native configure
+  ai_native start
+
+  if [ "$existed" = "no" ]; then
+    prompt admin_name "First administrator name: " "Administrator"
+    prompt admin_email "First administrator email: " ""
+    while true; do
+      prompt_secret admin_password "First administrator password (minimum 12 characters): "
+      prompt_secret admin_password_confirm "Confirm password: "
+      if ai_password_is_strong "$admin_password" && [ "$admin_password" = "$admin_password_confirm" ]; then
+        break
+      fi
+      echo "Passwords must match, contain 12-256 characters, and use at least three character categories."
+    done
+    printf '%s\n' "$admin_password" \
+      | ai_cli init-admin --name "$admin_name" --email "$admin_email" --password-stdin
+  fi
+
+  if [ ! -f "$AI_PLATFORM_META" ]; then
+    printf 'schema_version=%s\ninstalled_at=%s\n' "$AI_SCHEMA_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$AI_PLATFORM_META"
+  fi
+  set_env_file_var "$AI_PLATFORM_META" "runtime_mode" "native"
+  set_env_file_var "$AI_PLATFORM_META" "native_vllm_version" "$version"
+  chmod 600 "$AI_PLATFORM_META"
+  echo "Native AI Platform is ready on private loopback listeners."
+  echo "  Gateway: http://127.0.0.1:8000/v1"
+  echo "  Admin/chat: http://127.0.0.1:18080"
+  echo "Use SSH/Vast.ai port forwarding or an explicitly configured TLS proxy; no provider ports were exposed automatically."
+}
+
+ai_hardware_refresh() {
+  local validate="${1:-no}"
+  local args=(--storage-path "$AI_PLATFORM_BASE" --output "${AI_PLATFORM_BASE}/hardware/current.json")
+  if [ "$validate" = "yes" ]; then
+    args+=(--validate-docker)
+  fi
+  python3 "${AI_PLATFORM_BASE}/scripts/hardware_probe.py" "${args[@]}"
+  ai_environment_refresh no || true
+  if [ ! -f "${AI_PLATFORM_BASE}/hardware/baseline.json" ]; then
+    cp "${AI_PLATFORM_BASE}/hardware/current.json" "${AI_PLATFORM_BASE}/hardware/baseline.json"
+  fi
+  python3 "${AI_PLATFORM_BASE}/scripts/compare_hardware.py" \
+    "${AI_PLATFORM_BASE}/hardware/baseline.json" \
+    "${AI_PLATFORM_BASE}/hardware/current.json" \
+    --output "${AI_PLATFORM_BASE}/hardware/change.json"
+}
+
+ai_hardware_show() {
+  local accept
+  ai_require_installed || return 1
+  ai_hardware_refresh no
+  echo ""
+  echo "Current hardware:"
+  python3 -m json.tool "${AI_PLATFORM_BASE}/hardware/current.json"
+  echo ""
+  echo "Changes from accepted baseline:"
+  python3 -m json.tool "${AI_PLATFORM_BASE}/hardware/change.json"
+  prompt accept "Accept the current hardware as the new baseline? (yes/no): " "no"
+  if [ "${accept,,}" = "yes" ]; then
+    cp "${AI_PLATFORM_BASE}/hardware/current.json" "${AI_PLATFORM_BASE}/hardware/baseline.json"
+    chmod 600 "${AI_PLATFORM_BASE}/hardware/baseline.json"
+    echo "Hardware baseline updated."
+  fi
+}
+
+ai_gpu_diagnostics() {
+  local validate="${1:-yes}"
+  echo "Host NVIDIA diagnostic:"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi || true
+  else
+    echo "  nvidia-smi is unavailable. Install a supported NVIDIA driver first."
+  fi
+  echo ""
+  local docker_ready="no"
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    docker_ready="yes"
+    docker info --format 'Docker server: {{.ServerVersion}} | runtimes: {{json .Runtimes}}' 2>/dev/null || true
+  else
+    echo "  Docker daemon unavailable; container GPU validation is skipped without modifying the host."
+  fi
+  if [ "$validate" = "yes" ] && command -v nvidia-smi >/dev/null 2>&1 && [ "$docker_ready" = "yes" ]; then
+    echo ""
+    echo "Testing GPU access in a disposable CUDA container..."
+    docker run --rm --gpus all nvidia/cuda:12.9.1-base-ubuntu24.04 nvidia-smi -L
+  fi
+}
+
+ai_install_nvidia_runtime() {
+  local daemon_file="/etc/docker/daemon.json"
+  local backup_file=""
+
+  ai_environment_refresh no || true
+  if ! ai_host_mutation_allowed; then
+    echo "NVIDIA Container Toolkit host mutation is disabled in provider/marketplace containers or without host privileges."
+    echo "Use the provider's CUDA/GPU configuration; no systemd, Docker daemon or provider startup files were changed."
+    return 1
+  fi
+
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "A working host NVIDIA driver is required before installing the container runtime."
+    return 1
+  fi
+
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg
+  install -m 0755 -d /usr/share/keyrings
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+    | gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  apt-get update -y
+  apt-get install -y nvidia-container-toolkit
+
+  if [ -f "$daemon_file" ]; then
+    backup_file="${daemon_file}.before-vllm.$(date -u +%Y%m%dT%H%M%SZ)"
+    cp -a "$daemon_file" "$backup_file"
+    echo "Docker daemon configuration backed up to ${backup_file}."
+  fi
+
+  nvidia-ctk runtime configure --runtime=docker
+  if ! python3 -m json.tool "$daemon_file" >/dev/null; then
+    echo "nvidia-ctk produced invalid JSON."
+    if [ -n "$backup_file" ]; then
+      cp -a "$backup_file" "$daemon_file"
+    else
+      rm -f "$daemon_file"
+    fi
+    systemctl restart docker || true
+    return 1
+  fi
+  systemctl restart docker
+  ai_gpu_diagnostics yes
+}
+
+ai_write_proxy_http() {
+  local domain="$1"
+  cat > "$AI_PROXY_CONFIG" <<EOF
+server {
+    listen 80;
+    server_name ${domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        proxy_pass http://ai-web:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-AI-Proxy-Token $(ai_env_value PROXY_SHARED_TOKEN);
+    }
+}
+EOF
+}
+
+ai_write_proxy_https() {
+  local domain="$1"
+  cat > "$AI_PROXY_CONFIG" <<EOF
+server {
+    listen 80;
+    server_name ${domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${domain};
+
+    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+    client_max_body_size 4m;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy no-referrer always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    location /v1/ {
+        proxy_pass http://ai-gateway:8000;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-AI-Proxy-Token $(ai_env_value PROXY_SHARED_TOKEN);
+        proxy_set_header Connection "";
+    }
+
+    location / {
+        proxy_pass http://ai-web:8080;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-AI-Proxy-Token $(ai_env_value PROXY_SHARED_TOKEN);
+        proxy_set_header Connection "";
+    }
+}
+EOF
+}
+
+ai_configure_proxy() {
+  local domain="$1"
+  local email="$2"
+  local old_config=""
+
+  ensure_proxy_stack
+  if [ -f "$AI_PROXY_CONFIG" ]; then
+    old_config="$(mktemp)"
+    cp "$AI_PROXY_CONFIG" "$old_config"
+  fi
+
+  ai_write_proxy_http "$domain"
+  chmod 600 "$AI_PROXY_CONFIG"
+  if ! proxy_dc exec -T reverse-proxy nginx -t; then
+    if [ -n "$old_config" ]; then cp "$old_config" "$AI_PROXY_CONFIG"; else rm -f "$AI_PROXY_CONFIG"; fi
+    rm -f "$old_config"
+    echo "Nginx rejected the AI HTTP proxy configuration."
+    return 1
+  fi
+  proxy_dc restart reverse-proxy
+
+  if ! proxy_dc run --rm certbot certonly \
+    --webroot \
+    --webroot-path=/var/www/certbot \
+    --email "$email" \
+    --agree-tos \
+    --no-eff-email \
+    --non-interactive \
+    --keep-until-expiring \
+    -d "$domain"; then
+    if [ -n "$old_config" ]; then cp "$old_config" "$AI_PROXY_CONFIG"; else rm -f "$AI_PROXY_CONFIG"; fi
+    rm -f "$old_config"
+    proxy_dc restart reverse-proxy || true
+    return 1
+  fi
+
+  ai_write_proxy_https "$domain"
+  chmod 600 "$AI_PROXY_CONFIG"
+  if ! proxy_dc exec -T reverse-proxy nginx -t; then
+    if [ -n "$old_config" ]; then cp "$old_config" "$AI_PROXY_CONFIG"; else rm -f "$AI_PROXY_CONFIG"; fi
+    rm -f "$old_config"
+    proxy_dc restart reverse-proxy || true
+    echo "Nginx rejected the AI HTTPS proxy configuration; the prior configuration was restored."
+    return 1
+  fi
+  rm -f "$old_config"
+  proxy_dc restart reverse-proxy
+}
+
+ai_sync_proxy_from_env() {
+  local domain old_config=""
+  domain="$(ai_env_value AI_DOMAIN)"
+  if ! validate_domain "$domain"; then
+    echo "The restored AI_DOMAIN is invalid; the proxy was not changed."
+    return 1
+  fi
+  ensure_proxy_stack
+  if [ -f "$AI_PROXY_CONFIG" ]; then
+    old_config="$(mktemp)"
+    cp "$AI_PROXY_CONFIG" "$old_config"
+  fi
+  ai_write_proxy_https "$domain"
+  chmod 600 "$AI_PROXY_CONFIG"
+  if ! proxy_dc exec -T reverse-proxy nginx -t; then
+    if [ -n "$old_config" ]; then cp "$old_config" "$AI_PROXY_CONFIG"; else rm -f "$AI_PROXY_CONFIG"; fi
+    rm -f "$old_config"
+    echo "Nginx rejected the restored proxy configuration; the prior configuration was restored."
+    return 1
+  fi
+  rm -f "$old_config"
+  proxy_dc restart reverse-proxy
+}
+
+ai_add_catalog_model() {
+  local catalog_key="$1" alias="$2"
+  local catalog_id catalog_revision catalog_caps catalog_size catalog_context catalog_tools catalog_parser
+  local catalog_quantization catalog_dtype catalog_max_sequences catalog_profile catalog_reasoning catalog_gpu_utilization
+  catalog_id="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .model_id' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  if [ -z "$catalog_id" ] || [ "$catalog_id" = "null" ]; then
+    echo "Unknown catalog key: ${catalog_key}"
+    return 1
+  fi
+  catalog_caps="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .capabilities | join(",")' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_size="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .estimated_weight_gb' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_context="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .default_max_model_len' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_tools="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .tool_calling' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_parser="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .tool_call_parser // empty' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_quantization="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .quantization // empty' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_revision="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .revision // "main"' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_dtype="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .dtype // "auto"' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_max_sequences="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .max_num_seqs // 4' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_profile="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .performance_profile // "AUTO"' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_reasoning="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .reasoning_parser // empty' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_gpu_utilization="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .gpu_memory_utilization // 0.82' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  [ -n "$alias" ] || alias="$catalog_key"
+  local catalog_args=(models add --model-id "$catalog_id" --revision "$catalog_revision" --alias "$alias"
+    --capabilities "$catalog_caps" --estimated-weight-gb "$catalog_size" --max-model-len "$catalog_context"
+    --dtype "$catalog_dtype" --max-num-seqs "$catalog_max_sequences"
+    --gpu-memory-utilization "$catalog_gpu_utilization" --performance-profile "$catalog_profile")
+  [ -z "$catalog_quantization" ] || catalog_args+=(--quantization "$catalog_quantization")
+  [ -z "$catalog_reasoning" ] || catalog_args+=(--reasoning-parser "$catalog_reasoning")
+  if [ "$catalog_tools" = "true" ]; then
+    catalog_args+=(--tool-calling --tool-call-parser "$catalog_parser")
+  fi
+  ai_cli "${catalog_args[@]}"
+}
+
+ai_catalog_model_wizard() {
+  local catalog="${AI_PLATFORM_BASE}/config/model-catalog.json"
+  local choice count index catalog_key alias confirm download_now activate_now set_default
+  local total_vram recommended_vram fit_label activate_default model_id display_name summary category
+  local estimated_size max_context revision capabilities
+
+  if [ ! -r "$catalog" ] || ! jq -e '.schema_version >= 2 and (.models | length > 0)' "$catalog" >/dev/null 2>&1; then
+    echo "The curated model catalog is missing or invalid."
+    return 1
+  fi
+
+  ai_hardware_refresh no >/dev/null 2>&1 || true
+  total_vram="$(jq -r '([.gpus[]?.memory_total_bytes] | add // 0) / 1073741824' "${AI_PLATFORM_BASE}/hardware/current.json" 2>/dev/null || echo 0)"
+  [[ "$total_vram" =~ ^[0-9]+([.][0-9]+)?$ ]] || total_vram=0
+
+  echo ""
+  echo "Stable curated model installer"
+  jq -r '"Catalog: \(.catalog_version) | reviewed \(.updated_at) | validated with vLLM \(.validated_vllm_version)"' "$catalog"
+  if jq -e '.gpus | length > 0' "${AI_PLATFORM_BASE}/hardware/current.json" >/dev/null 2>&1; then
+    jq -r '(.gpus | map(.name) | unique | join(", ")) as $names | ([.gpus[].memory_total_bytes] | add / 1073741824) as $vram | "Detected GPU: \($names) | total VRAM: \(($vram * 10 | floor) / 10) GiB"' "${AI_PLATFORM_BASE}/hardware/current.json"
+  else
+    echo "Detected GPU: unavailable; compatibility will be checked again before activation."
+  fi
+  echo "FIT = recommended for detected VRAM; TIGHT = may require reduced context/offload."
+  echo ""
+  jq -r --argjson vram "$total_vram" '
+    .models | to_entries[] |
+    .value as $model |
+    (if $vram <= 0 then "UNKNOWN"
+     elif $model.recommended_vram_gb <= ($vram * 0.82) then "FIT"
+     elif $model.recommended_vram_gb <= ($vram * 0.97) then "TIGHT"
+     else "TOO LARGE" end) as $fit |
+    "\(.key + 1)) [\($fit)] \($model.display_name) - \($model.category)\n" +
+    "    \($model.summary)\n" +
+    "    disk ~\($model.estimated_weight_gb) GiB | VRAM ~\($model.recommended_vram_gb) GiB | context \($model.default_max_model_len)"
+  ' "$catalog"
+  echo "0) Back"
+
+  prompt choice "Choose a model number: " "1"
+  if [ "$choice" = "0" ]; then
+    return 0
+  fi
+  count="$(jq '.models | length' "$catalog")"
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$count" ]; then
+    echo "Choose a number between 1 and ${count}."
+    return 1
+  fi
+  index=$((choice - 1))
+  catalog_key="$(jq -r --argjson index "$index" '.models[$index].key' "$catalog")"
+  display_name="$(jq -r --argjson index "$index" '.models[$index].display_name' "$catalog")"
+  model_id="$(jq -r --argjson index "$index" '.models[$index].model_id' "$catalog")"
+  summary="$(jq -r --argjson index "$index" '.models[$index].summary' "$catalog")"
+  category="$(jq -r --argjson index "$index" '.models[$index].category' "$catalog")"
+  estimated_size="$(jq -r --argjson index "$index" '.models[$index].estimated_weight_gb' "$catalog")"
+  recommended_vram="$(jq -r --argjson index "$index" '.models[$index].recommended_vram_gb' "$catalog")"
+  max_context="$(jq -r --argjson index "$index" '.models[$index].default_max_model_len' "$catalog")"
+  revision="$(jq -r --argjson index "$index" '.models[$index].revision' "$catalog")"
+  capabilities="$(jq -r --argjson index "$index" '.models[$index].capabilities | join(",")' "$catalog")"
+  fit_label="$(jq -nr --argjson vram "$total_vram" --argjson recommended "$recommended_vram" '
+    if $vram <= 0 then "UNKNOWN"
+    elif $recommended <= ($vram * 0.82) then "FIT"
+    elif $recommended <= ($vram * 0.97) then "TIGHT"
+    else "TOO LARGE" end')"
+
+  echo ""
+  echo "Install plan"
+  echo "  Model:        ${display_name} (${category})"
+  echo "  Repository:   ${model_id}"
+  echo "  Revision:     ${revision}"
+  echo "  Capabilities: ${capabilities}"
+  echo "  Disk:         ~${estimated_size} GiB"
+  echo "  VRAM:         ~${recommended_vram} GiB (${fit_label})"
+  echo "  Context:      ${max_context} tokens"
+  echo "  Notes:        ${summary}"
+  if [ "$fit_label" = "TOO LARGE" ]; then
+    echo "WARNING: This model is not recommended for the currently detected GPU memory."
+  fi
+  prompt confirm "Register this reviewed model? (yes/no): " "yes"
+  [ "${confirm,,}" = "yes" ] || return 0
+  prompt alias "Stable API alias: " "$catalog_key"
+  ai_add_catalog_model "$catalog_key" "$alias" || return 1
+
+  echo "Compatibility plan:"
+  ai_cli models compatibility "$alias" || true
+  prompt download_now "Download/resume the pinned model weights now? (yes/no): " "yes"
+  [ "${download_now,,}" = "yes" ] || return 0
+  ai_cli models download "$alias" || return 1
+
+  activate_default="no"
+  [ "$fit_label" = "FIT" ] && activate_default="yes"
+  prompt activate_now "Validate capacity and activate now? (yes/no): " "$activate_default"
+  if [ "${activate_now,,}" = "yes" ]; then
+    ai_cli models activate "$alias" || return 1
+    prompt set_default "Set this as the default model? (yes/no): " "yes"
+    [ "${set_default,,}" = "yes" ] && ai_cli models default "$alias"
+  fi
+}
+
+ai_health_report() {
+  local entry service port failed=0
+  echo "AI service health:"
+  for entry in gateway:8000 web:8080 controller:8090; do
+    service="${entry%%:*}"
+    port="${entry##*:}"
+    if ai_dc exec -T "$service" python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${port}/health', timeout=5)" >/dev/null 2>&1; then
+      echo "  ${service}: healthy"
+    else
+      echo "  ${service}: unhealthy"
+      failed=1
+    fi
+  done
+  ai_dc ps
+  return "$failed"
+}
+
+ai_install_or_repair() {
+  local existed="no"
+  local domain email image hf_token admin_name admin_email admin_password admin_password_confirm
+  local panel chat repair_runtime initial_model initial_alias environment_type container_mode="no" native_mode
+
+  ai_is_installed && existed="yes"
+  ai_environment_preflight
+  ai_environment_refresh no || true
+  environment_type="$(ai_environment_value environment_type)"
+  case "$environment_type" in
+    VAST_AI_CONTAINER|OTHER_MARKETPLACE_CONTAINER|DOCKER_CONTAINER)
+      container_mode="yes"
+      if ! ai_prepare_marketplace_container_base; then
+        prompt native_mode "Docker is unavailable. Install the isolated native runtime instead? (yes/no): " "yes"
+        if [ "${native_mode,,}" = "yes" ]; then
+          ai_install_native
+          return
+        fi
+        echo "AI Platform installation was cancelled. Existing provider Jupyter was not modified."
+        return 0
+      fi
+      ;;
+    *)
+      install_base
+      ;;
+  esac
+  if [ "$container_mode" = "no" ]; then
+    apt-get install -y python3 jq openssl rsync ca-certificates curl gnupg
+  fi
+  ai_copy_assets
+
+  domain="$(ai_env_value AI_DOMAIN)"
+  prompt domain "AI domain: " "${domain:-ai.example.com}"
+  domain="${domain,,}"
+  if ! validate_domain "$domain"; then
+    echo "Invalid fully qualified domain name."
+    return 1
+  fi
+  prompt email "Let's Encrypt email: " ""
+  if [[ ! "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+    echo "Invalid email address."
+    return 1
+  fi
+  image="$(ai_env_value VLLM_IMAGE)"
+  prompt image "Pinned vLLM image: " "${image:-$AI_DEFAULT_VLLM_IMAGE}"
+  if [[ ! "$image" =~ ^vllm/vllm-openai:[A-Za-z0-9._-]+$ ]]; then
+    echo "Use a pinned vllm/vllm-openai:<tag> image."
+    return 1
+  fi
+
+  if [ ! -f "$AI_PLATFORM_ENV" ]; then
+    cp "${AI_PLATFORM_BASE}/.env.example" "$AI_PLATFORM_ENV"
+    local postgres_password redis_password app_secret api_pepper internal_token controller_token proxy_token
+    postgres_password="$(ai_random_secret)"
+    redis_password="$(ai_random_secret)"
+    app_secret="$(ai_random_secret)"
+    api_pepper="$(ai_random_secret)"
+    internal_token="$(ai_random_secret)"
+    controller_token="$(ai_random_secret)"
+    proxy_token="$(ai_random_secret)"
+    set_env_file_var "$AI_PLATFORM_ENV" "POSTGRES_PASSWORD" "$postgres_password"
+    set_env_file_var "$AI_PLATFORM_ENV" "DATABASE_URL" "postgresql+psycopg://vllm_ai:${postgres_password}@postgres:5432/vllm_ai"
+    set_env_file_var "$AI_PLATFORM_ENV" "REDIS_PASSWORD" "$redis_password"
+    set_env_file_var "$AI_PLATFORM_ENV" "REDIS_URL" "redis://:${redis_password}@redis:6379/0"
+    set_env_file_var "$AI_PLATFORM_ENV" "APP_SECRET" "$app_secret"
+    set_env_file_var "$AI_PLATFORM_ENV" "API_KEY_PEPPER" "$api_pepper"
+    set_env_file_var "$AI_PLATFORM_ENV" "INTERNAL_GATEWAY_TOKEN" "$internal_token"
+    set_env_file_var "$AI_PLATFORM_ENV" "CONTROLLER_TOKEN" "$controller_token"
+    set_env_file_var "$AI_PLATFORM_ENV" "PROXY_SHARED_TOKEN" "$proxy_token"
+  fi
+
+  if [ -z "$(ai_env_value PROXY_SHARED_TOKEN)" ] || [ "$(ai_env_value PROXY_SHARED_TOKEN)" = "replace-me" ]; then
+    set_env_file_var "$AI_PLATFORM_ENV" "PROXY_SHARED_TOKEN" "$(ai_random_secret)"
+  fi
+
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_PLATFORM_SCHEMA_VERSION" "$AI_SCHEMA_VERSION"
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_DOMAIN" "$domain"
+  set_env_file_var "$AI_PLATFORM_ENV" "VLLM_IMAGE" "$image"
+  set_env_file_var "$AI_PLATFORM_ENV" "ALLOWED_ORIGINS" "https://${domain}"
+  set_env_file_var "$AI_PLATFORM_ENV" "COOKIE_SECURE" "true"
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_PLATFORM_ROOT" "$AI_PLATFORM_BASE"
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_SHARED_NETWORK" "$SHARED_NETWORK"
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_INTERNAL_NETWORK" "$AI_INTERNAL_NETWORK"
+
+  prompt panel "Enable administrator web panel? (yes/no): " "$( [ "$(ai_env_value ADMIN_PANEL_ENABLED)" = "false" ] && echo no || echo yes )"
+  prompt chat "Enable end-user chat portal? (yes/no): " "$( [ "$(ai_env_value CHAT_PORTAL_ENABLED)" = "false" ] && echo no || echo yes )"
+  [ "${panel,,}" = "yes" ] && panel="true" || panel="false"
+  [ "${chat,,}" = "yes" ] && chat="true" || chat="false"
+  set_env_file_var "$AI_PLATFORM_ENV" "ADMIN_PANEL_ENABLED" "$panel"
+  set_env_file_var "$AI_PLATFORM_ENV" "CHAT_PORTAL_ENABLED" "$chat"
+
+  prompt_secret hf_token "Hugging Face token (blank keeps existing/public-only): "
+  if [ -n "$hf_token" ]; then
+    printf '%s' "$hf_token" > "${AI_PLATFORM_BASE}/secrets/hf_token"
+  elif [ ! -f "${AI_PLATFORM_BASE}/secrets/hf_token" ]; then
+    : > "${AI_PLATFORM_BASE}/secrets/hf_token"
+  fi
+  chmod 600 "$AI_PLATFORM_ENV" "${AI_PLATFORM_BASE}/secrets/hf_token"
+  if [ ! -f "$AI_PLATFORM_META" ]; then
+    printf 'schema_version=%s\ninstalled_at=%s\n' "$AI_SCHEMA_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$AI_PLATFORM_META"
+  else
+    set_env_file_var "$AI_PLATFORM_META" "schema_version" "$AI_SCHEMA_VERSION"
+    set_env_file_var "$AI_PLATFORM_META" "last_repaired_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
+  set_env_file_var "$AI_PLATFORM_META" "vllm_image" "$image"
+  chmod 600 "$AI_PLATFORM_META"
+
+  ai_hardware_refresh no
+  if ! ai_gpu_diagnostics yes; then
+    prompt repair_runtime "GPU container validation failed. Install/repair NVIDIA Container Toolkit now? (yes/no): " "yes"
+    if [ "${repair_runtime,,}" = "yes" ]; then
+      ai_install_nvidia_runtime
+      ai_hardware_refresh yes
+    else
+      echo "Installation cannot safely activate models until GPU container access works."
+    fi
+  else
+    ai_hardware_refresh yes
+  fi
+
+  echo "Pulling pinned vLLM runtime image ${image}..."
+  docker pull "$image"
+  ai_dc config >/dev/null
+  ai_dc build --pull
+  ai_dc up -d postgres redis
+  ai_dc run --rm migrate
+  ai_dc up -d gateway web controller
+
+  if [ "$existed" = "no" ]; then
+    prompt admin_name "First administrator name: " "Administrator"
+    prompt admin_email "First administrator email: " ""
+    while true; do
+      prompt_secret admin_password "First administrator password (minimum 12 characters): "
+      prompt_secret admin_password_confirm "Confirm password: "
+      if ai_password_is_strong "$admin_password" && [ "$admin_password" = "$admin_password_confirm" ]; then
+        break
+      fi
+      echo "Passwords must match, contain 12-256 characters, and use at least three of lowercase, uppercase, numbers and symbols."
+    done
+    printf '%s\n' "$admin_password" \
+      | ai_dc exec -T controller python -m app.cli init-admin \
+        --name "$admin_name" --email "$admin_email" --password-stdin
+
+    echo "Curated models available for optional registration:"
+    jq -r '.models[] | "  \(.key): \(.model_id) [\(.capabilities | join(","))]"' "${AI_PLATFORM_BASE}/config/model-catalog.json"
+    prompt initial_model "Initial catalog model key (blank skips; registration does not download or activate): " ""
+    if [ -n "$initial_model" ]; then
+      prompt initial_alias "Stable API alias: " "$initial_model"
+      ai_add_catalog_model "$initial_model" "$initial_alias"
+    fi
+  fi
+
+  ai_configure_proxy "$domain" "$email"
+  if [ "$container_mode" = "no" ] && command -v crontab >/dev/null 2>&1; then
+    ensure_cron_jobs
+  else
+    echo "Host cron integration skipped in marketplace/container mode. Run diagnostics and backups through the provider scheduler if required."
+  fi
+  if ! ai_health_report; then
+    echo "Installation completed, but one or more AI services failed their health check."
+    return 1
+  fi
+  echo ""
+  echo "vLLM AI platform is ready at https://${domain}/"
+  echo "OpenAI-compatible API base: https://${domain}/v1"
+}
+
+ai_platform_start() {
+  ai_require_installed || return 1
+  ai_hardware_refresh no
+  if jq -e '.downgrade_detected == true or .requires_model_review == true' "${AI_PLATFORM_BASE}/hardware/change.json" >/dev/null; then
+    echo "Hardware changes require model compatibility review:"
+    jq . "${AI_PLATFORM_BASE}/hardware/change.json"
+  fi
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    ai_native start
+  else
+    ai_dc up -d postgres redis
+    ai_dc run --rm migrate
+    ai_dc up -d gateway web controller
+  fi
+  ai_cli models reconcile --wait-seconds 600 || true
+}
+
+ai_platform_stop() {
+  ai_require_installed || return 1
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    ai_native stop
+    return
+  fi
+  local ids
+  ids="$(docker ps -q --filter label=com.vllm-ai-platform.managed=true)"
+  if [ -n "$ids" ]; then
+    docker stop $ids
+  fi
+  ai_dc stop
+}
+
+ai_platform_restart() {
+  ai_platform_stop
+  ai_platform_start
+}
+
+ai_platform_status() {
+  if ! ai_is_installed; then
+    echo "AI platform: not installed"
+    return 0
+  fi
+  echo "AI platform: installed"
+  echo "Runtime mode: $(ai_runtime_mode)"
+  echo "Domain: $(ai_env_value AI_DOMAIN)"
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    echo "Native vLLM: $(ai_env_value NATIVE_VLLM_VERSION)"
+  else
+    echo "vLLM image: $(ai_env_value VLLM_IMAGE)"
+  fi
+  if [ -f "${AI_PLATFORM_BASE}/hardware/current.json" ]; then
+    jq -r '"Host: CPU=\(.cpu.model // "unknown") | RAM=\(((.memory.total_bytes // 0) / 1073741824 * 10 | floor) / 10) GiB | GPUs=\(.gpus | length)", (.gpu_driver.version // "unknown") as $driver | (.gpus[]? | "  GPU \(.index): \(.name) | \(((.memory_total_bytes // 0) / 1048576 | floor)) MiB | driver \($driver)")' "${AI_PLATFORM_BASE}/hardware/current.json"
+  fi
+  if [ -f "$AI_ENVIRONMENT_SNAPSHOT" ]; then
+    jq -r '"Environment: \(.environment_type // "UNKNOWN") | provider=\(.provider // "unknown")", "Jupyter: detected=\(.jupyter.detected // false) running=\(.jupyter.running // false) management=\(.jupyter.management // "UNKNOWN") action=\(.jupyter.action // "UNKNOWN")"' "$AI_ENVIRONMENT_SNAPSHOT" 2>/dev/null || true
+  fi
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    ai_native status 2>/dev/null || true
+    ai_cli status 2>/dev/null || true
+  else
+    echo "Running Compose services:"
+    ai_dc ps --status running --services 2>/dev/null || true
+    echo "Managed model containers:"
+    docker ps --filter label=com.vllm-ai-platform.managed=true \
+      --format '  {{.Names}}  {{.Status}}' 2>/dev/null || true
+    if ai_dc ps --status running --services 2>/dev/null | grep -qx controller; then
+      ai_cli status || true
+    fi
+  fi
+}
+
+ai_platform_diagnostics() {
+  ai_require_installed || return 1
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    ai_hardware_refresh no || true
+  else
+    ai_hardware_refresh yes || true
+  fi
+  ai_platform_status
+  echo ""
+  ai_gpu_diagnostics no || true
+  echo ""
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    echo "Native runtime validation:"
+    ai_native status || true
+    "${AI_NATIVE_VLLM_VENV}/bin/vllm" --version 2>/dev/null || true
+    echo "  All managed HTTP and model listeners bind to loopback."
+  else
+    echo "Compose validation:"
+    ai_dc config >/dev/null && echo "  OK"
+    echo "Runtime versions:"
+    docker --version 2>/dev/null || true
+    dc version 2>/dev/null || true
+    echo "AI networks:"
+    docker network inspect "$AI_INTERNAL_NETWORK" "$AI_EGRESS_NETWORK" "$SHARED_NETWORK" \
+      --format '  {{.Name}} internal={{.Internal}} containers={{len .Containers}}' 2>/dev/null || true
+  fi
+  echo "AI filesystem:"
+  jq -r '"  path=\(.storage.path) total=\((.storage.total_bytes / 1073741824 * 10 | floor) / 10) GiB used=\((.storage.used_bytes / 1073741824 * 10 | floor) / 10) GiB free=\((.storage.free_bytes / 1073741824 * 10 | floor) / 10) GiB"' "${AI_PLATFORM_BASE}/hardware/current.json" 2>/dev/null || true
+  echo "Health:"
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    ai_native status || true
+    echo "Recent service errors:"
+    tail -n 80 "${AI_PLATFORM_BASE}/logs/gateway.log" "${AI_PLATFORM_BASE}/logs/web.log" "${AI_PLATFORM_BASE}/logs/controller.log" 2>/dev/null \
+      | grep -Ei 'error|exception|failed|traceback|out of memory|cuda' \
+      | tail -n 40 || echo "  No matching recent errors."
+  else
+    ai_dc ps
+    echo "Recent service errors:"
+    ai_dc logs --tail 80 gateway web controller 2>&1 \
+      | grep -Ei 'error|exception|failed|traceback|out of memory|cuda' \
+      | tail -n 40 || echo "  No matching recent errors."
+  fi
+  echo "Coding/IDE capability report:"
+  ai_cli coding-diagnostics || true
+  echo "Jupyter/environment capability report:"
+  ai_cli jupyter-diagnostics || true
+}
+
+ai_jupyter_status() {
+  ai_environment_refresh no || return 1
+  python3 - "$AI_ENVIRONMENT_SNAPSHOT" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+jupyter = value.get("jupyter", {})
+yes_no = lambda item: "YES" if item else "NO"
+status = "RUNNING" if jupyter.get("running") else "STOPPED" if jupyter.get("detected") else "NOT INSTALLED"
+print("============================================================")
+print("JUPYTER INTEGRATION")
+print("============================================================")
+print(f"Provider:            {value.get('provider', 'unknown')}")
+print(f"Runtime:             {value.get('runtime', {}).get('kind', 'unknown')}")
+print(f"Environment type:    {value.get('environment_type', 'UNKNOWN')}")
+print(f"Jupyter:             {'DETECTED' if jupyter.get('detected') else 'NOT DETECTED'}")
+print(f"JupyterLab:          {'AVAILABLE' if jupyter.get('lab_available') else 'NOT DETECTED'}")
+print(f"Status:              {status}")
+print(f"Management:          {jupyter.get('management', 'UNKNOWN')}")
+print(f"AI Platform action:  {jupyter.get('action', 'UNKNOWN')}")
+print(f"Python:              {value.get('python', {}).get('version', 'unknown')}")
+print(f"CUDA visible:        {yes_no(value.get('cuda', {}).get('visible'))}")
+print(f"GPU visible:         {yes_no(value.get('gpu', {}).get('visible'))}")
+print(f"PyTorch:             {'AVAILABLE' if value.get('pytorch', {}).get('available') else 'NOT AVAILABLE'}")
+print(f"PyTorch GPU:         {value.get('pytorch', {}).get('gpu_status', 'NOT_TESTED')}")
+print(f"Docker daemon:       {yes_no(value.get('capabilities', {}).get('docker_daemon_available'))}")
+print(f"systemd:             {yes_no(value.get('capabilities', {}).get('systemd_available'))}")
+PY
+}
+
+ai_jupyter_environment_information() {
+  ai_environment_refresh no || return 1
+  python3 -m json.tool "$AI_ENVIRONMENT_SNAPSHOT"
+}
+
+ai_jupyter_cuda_test() {
+  ai_environment_refresh no || true
+  echo "Safe CUDA/GPU diagnostic (read-only):"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu,power.draw \
+      --format=csv,noheader,nounits || true
+  else
+    echo "  nvidia-smi is unavailable; nothing was installed or changed."
+  fi
+  python3 - "$AI_ENVIRONMENT_SNAPSHOT" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+print(json.dumps({"cuda": value.get("cuda", {}), "gpu": value.get("gpu", {})}, indent=2))
+PY
+}
+
+ai_jupyter_pytorch_test() {
+  ai_environment_refresh yes || return 1
+  python3 - "$AI_ENVIRONMENT_SNAPSHOT" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    pytorch = json.load(handle).get("pytorch", {})
+if pytorch.get("available"):
+    print("PyTorch: AVAILABLE")
+    print(f"PyTorch GPU: {pytorch.get('gpu_status', 'NOT_TESTED')}")
+    print(f"Device count: {pytorch.get('device_count') or 0}")
+    print(f"Version: {pytorch.get('torch_version') or 'unknown'}")
+    print(f"PyTorch CUDA: {pytorch.get('torch_cuda_version') or 'unknown'}")
+else:
+    print("PyTorch GPU Test: NOT AVAILABLE")
+    print("No package was installed or upgraded.")
+PY
+}
+
+ai_jupyter_test_vllm_api() {
+  local base_url api_key model run_chat configured_domain tester test_status tester_args=()
+  configured_domain="$(ai_env_value AI_DOMAIN)"
+  base_url="https://${configured_domain:-ai.example.com}/v1"
+  prompt base_url "Gateway API base URL: " "$base_url"
+  if [[ ! "$base_url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/v1/?$ ]]; then
+    echo "Use an HTTPS Gateway base ending in /v1. Raw vLLM URLs are not accepted."
+    return 1
+  fi
+  base_url="${base_url%/}"
+  prompt_secret api_key "Dedicated diagnostic Gateway API key: "
+  if [[ ! "$api_key" =~ ^ovai_live_[A-Za-z0-9._-]+$ ]]; then
+    unset api_key
+    echo "The API key format is invalid."
+    return 1
+  fi
+  prompt run_chat "Send one short chat request through the Gateway? (yes/no): " "yes"
+  if [ "${run_chat,,}" = "yes" ]; then
+    prompt model "Active authorized model alias: " ""
+    if [[ ! "$model" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      unset api_key
+      echo "Invalid model alias."
+      return 1
+    fi
+    tester_args=(--model "$model")
+  fi
+  if [ -f "${AI_PLATFORM_BASE}/scripts/test_gateway.py" ]; then
+    tester="${AI_PLATFORM_BASE}/scripts/test_gateway.py"
+  else
+    tester="$(ai_assets_dir)/scripts/test_gateway.py"
+  fi
+  if printf '%s\n' "$api_key" | python3 "$tester" --base-url "$base_url" --api-key-stdin "${tester_args[@]}"; then
+    test_status=0
+  else
+    test_status=$?
+  fi
+  unset api_key
+  return "$test_status"
+}
+
+ai_jupyter_generate_notebook() {
+  local kind="$1" owner generator owner_args=()
+  ai_environment_refresh no || true
+  if [ -f "${AI_PLATFORM_BASE}/scripts/generate_notebook.py" ]; then
+    generator="${AI_PLATFORM_BASE}/scripts/generate_notebook.py"
+  else
+    generator="$(ai_assets_dir)/scripts/generate_notebook.py"
+  fi
+  owner="$(ai_environment_value jupyter.effective_user)"
+  if [ -n "$owner" ] && [ "$owner" != "root" ] && id "$owner" >/dev/null 2>&1; then
+    owner_args=(--owner "$owner")
+  fi
+  python3 "$generator" "$kind" \
+    --output-dir "$AI_NOTEBOOKS_BASE" "${owner_args[@]}"
+  echo "The notebook contains no API key. Supply a restricted Gateway credential at runtime."
+}
+
+ai_jupyter_provider_access() {
+  ai_environment_refresh no || return 1
+  python3 - "$AI_ENVIRONMENT_SNAPSHOT" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+jupyter = value.get("jupyter", {})
+status = "RUNNING" if jupyter.get("running") else "DETECTED / STOPPED" if jupyter.get("detected") else "NOT DETECTED"
+listeners = ", ".join(f"{item.get('address')}:{item.get('port')} [{item.get('scope')}]" for item in jupyter.get("internal_listeners", [])) or "not discoverable"
+print(f"Provider: {value.get('provider', 'unknown')}")
+print(f"Jupyter: {status}")
+print(f"Management: {jupyter.get('management', 'UNKNOWN')}")
+print(f"Access: {jupyter.get('provider_access', 'Not detected')}")
+print(f"Internal listeners: {listeners}")
+print("External URL: NOT INFERRED")
+print("Provider credentials: NEVER DISPLAYED")
+PY
+}
+
+ai_jupyter_security_diagnostics() {
+  ai_environment_refresh no || return 1
+  python3 - "$AI_ENVIRONMENT_SNAPSHOT" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+security = value.get("security", {})
+jupyter = value.get("jupyter", {})
+print(f"Probe mode: {security.get('probe_mode')}")
+print(f"Provider configuration modified: {security.get('provider_configuration_modified')}")
+print(f"Provider startup modified: {security.get('provider_startup_modified')}")
+print(f"Provider authentication modified: {security.get('provider_authentication_modified')}")
+print(f"New public Jupyter listener created: {security.get('platform_public_jupyter_listener_created')}")
+print(f"Runtime file contents read: {security.get('runtime_file_contents_read')}")
+print(f"Process arguments included: {security.get('process_arguments_included')}")
+print(f"Secrets included: {security.get('secrets_included')}")
+print(f"Provider-managed: {jupyter.get('management') == 'PROVIDER_MANAGED'}")
+print(f"Policy: {jupyter.get('action')}")
+for listener in jupyter.get("internal_listeners", []):
+    print(f"Listener: {listener.get('address')}:{listener.get('port')} scope={listener.get('scope')}")
+if any(item.get("scope") == "ALL_INTERFACES" for item in jupyter.get("internal_listeners", [])):
+    print("WARNING: a detected Jupyter listener uses all interfaces. Verify provider authentication; this platform will not rewrite it.")
+PY
+  echo "No Jupyter token, password, Gateway key, HF token, encryption key or private key is read or printed."
+}
+
+ai_jupyter_install_isolated() {
+  local environment_type detected confirm owner
+  ai_environment_refresh no || return 1
+  environment_type="$(jq -r '.environment_type' "$AI_ENVIRONMENT_SNAPSHOT")"
+  detected="$(jq -r '.jupyter.detected' "$AI_ENVIRONMENT_SNAPSHOT")"
+  if [ "$environment_type" != "FULL_VM" ] && [ "$environment_type" != "BARE_METAL" ]; then
+    echo "Optional installation is disabled in containers and marketplace environments. Existing provider Jupyter must be preserved."
+    return 1
+  fi
+  if [ "$detected" = "true" ]; then
+    echo "Jupyter already exists. It will not be reinstalled, replaced or reconfigured."
+    return 1
+  fi
+  prompt owner "Non-root OS user who will own generated notebooks: " ""
+  if [ -z "$owner" ] || [ "$owner" = "root" ] || ! id "$owner" >/dev/null 2>&1; then
+    echo "Choose an existing non-root operating-system user."
+    return 1
+  fi
+  prompt confirm "Type INSTALL ISOLATED JUPYTER to create a private virtual environment without starting a server: " ""
+  [ "$confirm" = "INSTALL ISOLATED JUPYTER" ] || return 0
+  if ! python3 -m venv "${AI_PLATFORM_BASE}/jupyter-venv"; then
+    apt-get update -y
+    apt-get install -y python3-venv
+    python3 -m venv "${AI_PLATFORM_BASE}/jupyter-venv"
+  fi
+  "${AI_PLATFORM_BASE}/jupyter-venv/bin/python" -m pip install --upgrade pip
+  "${AI_PLATFORM_BASE}/jupyter-venv/bin/python" -m pip install 'jupyterlab>=4,<5'
+  mkdir -p "${AI_PLATFORM_BASE}/state" "$AI_NOTEBOOKS_BASE"
+  printf '{"management":"AI_PLATFORM_MANAGED","startup_managed":false,"public_listener_created":false}\n' > "${AI_PLATFORM_BASE}/state/jupyter-managed.json"
+  chown -R "$owner":"$(id -gn "$owner")" "$AI_NOTEBOOKS_BASE"
+  find "$AI_NOTEBOOKS_BASE" -type d -exec chmod 770 {} +
+  find "$AI_NOTEBOOKS_BASE" -type f -name '*.ipynb' -exec chmod 660 {} +
+  ai_environment_refresh no
+  echo "JupyterLab was installed in an isolated virtual environment but was NOT started, exposed, proxied or added to systemd."
+  echo "Launch it manually as ${owner}, bound to 127.0.0.1, and access it through an SSH tunnel or an explicitly secured proxy."
+  echo "Command: ${AI_PLATFORM_BASE}/jupyter-venv/bin/jupyter lab --no-browser --ip=127.0.0.1 --notebook-dir=${AI_NOTEBOOKS_BASE}"
+}
+
+ai_jupyter_menu() {
+  local action environment_type detected show_install
+  while true; do
+    echo ""
+    echo "============================================================"
+    echo "                    JUPYTER INTEGRATION"
+    echo "============================================================"
+    ai_jupyter_status || true
+    echo "1) Jupyter Status"
+    echo "2) Environment Information"
+    echo "3) Test CUDA"
+    echo "4) Test PyTorch GPU"
+    echo "5) Test vLLM API through the Gateway"
+    echo "6) Generate vLLM Test Notebook"
+    echo "7) Generate GPU Benchmark Notebook"
+    echo "8) Generate Tool-Calling Test Notebook"
+    echo "9) Generate Embeddings / RAG Test Notebook"
+    echo "10) Show Provider Access Information"
+    echo "11) Security Diagnostics"
+    environment_type="$(ai_environment_value environment_type)"
+    detected="$(ai_environment_value jupyter.detected)"
+    show_install="no"
+    if { [ "$environment_type" = "FULL_VM" ] || [ "$environment_type" = "BARE_METAL" ]; } && [ "$detected" != "true" ]; then
+      show_install="yes"
+      echo "12) Optional isolated JupyterLab install (trusted VPS only)"
+    fi
+    echo "0) Back"
+    prompt action "Option: " "0"
+    case "$action" in
+      1) ai_jupyter_status ;;
+      2) ai_jupyter_environment_information ;;
+      3) ai_jupyter_cuda_test ;;
+      4) ai_jupyter_pytorch_test ;;
+      5) ai_jupyter_test_vllm_api ;;
+      6) ai_jupyter_generate_notebook vllm-api ;;
+      7) ai_jupyter_generate_notebook gpu-benchmark ;;
+      8) ai_jupyter_generate_notebook tool-calling ;;
+      9) ai_jupyter_generate_notebook embeddings-rag ;;
+      10) ai_jupyter_provider_access ;;
+      11) ai_jupyter_security_diagnostics ;;
+      12)
+        if [ "$show_install" = "yes" ]; then
+          ai_jupyter_install_isolated
+        else
+          echo "Installation is not available for a detected/provider-managed Jupyter environment."
+        fi
+        ;;
+      0) return 0 ;;
+      *) echo "Invalid option." ;;
+    esac
+  done
+}
+
+ai_platform_logs() {
+  local service lines
+  ai_require_installed || return 1
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    prompt service "Service (gateway/web/controller/redis/cloudflared/supervisord/all/backup-cron or model:<alias>): " "all"
+  else
+    prompt service "Service (gateway/web/controller/postgres/redis/all/proxy/backup-cron or model:<container>): " "all"
+  fi
+  prompt lines "Number of lines: " "150"
+  if [[ "$service" == model:* ]]; then
+    if [ "$(ai_runtime_mode)" = "native" ]; then
+      local safe_alias
+      safe_alias="$(printf '%s' "${service#model:}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')"
+      tail -n "$lines" "${AI_PLATFORM_BASE}/logs/model-vllm-ai-${safe_alias}.log"
+    else
+      docker logs --tail "$lines" "${service#model:}"
+    fi
+  elif [ "$service" = "proxy" ]; then
+    proxy_dc logs --tail "$lines" reverse-proxy
+  elif [ "$service" = "backup-cron" ]; then
+    tail -n "$lines" /var/log/vllm-ai-platform-backup.log 2>/dev/null || echo "No AI backup log exists yet."
+  elif [ "$service" = "all" ]; then
+    if [ "$(ai_runtime_mode)" = "native" ]; then
+      tail -n "$lines" "${AI_PLATFORM_BASE}/logs/"*.log 2>/dev/null || echo "No native logs exist yet."
+    else
+      ai_dc logs --tail "$lines"
+    fi
+  else
+    if [ "$(ai_runtime_mode)" = "native" ]; then
+      ai_native logs "$service" --lines "$lines"
+    else
+      ai_dc logs --tail "$lines" "$service"
+    fi
+  fi
+}
+
+ai_model_menu() {
+  local action model_id alias revision caps size gpus tp pp profile path confirm new_alias
+  local quantization dtype max_context max_sequences trust_remote tools parser chat_template auto_start
+  local token_required hf_token download_now activate_now
+  ai_require_installed || return 1
+  while true; do
+    echo ""
+    echo "Model management"
+    echo "1) List models"
+    echo "2) Install a current stable model (guided)"
+    echo "3) Add arbitrary Hugging Face model"
+    echo "4) Import custom model path"
+    echo "5) Download/resume model"
+    echo "6) Activate model"
+    echo "7) Deactivate model"
+    echo "8) Show model details"
+    echo "9) Analyze compatibility"
+    echo "10) Set default model"
+    echo "11) Change model alias"
+    echo "12) Configure GPUs/tensor parallelism/profile"
+    echo "13) Tune performance profile"
+    echo "14) Restart model"
+    echo "15) Clone model configuration"
+    echo "16) Delete model record only"
+    echo "17) Delete model and downloaded weights"
+    echo "18) Show internal vLLM metrics"
+    echo "19) Plan/safely switch active model for limited VRAM"
+    echo "20) Back"
+    prompt action "Option: " "20"
+    case "$action" in
+      1) ai_cli models list ;;
+      2) ai_catalog_model_wizard ;;
+      3)
+        prompt model_id "Hugging Face model ID: " ""
+        prompt revision "Pinned revision/tag/commit: " "main"
+        prompt alias "Stable API alias: " ""
+        prompt caps "Capabilities (general,chat,coding,agentic,reasoning,tool_calling,responses,embeddings,vision): " "chat,completions"
+        prompt size "Estimated weight size in GiB (0 if unknown): " "0"
+        prompt token_required "Does this gated/private model require a Hugging Face token? (yes/no): " "no"
+        if [ "${token_required,,}" = "yes" ]; then
+          prompt_secret hf_token "Hugging Face token (blank keeps the configured token): "
+          if [ -n "$hf_token" ]; then
+            printf '%s' "$hf_token" > "${AI_PLATFORM_BASE}/secrets/hf_token"
+            chmod 600 "${AI_PLATFORM_BASE}/secrets/hf_token"
+          fi
+        fi
+        prompt trust_remote "Trust remote model code? Type YES only after reviewing the repository: " "no"
+        prompt quantization "Quantization (blank/awq/gptq/fp8/...): " ""
+        prompt dtype "dtype: " "auto"
+        prompt max_context "Maximum model context: " "4096"
+        prompt gpus "GPU indexes (comma-separated or auto): " "auto"
+        prompt tp "Tensor parallel size: " "1"
+        prompt pp "Pipeline parallel size: " "1"
+        prompt max_sequences "Maximum concurrent sequences: " "4"
+        prompt tools "Enable compatible tool/function calling? (yes/no): " "no"
+        parser=""
+        if [ "${tools,,}" = "yes" ]; then
+          prompt parser "vLLM tool-call parser supported by this model: " ""
+        fi
+        prompt chat_template "Chat template path/text (blank uses the model default): " ""
+        prompt auto_start "Auto-start this model when the platform starts? (yes/no): " "no"
+        prompt profile "Profile (AUTO/CONSERVATIVE/BALANCED/PERFORMANCE/MAXIMUM/CUSTOM): " "AUTO"
+        profile="${profile^^}"
+        case "$profile" in
+          AUTO|CONSERVATIVE|BALANCED|PERFORMANCE|MAXIMUM|CUSTOM) ;;
+          *) echo "Invalid performance profile."; continue ;;
+        esac
+        local add_args=(models add --model-id "$model_id" --revision "$revision" --alias "$alias"
+          --capabilities "$caps" --estimated-weight-gb "$size" --quantization "$quantization"
+          --dtype "$dtype" --max-model-len "$max_context" --gpus "$gpus"
+          --tensor-parallel-size "$tp" --pipeline-parallel-size "$pp" --max-num-seqs "$max_sequences"
+          --performance-profile "$profile" --chat-template "$chat_template")
+        [ "$trust_remote" = "YES" ] && add_args+=(--trust-remote-code)
+        if [ "${tools,,}" = "yes" ]; then add_args+=(--tool-calling --tool-call-parser "$parser"); fi
+        [ "${auto_start,,}" = "yes" ] && add_args+=(--auto-start)
+        ai_cli "${add_args[@]}"
+        prompt download_now "Download/resume model weights now? (yes/no): " "yes"
+        if [ "${download_now,,}" = "yes" ]; then
+          ai_cli models download "$alias"
+          prompt activate_now "Validate capacity and activate now? (yes/no): " "no"
+          [ "${activate_now,,}" = "yes" ] && ai_cli models activate "$alias"
+        fi
+        ;;
+      4)
+        prompt path "Absolute model path under ${AI_PLATFORM_BASE}/models: " ""
+        prompt alias "Stable API alias: " ""
+        prompt caps "Capabilities: " "chat,completions"
+        if [[ "$path" != "${AI_PLATFORM_BASE}/models/"* ]]; then
+          echo "The path must be below ${AI_PLATFORM_BASE}/models."
+          continue
+        fi
+        path="/models/${path#"${AI_PLATFORM_BASE}/models/"}"
+        ai_cli models add --model-id "local/${alias}" --alias "$alias" \
+          --local-path "$path" --capabilities "$caps"
+        ;;
+      5) prompt model_id "Model ID or alias: " ""; ai_cli models download "$model_id" ;;
+      6) prompt model_id "Model ID or alias: " ""; ai_cli models activate "$model_id" ;;
+      7) prompt model_id "Model ID or alias: " ""; ai_cli models deactivate "$model_id" ;;
+      8) prompt model_id "Model ID or alias: " ""; ai_cli models details "$model_id" ;;
+      9) prompt model_id "Model ID or alias: " ""; ai_cli models compatibility "$model_id" ;;
+      10) prompt model_id "Model ID or alias: " ""; ai_cli models default "$model_id" ;;
+      11)
+        prompt model_id "Model ID or current alias: " ""
+        prompt new_alias "New alias: " ""
+        ai_cli models alias "$model_id" "$new_alias"
+        ;;
+      12)
+        prompt model_id "Model ID or alias: " ""
+        prompt gpus "GPU indexes (comma-separated or auto): " "auto"
+        prompt tp "Tensor parallel size: " "1"
+        prompt profile "Profile (AUTO/CONSERVATIVE/BALANCED/PERFORMANCE/MAXIMUM/CUSTOM): " "AUTO"
+        ai_cli models configure "$model_id" --gpus "$gpus" --tensor-parallel-size "$tp" --performance-profile "${profile^^}"
+        ;;
+      13)
+        prompt model_id "Model ID or alias: " ""
+        prompt profile "Profile (AUTO/CONSERVATIVE/BALANCED/PERFORMANCE/MAXIMUM/CUSTOM): " "BALANCED"
+        if [ "${profile^^}" = "MAXIMUM" ]; then
+          prompt confirm "MAXIMUM uses the smallest safety reserve permitted by the profile. Apply after validation? (yes/no): " "no"
+          [ "${confirm,,}" = "yes" ] || continue
+        fi
+        ai_cli performance "$model_id" "${profile^^}" --apply
+        ;;
+      14) prompt model_id "Model ID or alias: " ""; ai_cli models restart "$model_id" ;;
+      15)
+        prompt model_id "Model ID or alias: " ""
+        prompt new_alias "Alias for clone: " ""
+        ai_cli models clone "$model_id" "$new_alias"
+        ;;
+      16)
+        prompt model_id "Model ID or alias: " ""
+        prompt confirm "Delete the model record but keep weights? (yes/no): " "no"
+        [ "${confirm,,}" = "yes" ] && ai_cli models delete "$model_id"
+        ;;
+      17)
+        prompt model_id "Model ID or alias: " ""
+        prompt confirm "Permanently delete this record and its managed weight directory? Type DELETE: " ""
+        [ "$confirm" = "DELETE" ] && ai_cli models delete "$model_id" --delete-weights
+        ;;
+      18) prompt model_id "Model ID or alias: " ""; ai_cli models metrics "$model_id" ;;
+      19)
+        prompt model_id "Downloaded model ID or alias: " ""
+        ai_cli models plan "$model_id" || continue
+        prompt confirm "Stop the listed conflicting model(s) and activate this one? (yes/no): " "no"
+        [ "${confirm,,}" = "yes" ] && ai_cli models switch "$model_id"
+        ;;
+      20) return 0 ;;
+      *) echo "Invalid option." ;;
+    esac
+  done
+}
+
+ai_user_menu() {
+  local action name email role user_id password description models scopes endpoints purpose service_id confirm custom_system
+  while true; do
+    echo ""
+    echo "Users and service accounts"
+    echo "1) List users"
+    echo "2) Create user"
+    echo "3) Enable user"
+    echo "4) Disable user"
+    echo "5) Reset user password"
+    echo "6) List service accounts"
+    echo "7) Create service account"
+    echo "8) Enable service account"
+    echo "9) Disable service account"
+    echo "10) Delete service account"
+    echo "11) Back"
+    prompt action "Option: " "11"
+    case "$action" in
+      1) ai_cli users list ;;
+      2)
+        prompt name "Name: " ""
+        prompt email "Email: " ""
+        prompt role "Role (super_admin/administrator/user): " "user"
+        prompt_secret password "Temporary password: "
+        printf '%s\n' "$password" | ai_dc exec -T controller python -m app.cli users create --name "$name" --email "$email" --role "$role"
+        ;;
+      3|4)
+        prompt user_id "User numeric ID: " ""
+        [ "$action" = "3" ] && ai_cli users enable "$user_id" || ai_cli users disable "$user_id"
+        ;;
+      5)
+        prompt user_id "User numeric ID: " ""
+        prompt_secret password "New temporary password: "
+        printf '%s\n' "$password" | ai_dc exec -T controller python -m app.cli users reset-password "$user_id"
+        ;;
+      6) ai_cli service-accounts list ;;
+      7)
+        prompt name "Service account name: " ""
+        prompt description "Description: " ""
+        prompt purpose "Purpose (general_api/omnivis_production/coding_agent/custom): " "general_api"
+        prompt models "Allowed model aliases (blank means all permitted models): " ""
+        prompt scopes "Allowed scopes: " "models,chat"
+        prompt endpoints "Allowed endpoints (comma-separated; blank keeps legacy behavior): " ""
+        prompt custom_system "Permit custom system messages? (yes/no): " "no"
+        local service_args=(service-accounts create --name "$name" --description "$description" --purpose "$purpose" --models "$models" --scopes "$scopes" --endpoints "$endpoints")
+        [ "${custom_system,,}" = "yes" ] && service_args+=(--allow-custom-system-messages)
+        ai_cli "${service_args[@]}"
+        ;;
+      8|9)
+        prompt service_id "Service account numeric ID: " ""
+        [ "$action" = "8" ] && ai_cli service-accounts enable "$service_id" || ai_cli service-accounts disable "$service_id"
+        ;;
+      10)
+        prompt service_id "Service account numeric ID: " ""
+        prompt confirm "Delete it and all attached API keys? Type DELETE: " ""
+        [ "$confirm" = "DELETE" ] && ai_cli service-accounts delete "$service_id"
+        ;;
+      11) return 0 ;;
+      *) echo "Invalid option." ;;
+    esac
+  done
+}
+
+ai_key_menu() {
+  local action name owner_type owner_id models cidrs scopes endpoints key_id
+  while true; do
+    echo ""
+    echo "API keys"
+    echo "1) List  2) Create  3) Revoke  4) Rotate  5) Back"
+    prompt action "Option: " "5"
+    case "$action" in
+      1) ai_cli keys list ;;
+      2)
+        prompt name "Key name: " ""
+        prompt owner_type "Owner type (user/service): " "user"
+        prompt owner_id "Owner numeric ID: " ""
+        prompt models "Allowed model aliases (blank means owner policy): " ""
+        prompt cidrs "Allowed IPv4/IPv6 CIDRs (blank means inherited policy): " ""
+        prompt scopes "Allowed scopes: " "models,chat"
+        prompt endpoints "Allowed endpoints (comma-separated; blank inherits owner/legacy behavior): " ""
+        if [ "$owner_type" = "service" ]; then
+          ai_cli keys create --name "$name" --service-account-id "$owner_id" --models "$models" --cidrs "$cidrs" --scopes "$scopes" --endpoints "$endpoints"
+        else
+          ai_cli keys create --name "$name" --user-id "$owner_id" --models "$models" --cidrs "$cidrs" --scopes "$scopes" --endpoints "$endpoints"
+        fi
+        ;;
+      3|4)
+        prompt key_id "API key numeric ID: " ""
+        [ "$action" = "3" ] && ai_cli keys revoke "$key_id" || ai_cli keys rotate "$key_id"
+        ;;
+      5) return 0 ;;
+      *) echo "Invalid option." ;;
+    esac
+  done
+}
+
+ai_ip_menu() {
+  local action cidr scope subject description rule_id
+  while true; do
+    echo ""
+    echo "IP allowlists"
+    echo "1) List  2) Add  3) Delete  4) Back"
+    prompt action "Option: " "4"
+    case "$action" in
+      1) ai_cli ip list ;;
+      2)
+        prompt cidr "IPv4 or IPv6 CIDR: " ""
+        prompt scope "Scope (global/service_account/api_key): " "global"
+        prompt subject "Subject ID (blank for global): " ""
+        prompt description "Description: " ""
+        local args=(ip add "$cidr" --scope "$scope" --description "$description")
+        [ -n "$subject" ] && args+=(--subject-id "$subject")
+        ai_cli "${args[@]}"
+        ;;
+      3) prompt rule_id "Rule numeric ID: " ""; ai_cli ip delete "$rule_id" ;;
+      4) return 0 ;;
+      *) echo "Invalid option." ;;
+    esac
+  done
+}
+
+ai_cloudflared_binary() {
+  local candidate from_path
+  from_path="$(command -v cloudflared 2>/dev/null || true)"
+  for candidate in /opt/instance-tools/bin/cloudflared /usr/local/bin/cloudflared /usr/bin/cloudflared "$from_path"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ai_hostname_is_valid() {
+  python3 - "$1" <<'PY' >/dev/null 2>&1
+import re
+import sys
+
+value = sys.argv[1].strip().lower().rstrip(".")
+if len(value) > 253 or "." not in value or "://" in value or "/" in value:
+    raise SystemExit(1)
+try:
+    value.encode("ascii")
+except UnicodeEncodeError:
+    raise SystemExit(1)
+label = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+raise SystemExit(0 if all(label.fullmatch(part) for part in value.split(".")) else 1)
+PY
+}
+
+ai_external_health_code() {
+  local hostname="$1"
+  [ -n "$hostname" ] || {
+    printf 'not-configured\n'
+    return 0
+  }
+  curl -sS -o /dev/null -w '%{http_code}' \
+    --connect-timeout 5 --max-time 12 "https://${hostname}/health" 2>/dev/null || true
+}
+
+ai_external_access_status() {
+  local mode panel_hostname api_hostname code
+  ai_require_installed || return 1
+  mode="$(ai_env_value EXTERNAL_EXPOSURE_MODE)"
+  mode="${mode:-none}"
+  panel_hostname="$(ai_env_value CLOUDFLARE_PANEL_HOSTNAME)"
+  api_hostname="$(ai_env_value CLOUDFLARE_API_HOSTNAME)"
+  echo "External exposure: ${mode}"
+  if [ "$mode" != "cloudflare" ]; then
+    echo "  No managed public tunnel is enabled. Loopback/SSH access remains private."
+    return 0
+  fi
+  echo "  Panel: https://${panel_hostname}"
+  [ -z "$api_hostname" ] || echo "  API:   https://${api_hostname}/v1"
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    "${AI_NATIVE_PLATFORM_VENV}/bin/supervisorctl" \
+      -c "${AI_NATIVE_BASE}/supervisord.conf" status cloudflared 2>/dev/null \
+      || echo "  cloudflared is not RUNNING. Review its log from this menu."
+  fi
+  code="$(ai_external_health_code "$panel_hostname")"
+  echo "  Panel public health: ${code:-000}"
+  if [ -n "$api_hostname" ]; then
+    code="$(ai_external_health_code "$api_hostname")"
+    echo "  API public health:   ${code:-000}"
+  fi
+}
+
+ai_cloudflare_configure() {
+  local binary panel_hostname api_hostname token routes_ready service_group status_text
+  local old_mode old_domain old_origins old_cookie old_binary old_token_path old_panel old_api
+  local token_backup="" had_token="no" running="no" attempt code
+  ai_require_installed || return 1
+  if [ "$(ai_runtime_mode)" != "native" ]; then
+    echo "This managed Cloudflare Tunnel option currently targets the isolated native runtime."
+    echo "Docker/VPS installations should use the existing TLS reverse-proxy workflow."
+    return 1
+  fi
+  binary="$(ai_cloudflared_binary)" || {
+    echo "cloudflared is not installed. Install the official binary and retry."
+    return 1
+  }
+  if ! "$binary" tunnel run --help 2>&1 | grep -q -- '--token-file'; then
+    echo "The installed cloudflared does not support --token-file; version 2025.4.0 or newer is required."
+    return 1
+  fi
+
+  panel_hostname="$(ai_env_value CLOUDFLARE_PANEL_HOSTNAME)"
+  [ -n "$panel_hostname" ] || panel_hostname="$(ai_env_value AI_DOMAIN)"
+  [ "$panel_hostname" = "localhost" ] && panel_hostname=""
+  [ "$panel_hostname" = "ai.example.com" ] && panel_hostname=""
+  api_hostname="$(ai_env_value CLOUDFLARE_API_HOSTNAME)"
+  prompt panel_hostname "Public panel hostname (example: ia.example.com): " "$panel_hostname"
+  panel_hostname="${panel_hostname,,}"
+  panel_hostname="${panel_hostname%.}"
+  ai_hostname_is_valid "$panel_hostname" || {
+    echo "Enter a DNS hostname only, without https://, port or path."
+    return 1
+  }
+  prompt api_hostname "Public API hostname (blank disables public API): " "$api_hostname"
+  api_hostname="${api_hostname,,}"
+  api_hostname="${api_hostname%.}"
+  if [ -n "$api_hostname" ]; then
+    ai_hostname_is_valid "$api_hostname" || {
+      echo "The API hostname is invalid. Enter only a DNS hostname."
+      return 1
+    }
+    if [ "$api_hostname" = "$panel_hostname" ]; then
+      echo "Use different hostnames for the panel and API."
+      return 1
+    fi
+  fi
+
+  if [ -f "$AI_CLOUDFLARED_TOKEN_FILE" ]; then
+    had_token="yes"
+    token_backup="$(mktemp /tmp/vllm-ai-cloudflare-token.XXXXXX)"
+    cp "$AI_CLOUDFLARED_TOKEN_FILE" "$token_backup"
+    chmod 600 "$token_backup"
+    echo "A connector token is already stored; leave the next value blank to keep it."
+  fi
+  prompt_secret token "Cloudflare Tunnel connector token (hidden): "
+  if [ -n "$token" ]; then
+    if [ "${#token}" -lt 40 ] || [ "${#token}" -gt 4096 ] || [[ "$token" =~ [[:space:]] ]]; then
+      [ -z "$token_backup" ] || rm -f -- "$token_backup"
+      echo "The connector token format is invalid."
+      return 1
+    fi
+    (umask 027; printf '%s' "$token" > "$AI_CLOUDFLARED_TOKEN_FILE")
+  elif [ ! -f "$AI_CLOUDFLARED_TOKEN_FILE" ]; then
+    [ -z "$token_backup" ] || rm -f -- "$token_backup"
+    echo "A connector token is required the first time."
+    return 1
+  fi
+  unset token
+
+  service_group="$(id -gn "$AI_NATIVE_SERVICE_USER")"
+  chown "root:${service_group}" "${AI_PLATFORM_BASE}/secrets"
+  chmod 710 "${AI_PLATFORM_BASE}/secrets"
+  chown "root:${service_group}" "$AI_CLOUDFLARED_TOKEN_FILE"
+  chmod 640 "$AI_CLOUDFLARED_TOKEN_FILE"
+  if command -v runuser >/dev/null 2>&1 \
+    && ! runuser -u "$AI_NATIVE_SERVICE_USER" -- test -r "$AI_CLOUDFLARED_TOKEN_FILE"; then
+    echo "The cloudflared service user cannot read the protected connector token."
+    if [ "$had_token" = "yes" ]; then
+      cp "$token_backup" "$AI_CLOUDFLARED_TOKEN_FILE"
+      chown "root:${service_group}" "$AI_CLOUDFLARED_TOKEN_FILE"
+      chmod 640 "$AI_CLOUDFLARED_TOKEN_FILE"
+    else
+      rm -f -- "$AI_CLOUDFLARED_TOKEN_FILE"
+    fi
+    [ -z "$token_backup" ] || rm -f -- "$token_backup"
+    return 1
+  fi
+
+  old_mode="$(ai_env_value EXTERNAL_EXPOSURE_MODE)"
+  old_domain="$(ai_env_value AI_DOMAIN)"
+  old_origins="$(ai_env_value ALLOWED_ORIGINS)"
+  old_cookie="$(ai_env_value COOKIE_SECURE)"
+  old_binary="$(ai_env_value CLOUDFLARED_EXECUTABLE)"
+  old_token_path="$(ai_env_value CLOUDFLARED_TOKEN_FILE)"
+  old_panel="$(ai_env_value CLOUDFLARE_PANEL_HOSTNAME)"
+  old_api="$(ai_env_value CLOUDFLARE_API_HOSTNAME)"
+
+  set_env_file_var "$AI_PLATFORM_ENV" "EXTERNAL_EXPOSURE_MODE" "cloudflare"
+  set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARED_EXECUTABLE" "$binary"
+  set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARED_TOKEN_FILE" "$AI_CLOUDFLARED_TOKEN_FILE"
+  set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARE_PANEL_HOSTNAME" "$panel_hostname"
+  set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARE_API_HOSTNAME" "$api_hostname"
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_DOMAIN" "$panel_hostname"
+  set_env_file_var "$AI_PLATFORM_ENV" "ALLOWED_ORIGINS" "https://${panel_hostname}"
+  set_env_file_var "$AI_PLATFORM_ENV" "COOKIE_SECURE" "true"
+  if ! ai_native restart; then
+    echo "Tunnel configuration failed; restoring the previous platform settings."
+    set_env_file_var "$AI_PLATFORM_ENV" "EXTERNAL_EXPOSURE_MODE" "${old_mode:-none}"
+    set_env_file_var "$AI_PLATFORM_ENV" "AI_DOMAIN" "$old_domain"
+    set_env_file_var "$AI_PLATFORM_ENV" "ALLOWED_ORIGINS" "$old_origins"
+    set_env_file_var "$AI_PLATFORM_ENV" "COOKIE_SECURE" "$old_cookie"
+    set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARED_EXECUTABLE" "$old_binary"
+    set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARED_TOKEN_FILE" "$old_token_path"
+    set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARE_PANEL_HOSTNAME" "$old_panel"
+    set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARE_API_HOSTNAME" "$old_api"
+    if [ "$had_token" = "yes" ]; then
+      cp "$token_backup" "$AI_CLOUDFLARED_TOKEN_FILE"
+    else
+      rm -f -- "$AI_CLOUDFLARED_TOKEN_FILE"
+    fi
+    ai_native start || true
+    [ -z "$token_backup" ] || rm -f -- "$token_backup"
+    return 1
+  fi
+
+  for attempt in {1..20}; do
+    status_text="$("${AI_NATIVE_PLATFORM_VENV}/bin/supervisorctl" -c "${AI_NATIVE_BASE}/supervisord.conf" status cloudflared 2>&1 || true)"
+    if grep -Eq '^cloudflared[[:space:]]+RUNNING' <<< "$status_text"; then
+      running="yes"
+      break
+    fi
+    sleep 1
+  done
+  if [ "$running" != "yes" ]; then
+    echo "cloudflared did not remain running:"
+    printf '%s\n' "$status_text"
+    ai_native logs cloudflared --lines 80 || true
+    echo "The token or tunnel configuration must be corrected. Restoring private access settings."
+    set_env_file_var "$AI_PLATFORM_ENV" "EXTERNAL_EXPOSURE_MODE" "${old_mode:-none}"
+    set_env_file_var "$AI_PLATFORM_ENV" "AI_DOMAIN" "$old_domain"
+    set_env_file_var "$AI_PLATFORM_ENV" "ALLOWED_ORIGINS" "$old_origins"
+    set_env_file_var "$AI_PLATFORM_ENV" "COOKIE_SECURE" "$old_cookie"
+    set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARED_EXECUTABLE" "$old_binary"
+    set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARED_TOKEN_FILE" "$old_token_path"
+    set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARE_PANEL_HOSTNAME" "$old_panel"
+    set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARE_API_HOSTNAME" "$old_api"
+    if [ "$had_token" = "yes" ]; then
+      cp "$token_backup" "$AI_CLOUDFLARED_TOKEN_FILE"
+      chown "root:${service_group}" "$AI_CLOUDFLARED_TOKEN_FILE"
+      chmod 640 "$AI_CLOUDFLARED_TOKEN_FILE"
+    else
+      rm -f -- "$AI_CLOUDFLARED_TOKEN_FILE"
+    fi
+    ai_native restart || true
+    [ -z "$token_backup" ] || rm -f -- "$token_backup"
+    return 1
+  fi
+
+  mkdir -p "$AI_NATIVE_BASE"
+  printf 'mode=cloudflare\npanel_hostname=%s\napi_hostname=%s\nconfigured_at=%s\n' \
+    "$panel_hostname" "$api_hostname" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$AI_EXTERNAL_ACCESS_META"
+  chmod 600 "$AI_EXTERNAL_ACCESS_META"
+  [ -z "$token_backup" ] || rm -f -- "$token_backup"
+  echo "Cloudflare connector is managed by the native platform Supervisor."
+  echo "Return to Cloudflare, wait for the connector to show Connected, then create these Published application routes:"
+  echo "  ${panel_hostname} -> http://localhost:18080"
+  [ -z "$api_hostname" ] || echo "  ${api_hostname} -> http://localhost:8000"
+  echo "Add a final catch-all route to http_status:404."
+  prompt routes_ready "Are the routes saved and ready for a public health check? (yes/no): " "no"
+  if [ "${routes_ready,,}" = "yes" ]; then
+    code="$(ai_external_health_code "$panel_hostname")"
+    echo "Panel public health: ${code:-000}"
+    if [ -n "$api_hostname" ]; then
+      code="$(ai_external_health_code "$api_hostname")"
+      echo "API public health: ${code:-000}"
+    fi
+    echo "If a health code is 000/404, allow DNS and tunnel-route propagation, then use Status to retry."
+  else
+    echo "The connector remains active. Finish the routes in Cloudflare, then choose Status and public health."
+  fi
+}
+
+ai_external_access_disable() {
+  local confirm delete_token
+  ai_require_installed || return 1
+  if [ "$(ai_runtime_mode)" != "native" ]; then
+    echo "Managed Cloudflare exposure is not enabled for this runtime."
+    return 1
+  fi
+  prompt confirm "Disable the managed public tunnel and return to private SSH access? (yes/no): " "no"
+  [ "${confirm,,}" = "yes" ] || return 0
+  set_env_file_var "$AI_PLATFORM_ENV" "EXTERNAL_EXPOSURE_MODE" "none"
+  set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARE_PANEL_HOSTNAME" ""
+  set_env_file_var "$AI_PLATFORM_ENV" "CLOUDFLARE_API_HOSTNAME" ""
+  set_env_file_var "$AI_PLATFORM_ENV" "AI_DOMAIN" "localhost"
+  set_env_file_var "$AI_PLATFORM_ENV" "ALLOWED_ORIGINS" ""
+  set_env_file_var "$AI_PLATFORM_ENV" "COOKIE_SECURE" "false"
+  ai_native restart
+  rm -f -- "$AI_EXTERNAL_ACCESS_META"
+  prompt delete_token "Delete the stored Cloudflare connector token? (yes/no): " "yes"
+  if [ "${delete_token,,}" = "yes" ]; then
+    rm -f -- "$AI_CLOUDFLARED_TOKEN_FILE"
+    echo "Stored connector token deleted."
+  fi
+  echo "Managed external exposure is disabled; loopback services remain available through SSH forwarding."
+}
+
+ai_external_access_menu() {
+  local action
+  ai_require_installed || return 1
+  if [ "$(ai_runtime_mode)" != "native" ]; then
+    echo "External domain management from this menu is available for the native runtime."
+    echo "Docker/VPS installations should use the platform TLS reverse-proxy configuration."
+    return 1
+  fi
+  while true; do
+    echo ""
+    echo "External domain / Cloudflare Tunnel"
+    echo "1) Configure or update custom-domain tunnel"
+    echo "2) Status and public health"
+    echo "3) View cloudflared log"
+    echo "4) Disable managed external exposure"
+    echo "5) Back"
+    prompt action "Option: " "5"
+    case "$action" in
+      1) ai_cloudflare_configure ;;
+      2) ai_external_access_status ;;
+      3) ai_native logs cloudflared --lines 150 ;;
+      4) ai_external_access_disable ;;
+      5) return 0 ;;
+      *) echo "Invalid option." ;;
+    esac
+  done
+}
+
+ai_portal_settings() {
+  local panel chat origins
+  ai_require_installed || return 1
+  prompt panel "Enable admin panel? (yes/no): " "$( [ "$(ai_env_value ADMIN_PANEL_ENABLED)" = "true" ] && echo yes || echo no )"
+  prompt chat "Enable chat portal? (yes/no): " "$( [ "$(ai_env_value CHAT_PORTAL_ENABLED)" = "true" ] && echo yes || echo no )"
+  prompt origins "Allowed browser origins (comma-separated, exact HTTPS origins): " "$(ai_env_value ALLOWED_ORIGINS)"
+  [ "${panel,,}" = "yes" ] && panel=true || panel=false
+  [ "${chat,,}" = "yes" ] && chat=true || chat=false
+  set_env_file_var "$AI_PLATFORM_ENV" "ADMIN_PANEL_ENABLED" "$panel"
+  set_env_file_var "$AI_PLATFORM_ENV" "CHAT_PORTAL_ENABLED" "$chat"
+  set_env_file_var "$AI_PLATFORM_ENV" "ALLOWED_ORIGINS" "$origins"
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    ai_native restart
+    ai_cli models reconcile --wait-seconds 600 || true
+  else
+    ai_dc up -d --force-recreate gateway web controller
+  fi
+}
+
+ai_platform_backup() {
+  local include_models="${1:-ask}"
+  local stamp staging archive retention
+  ai_require_installed || return 1
+  if [ "$include_models" = "ask" ]; then
+    prompt include_models "Include model weights? This can be very large (yes/no): " "no"
+  fi
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  staging="$(mktemp -d)"
+  archive="${AI_BACKUPS_BASE}/vllm-ai-platform-${stamp}.tar.gz"
+  mkdir -p "${staging}/config"
+  chmod 700 "$staging"
+
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    "${AI_NATIVE_PLATFORM_VENV}/bin/python" - "${AI_PLATFORM_BASE}/database/platform.db" "${staging}/database.dump" <<'PY'
+import sqlite3
+import sys
+
+source, destination = sys.argv[1:]
+with sqlite3.connect(source) as current, sqlite3.connect(destination) as backup:
+    current.backup(backup)
+PY
+  else
+    ai_dc exec -T postgres pg_dump \
+      -U "$(ai_env_value POSTGRES_USER)" \
+      -d "$(ai_env_value POSTGRES_DB)" \
+      -Fc > "${staging}/database.dump"
+  fi
+  rsync -a \
+    --exclude='database/' --exclude='redis/' --exclude='models/' --exclude='hf-cache/' \
+    --exclude='backups/' --exclude='logs/' --exclude='jupyter-venv/' --exclude='native/' \
+    "${AI_PLATFORM_BASE}/" "${staging}/config/"
+  if [ "${include_models,,}" = "yes" ]; then
+    mkdir -p "${staging}/models"
+    rsync -a "${AI_PLATFORM_BASE}/models/" "${staging}/models/"
+  fi
+  printf '{"format":"vllm-ai-platform-backup","schema_version":1,"created_at":"%s","includes_models":%s,"runtime_mode":"%s","vllm_image":"%s","native_vllm_version":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$( [ "${include_models,,}" = "yes" ] && echo true || echo false )" \
+    "$(ai_runtime_mode)" \
+    "$(ai_env_value VLLM_IMAGE)" \
+    "$(ai_env_value NATIVE_VLLM_VERSION)" > "${staging}/manifest.json"
+  if [ -d "${staging}/models" ]; then
+    (umask 077; tar -C "$staging" -czf "$archive" manifest.json database.dump config models)
+  else
+    (umask 077; tar -C "$staging" -czf "$archive" manifest.json database.dump config)
+  fi
+  chmod 600 "$archive"
+  python3 "${AI_PLATFORM_BASE}/scripts/safe_archive.py" inspect "$archive" >/dev/null
+  (
+    cd "$AI_BACKUPS_BASE" || exit 1
+    sha256sum "$(basename "$archive")" > "$(basename "${archive}.sha256")"
+  )
+  chmod 600 "${archive}.sha256"
+  rm -rf "$staging"
+  retention="$(ai_env_value AI_BACKUP_RETENTION_DAYS)"
+  find "$AI_BACKUPS_BASE" -maxdepth 1 -type f -name 'vllm-ai-platform-*.tar.gz*' -mtime "+${retention:-14}" -delete
+  echo "Backup created: ${archive}"
+  echo "Model weights included: $( [ "${include_models,,}" = "yes" ] && echo yes || echo no )"
+}
+
+ai_platform_restore() {
+  local archive confirm staging restore_models redownload aliases alias backup_runtime current_runtime
+  local restored_db_user restored_db_password sql_password
+  ai_require_installed || return 1
+  prompt archive "Backup archive path: " ""
+  archive="$(readlink -f "$archive" 2>/dev/null || true)"
+  if [ -z "$archive" ] || [ ! -f "$archive" ]; then
+    echo "Backup archive not found."
+    return 1
+  fi
+  if [ -f "${archive}.sha256" ]; then
+    (
+      cd "$(dirname "$archive")" || exit 1
+      sha256sum -c "$(basename "${archive}.sha256")"
+    )
+  else
+    echo "Warning: no checksum sidecar was found; the archive will still receive structural validation."
+  fi
+  python3 "${AI_PLATFORM_BASE}/scripts/safe_archive.py" inspect "$archive"
+  prompt confirm "Restore this backup? Current configuration and database will be replaced. Type RESTORE: " ""
+  [ "$confirm" = "RESTORE" ] || return 0
+  ai_platform_backup no
+  staging="$(mktemp -d)"
+  python3 "${AI_PLATFORM_BASE}/scripts/safe_archive.py" extract "$archive" "$staging"
+  if [ ! -f "${staging}/config/compose.yaml" ] || [ ! -f "${staging}/database.dump" ]; then
+    rm -rf "$staging"
+    echo "Backup is incomplete."
+    return 1
+  fi
+  backup_runtime="$(python3 - "${staging}/manifest.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle).get("runtime_mode", "docker"))
+PY
+)"
+  current_runtime="$(ai_runtime_mode)"
+  if [ "$backup_runtime" != "$current_runtime" ]; then
+    rm -rf "$staging"
+    echo "Cross-runtime restore is not automatic: backup=${backup_runtime}, installed=${current_runtime}."
+    echo "Install the matching runtime first or migrate the database explicitly."
+    return 1
+  fi
+  ai_platform_stop || true
+  rsync -a --delete \
+    --exclude='database/' --exclude='redis/' --exclude='models/' --exclude='hf-cache/' \
+    --exclude='backups/' --exclude='logs/' --exclude='jupyter-venv/' --exclude='native/' \
+    "${staging}/config/" "${AI_PLATFORM_BASE}/"
+  chmod 600 "$AI_PLATFORM_ENV" "${AI_PLATFORM_BASE}/secrets/hf_token"
+  if [ -d "${staging}/models" ]; then
+    prompt restore_models "Restore model weights included in the backup? (yes/no): " "no"
+    if [ "${restore_models,,}" = "yes" ]; then
+      rsync -a --delete "${staging}/models/" "${AI_PLATFORM_BASE}/models/"
+    fi
+  fi
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    "${AI_NATIVE_PLATFORM_VENV}/bin/python" - "${staging}/database.dump" "${AI_PLATFORM_BASE}/database/platform.db" <<'PY'
+import sqlite3
+import sys
+
+source, destination = sys.argv[1:]
+with sqlite3.connect(source) as backup:
+    if backup.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise SystemExit("restored SQLite backup failed integrity validation")
+    with sqlite3.connect(destination) as current:
+        backup.backup(current)
+PY
+    ai_native_prepare_service_user
+    ai_native start
+  else
+    ai_dc up -d postgres redis
+    restored_db_user="$(ai_env_value POSTGRES_USER)"
+    restored_db_password="$(ai_env_value POSTGRES_PASSWORD)"
+    if [[ ! "$restored_db_user" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || [ -z "$restored_db_password" ]; then
+      rm -rf "$staging"
+      echo "The restored database credentials are invalid."
+      return 1
+    fi
+    # pg_dump does not preserve PostgreSQL role passwords. Reapply the restored
+    # secret so a backup can move safely to a freshly initialized VPS.
+    sql_password="${restored_db_password//\'/\'\'}"
+    printf "ALTER ROLE \"%s\" PASSWORD '%s';\n" "$restored_db_user" "$sql_password" \
+      | ai_dc exec -T postgres psql -v ON_ERROR_STOP=1 -U "$restored_db_user" -d postgres
+    ai_dc exec -T postgres pg_restore \
+      -U "$(ai_env_value POSTGRES_USER)" \
+      -d "$(ai_env_value POSTGRES_DB)" \
+      --clean --if-exists < "${staging}/database.dump"
+    ai_dc run --rm migrate
+    ai_dc up -d gateway web controller
+    ai_sync_proxy_from_env
+  fi
+  ai_cli models verify-storage
+  prompt redownload "Redownload missing Hugging Face models now? (yes/no): " "no"
+  if [ "${redownload,,}" = "yes" ]; then
+    prompt aliases "Missing model aliases to download (comma-separated): " ""
+    IFS=',' read -r -a missing_aliases <<< "$aliases"
+    for alias in "${missing_aliases[@]}"; do
+      alias="${alias//[[:space:]]/}"
+      [ -z "$alias" ] || ai_cli models download "$alias"
+    done
+  fi
+  rm -rf "$staging"
+  ai_hardware_refresh no
+  echo "Restore complete. Review model compatibility before activation."
+}
+
+ai_safe_remove_path() {
+  local target="$1"
+  local expected="$2"
+  local resolved
+  [ -e "$target" ] || return 0
+  resolved="$(readlink -f "$target")"
+  if [ "$resolved" != "$expected" ]; then
+    echo "Refusing to remove unexpected path: ${resolved}"
+    return 1
+  fi
+  rm -rf "$resolved"
+}
+
+ai_platform_uninstall() {
+  local mode confirm ids
+  ai_require_installed || return 1
+  echo "1) Disable containers/proxy only; preserve all files"
+  echo "2) Remove application, database and cache; preserve weights and backups"
+  echo "3) Full removal including model weights and backups"
+  prompt mode "Removal mode: " "1"
+  prompt confirm "Type UNINSTALL-AI to continue: " ""
+  [ "$confirm" = "UNINSTALL-AI" ] || return 0
+
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    ai_native stop || true
+  else
+    ids="$(docker ps -aq --filter label=com.vllm-ai-platform.managed=true)"
+    [ -z "$ids" ] || docker rm -f $ids
+    ai_dc down || true
+  fi
+  remove_ai_cron_jobs
+  if [ -f "$AI_PROXY_CONFIG" ]; then
+    rm -f "$AI_PROXY_CONFIG"
+    proxy_dc exec -T reverse-proxy nginx -t && proxy_dc restart reverse-proxy || true
+  fi
+
+  case "$mode" in
+    1) echo "AI containers and proxy were removed; all platform files remain recoverable." ;;
+    2)
+      local keep_dir
+      keep_dir="$(mktemp -d)"
+      mv "${AI_PLATFORM_BASE}/models" "${keep_dir}/models"
+      ai_safe_remove_path "$AI_PLATFORM_BASE" "/opt/vllm-ai-platform"
+      mkdir -p "$AI_PLATFORM_BASE"
+      mv "${keep_dir}/models" "${AI_PLATFORM_BASE}/models"
+      rmdir "$keep_dir"
+      echo "Application/database/cache removed. Weights and backups were preserved."
+      ;;
+    3)
+      prompt confirm "This deletes database, weights and AI backups. Type DELETE-EVERYTHING: " ""
+      if [ "$confirm" = "DELETE-EVERYTHING" ]; then
+        ai_safe_remove_path "$AI_PLATFORM_BASE" "/opt/vllm-ai-platform"
+        ai_safe_remove_path "$AI_BACKUPS_BASE" "/var/backups/vllm-ai-platform"
+        echo "AI application, database, weights, cache and backups were permanently removed."
+      fi
+      ;;
+    *) echo "Invalid mode." ;;
+  esac
+}
+
+ai_update_platform() {
+  local image confirm old_image ids
+  ai_require_installed || return 1
+  if [ "$(ai_runtime_mode)" = "native" ]; then
+    local version old_version
+    old_version="$(ai_env_value NATIVE_VLLM_VERSION)"
+    prompt version "New pinned native vLLM package version: " "$old_version"
+    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([a-zA-Z0-9._-]*)$ ]]; then
+      echo "Invalid pinned native vLLM version."
+      return 1
+    fi
+    prompt confirm "Create a backup and update the isolated native environments? (yes/no): " "yes"
+    [ "${confirm,,}" = "yes" ] || return 0
+    ai_platform_backup no
+    ai_copy_assets
+    set_env_file_var "$AI_PLATFORM_ENV" "NATIVE_VLLM_VERSION" "$version"
+    ai_native_install_environments "$version"
+    ai_native_prepare_service_user
+    if ! ai_cli models validate-config || ! ai_native restart || ! ai_cli models reconcile --wait-seconds 600 --strict; then
+      echo "Native update validation failed. Reinstalling the previous pinned vLLM version."
+      set_env_file_var "$AI_PLATFORM_ENV" "NATIVE_VLLM_VERSION" "$old_version"
+      ai_native_install_environments "$old_version"
+      ai_native restart || true
+      ai_cli models reconcile --wait-seconds 600 || true
+      return 1
+    fi
+    set_env_file_var "$AI_PLATFORM_META" "native_vllm_version" "$version"
+    set_env_file_var "$AI_PLATFORM_META" "last_updated_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "Native vLLM update applied."
+    return 0
+  fi
+  old_image="$(ai_env_value VLLM_IMAGE)"
+  echo "Current image: ${old_image}"
+  prompt image "New pinned vLLM image: " "$old_image"
+  if [[ ! "$image" =~ ^vllm/vllm-openai:[A-Za-z0-9._-]+$ ]]; then
+    echo "Invalid pinned image."
+    return 1
+  fi
+  prompt confirm "Create a database/config backup and apply this update? (yes/no): " "yes"
+  [ "${confirm,,}" = "yes" ] || return 0
+  ai_platform_backup no
+  ai_copy_assets
+  set_env_file_var "$AI_PLATFORM_ENV" "VLLM_IMAGE" "$image"
+  if ! docker pull "$image" \
+    || ! ai_dc config >/dev/null \
+    || ! ai_dc build --pull \
+    || ! ai_dc run --rm migrate \
+    || ! ai_dc run --rm --no-deps controller python -m app.cli models validate-config; then
+    echo "Update validation failed. Restoring the previous pinned vLLM image."
+    set_env_file_var "$AI_PLATFORM_ENV" "VLLM_IMAGE" "$old_image"
+    set_env_file_var "$AI_PLATFORM_META" "vllm_image" "$old_image"
+    ai_dc build
+    ai_dc up -d gateway web controller
+    return 1
+  fi
+  ids="$(docker ps -q --filter label=com.vllm-ai-platform.managed=true)"
+  if [ -n "$ids" ]; then
+    docker stop --time 30 $ids
+    docker rm $ids
+  fi
+  if ! ai_dc up -d --force-recreate gateway web controller \
+    || ! ai_cli models reconcile --wait-seconds 600 --strict; then
+    echo "Updated services failed to start. Restoring the previous pinned vLLM image."
+    set_env_file_var "$AI_PLATFORM_ENV" "VLLM_IMAGE" "$old_image"
+    set_env_file_var "$AI_PLATFORM_META" "vllm_image" "$old_image"
+    ids="$(docker ps -aq --filter label=com.vllm-ai-platform.managed=true)"
+    [ -z "$ids" ] || docker rm -f $ids
+    ai_dc build
+    ai_dc up -d --force-recreate gateway web controller
+    ai_cli models reconcile --wait-seconds 600 || true
+    return 1
+  fi
+  set_env_file_var "$AI_PLATFORM_META" "vllm_image" "$image"
+  set_env_file_var "$AI_PLATFORM_META" "last_updated_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "Update applied. Roll back by restoring the backup shown above and resetting VLLM_IMAGE."
+}
+
+manage_ai_platform() {
+  local action
+  while true; do
+    echo ""
+    echo "============================================================"
+    echo "                 vLLM / AI PLATFORM MANAGER"
+    echo "============================================================"
+    ai_platform_status
+    echo "============================================================"
+    echo "1) Install or repair AI platform (Docker/native auto-detect)"
+    echo "2) Platform status"
+    echo "3) Hardware inventory and change review"
+    echo "4) NVIDIA/Docker GPU diagnostics"
+    echo "5) Install or repair NVIDIA Container Toolkit"
+    echo "6) Start platform and reconcile models"
+    echo "7) Stop platform"
+    echo "8) Restart platform"
+    echo "9) Manage models"
+    echo "10) Manage users"
+    echo "11) Manage API keys"
+    echo "12) Manage IP allowlists"
+    echo "13) Portal and API settings"
+    echo "14) Usage summary"
+    echo "15) Diagnostics"
+    echo "16) View logs"
+    echo "17) Backup"
+    echo "18) Restore"
+    echo "19) Update pinned platform version"
+    echo "20) Jupyter Integration"
+    echo "21) External domain / Cloudflare Tunnel"
+    echo "22) Uninstall / remove"
+    echo "23) Back"
+    prompt action "Option: " "23"
+    case "$action" in
+      1) ai_install_or_repair ;;
+      2) ai_platform_status ;;
+      3) ai_hardware_show ;;
+      4) ai_gpu_diagnostics yes ;;
+      5) ai_install_nvidia_runtime ;;
+      6) ai_platform_start ;;
+      7) ai_platform_stop ;;
+      8) ai_platform_restart ;;
+      9) ai_model_menu ;;
+      10) ai_user_menu ;;
+      11) ai_key_menu ;;
+      12) ai_ip_menu ;;
+      13) ai_portal_settings ;;
+      14) ai_cli usage --limit 100 ;;
+      15) ai_platform_diagnostics ;;
+      16) ai_platform_logs ;;
+      17) ai_platform_backup ask ;;
+      18) ai_platform_restore ;;
+      19) ai_update_platform ;;
+      20) ai_jupyter_menu ;;
+      21) ai_external_access_menu ;;
+      22) ai_platform_uninstall ;;
+      23) return 0 ;;
+      *) echo "Invalid option." ;;
+    esac
+  done
+}
+
 menu() {
   echo ""
   echo "Select an option:"
@@ -9341,6 +11826,7 @@ menu() {
   echo "19) Manage project UFW"
   echo "20) Project access settings"
   echo "21) Manage webmail password changes"
+  echo "22) Manage vLLM / AI Platform"
   echo ""
   read -r -p "Option: " action
 
@@ -9366,6 +11852,7 @@ menu() {
     19) manage_project_ufw ;;
     20) manage_project_access ;;
     21) manage_webmail_password_change ;;
+    22) manage_ai_platform ;;
     *) echo "Invalid option."; exit 1 ;;
   esac
 }
@@ -9401,6 +11888,75 @@ fi
 if [ "${1:-}" = "manage-vnc" ]; then
   banner
   manage_vnc_server
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-status" ]; then
+  ai_platform_status
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-install-native" ]; then
+  ai_environment_preflight
+  ai_install_native
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-hardware" ] || [ "${1:-}" = "ai-gpu-info" ] || [ "${1:-}" = "gpu-info" ]; then
+  ai_require_installed
+  ai_hardware_refresh no
+  python3 -m json.tool "${AI_PLATFORM_BASE}/hardware/current.json"
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-hardware-snapshot" ]; then
+  ai_require_installed
+  ai_hardware_refresh no
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-diagnostics" ]; then
+  ai_platform_diagnostics
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-jupyter" ]; then
+  ai_jupyter_menu
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-external" ] || [ "${1:-}" = "ai-domain" ]; then
+  ai_external_access_menu
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-start" ]; then
+  ai_platform_start
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-stop" ]; then
+  ai_platform_stop
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-restart" ]; then
+  ai_platform_restart
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-models" ]; then
+  shift
+  if [ "$#" -eq 0 ]; then
+    ai_model_menu
+    exit 0
+  fi
+  ai_cli models "$@"
+  exit 0
+fi
+
+if [ "${1:-}" = "ai-backup" ]; then
+  ai_platform_backup no
   exit 0
 fi
 

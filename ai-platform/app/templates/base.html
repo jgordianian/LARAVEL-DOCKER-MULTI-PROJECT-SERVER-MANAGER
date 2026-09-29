@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}AI Platform{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/chat-extra.css">
+</head>
+<body>
+{% if session %}
+<header class="topbar">
+  <a class="brand" href="/">Aperture AI</a>
+  <nav>
+    {% if settings.chat_portal_enabled %}<a href="/">Chat</a>{% endif %}
+    {% if session.user.role in ['super_admin', 'administrator'] and settings.admin_panel_enabled %}<a href="/admin">Administration</a>{% endif %}
+    <a href="/profile/password">Profile</a>
+    <form method="post" action="/logout" class="inline"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="link-button">Sign out</button></form>
+  </nav>
+</header>
+{% endif %}
+<main class="{% block main_class %}page{% endblock %}">
+  {% block content %}{% endblock %}
+</main>
+<footer>vLLM AI Platform {{ version }}</footer>
+</body>
+</html>
+

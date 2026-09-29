@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Operations · AI Platform{% endblock %}
+{% block content %}
+<div class="admin-layout">
+  {% include "admin_nav.html" %}
+  <section>
+    <h1>Host operations</h1>
+    <p class="muted">These privileged actions remain intentionally outside the web process. Run them as root through the server manager; the web container has no host shell or backup-directory access.</p>
+    <article class="panel" id="logs"><h2>Logs</h2><p>Per-model sanitized logs and internal metrics are available on the Models page. For Gateway, Web, Controller, PostgreSQL, Redis, Nginx and backup-cron logs, choose <strong>View logs</strong> in the root AI Platform Manager.</p></article>
+    <article class="panel" id="backups"><h2>Backups</h2><p>Backup and restore are host-only controls with filesystem validation and typed confirmation. Use AI Platform Manager options <strong>Backup</strong> and <strong>Restore</strong>. Normal backups exclude model weights.</p></article>
+    <article class="panel" id="system"><h2>System</h2><dl class="facts"><dt>Domain</dt><dd>{{ settings.ai_domain }}</dd><dt>vLLM image</dt><dd>{{ settings.vllm_image }}</dd><dt>Internal network</dt><dd>{{ settings.ai_internal_network }}</dd><dt>Schema</dt><dd>{{ settings.ai_platform_schema_version }}</dd></dl><p class="muted">Updates, GPU runtime repair, diagnostics and uninstall remain root-only manager operations.</p></article>
+  </section>
+</div>
+{% endblock %}

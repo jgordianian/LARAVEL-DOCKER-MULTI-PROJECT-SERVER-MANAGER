@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}API access · AI Platform{% endblock %}
+{% block content %}
+<div class="admin-layout">
+  {% include "admin_nav.html" %}
+  <section>
+    <h1>API access</h1>
+    <p class="muted">Keys are hashed at rest. The complete secret appears once. Limits here are enforced by the Gateway.</p>
+    {% if created_secret %}<div class="secret-once"><strong>Copy this key now. It cannot be shown again.</strong><code>{{ created_secret }}</code></div>{% endif %}
+    <article class="panel">
+      <h2>Create API key</h2>
+      <form method="post" class="form-grid">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label>Name<input name="name" required></label>
+        <label>Owner type<select name="owner_type"><option value="service_account">Service account</option><option value="user">User</option></select></label>
+        <label>Owner ID<select name="owner_id">{% for a in accounts %}<option value="{{ a.id }}">Service: {{ a.name }}</option>{% endfor %}{% for u in users %}<option value="{{ u.id }}">User: {{ u.email }}</option>{% endfor %}</select></label>
+        <label>Models <small>comma-separated; blank inherits owner policy</small><input name="allowed_models"></label>
+        <label>Allowed IP/CIDR <small>comma-separated IPv4/IPv6</small><input name="allowed_cidrs"></label>
+        <label>Scopes<input name="scopes" value="models,chat"></label>
+        <label>Allowed endpoints <small>blank inherits owner/legacy behavior</small><input name="allowed_endpoints" placeholder="/v1/models,/v1/chat/completions,/v1/responses"></label>
+        <label>Expires at <small>optional UTC</small><input name="expires_at" type="datetime-local"></label>
+        <label>Requests/minute<input name="requests_per_minute" type="number" min="0" value="60"></label>
+        <label>Tokens/minute<input name="tokens_per_minute" type="number" min="0" value="60000"></label>
+        <label>Concurrent requests<input name="concurrent_requests" type="number" min="1" value="4"></label>
+        <label>Requests/day<input name="requests_per_day" type="number" min="0" value="10000"></label>
+        <label>Requests/month<input name="requests_per_month" type="number" min="0" value="100000"></label>
+        <label>Tokens/day<input name="tokens_per_day" type="number" min="0" value="2000000"></label>
+        <label>Tokens/month<input name="tokens_per_month" type="number" min="0" value="20000000"></label>
+        <label>Maximum input tokens<input name="max_input_tokens" type="number" min="1" value="32768"></label>
+        <label>Maximum output tokens<input name="max_output_tokens" type="number" min="1" value="8192"></label>
+        <button class="primary">Create key</button>
+      </form>
+    </article>
+    <article class="panel table-wrap">
+      <table>
+        <thead><tr><th>Name</th><th>Prefix</th><th>Owner</th><th>Policy</th><th>Limits</th><th>Status</th><th></th></tr></thead>
+        <tbody>{% for key in keys %}
+          <tr>
+            <td>{{ key.name }}<br><small>Last used {{ key.last_used_at or 'never' }}</small></td>
+            <td><code>{{ key.key_prefix }}</code></td>
+            <td>{{ key.service_account.name if key.service_account else key.user.email }}</td>
+            <td>Models: {{ key.allowed_models|join(', ') or 'Inherited/all' }}<br><small>Scopes: {{ key.scopes|join(', ') }}<br>Endpoints: {{ key.allowed_endpoints|join(', ') or 'Inherited/legacy' }}</small></td>
+            <td>{{ key.requests_per_minute }} rpm · {{ key.tokens_per_minute }} tpm · {{ key.concurrent_requests }} concurrent</td>
+            <td><span class="pill {{ 'good' if key.enabled and not key.revoked_at else 'bad' }}">{{ 'Active' if key.enabled and not key.revoked_at else 'Revoked' }}</span><br><small>{{ 'Expires ' ~ key.expires_at if key.expires_at else 'No expiry' }}</small></td>
+            <td><div class="actions">
+              <form method="post" action="/admin/api-keys/{{ key.id }}/rotate"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button>Rotate</button></form>
+              {% if key.enabled and not key.revoked_at %}<form method="post" action="/admin/api-keys/{{ key.id }}/revoke"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="danger">Revoke</button></form>{% endif %}
+            </div></td>
+          </tr>
+        {% endfor %}</tbody>
+      </table>
+    </article>
+  </section>
+</div>
+{% endblock %}

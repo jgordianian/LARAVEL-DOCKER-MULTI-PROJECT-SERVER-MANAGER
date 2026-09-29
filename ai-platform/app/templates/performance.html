@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Performance · AI Platform{% endblock %}
+{% block content %}
+<div class="admin-layout">
+  {% include "admin_nav.html" %}
+  <section>
+    <h1>Performance & hardware</h1>
+    <p class="muted">Every value is an estimate and hardware safety limits always win. Runtime parameters are changed only while a model is stopped.</p>
+    {% if notice %}<div class="alert success">{{ notice }}</div>{% endif %}
+    {% if changes.changed %}<div class="alert warning"><strong>Hardware change detected.</strong> Upgrade: {{ changes.upgrade_detected }} · downgrade: {{ changes.downgrade_detected }} · model review: {{ changes.requires_model_review }}</div>{% endif %}
+
+    <article class="panel">
+      <h2>Current hardware</h2>
+      {% if hardware %}
+      <dl class="facts">
+        <dt>CPU</dt><dd>{{ hardware.cpu.model }} · {{ hardware.cpu.cores }} cores</dd>
+        <dt>RAM available</dt><dd>{{ '%.1f'|format(hardware.memory.available_bytes / 1073741824) }} GB</dd>
+        <dt>Disk free</dt><dd>{{ '%.1f'|format(hardware.storage.free_bytes / 1073741824) }} GB</dd>
+        <dt>Driver</dt><dd>{{ hardware.gpu_driver.version or 'unavailable' }}</dd>
+      </dl>
+      {% for gpu in hardware.gpus %}<p>GPU {{ gpu.index }} · {{ gpu.name }} · {{ '%.1f'|format(gpu.memory_used_bytes / 1073741824) }}/{{ '%.1f'|format(gpu.memory_total_bytes / 1073741824) }} GB · {{ gpu.utilization_percent or 0 }}% · {{ gpu.temperature_c or 'n/a' }}°C</p>{% else %}<p class="alert warning">No supported NVIDIA GPU detected. Model activation will be blocked.</p>{% endfor %}
+      {% else %}<p>Run hardware analysis from the root manager.</p>{% endif %}
+    </article>
+
+    {% for model in models %}
+    <article class="panel">
+      <div class="heading">
+        <div><h2>{{ model.alias }}</h2><small>{{ model.hf_model_id }}</small></div>
+        <span class="pill">{{ model.instance.performance_profile if model.instance else 'unconfigured' }}</span>
+      </div>
+      {% if model.instance %}
+      <dl class="facts">
+        <dt>Runtime status</dt><dd>{{ model.instance.status }}</dd>
+        <dt>GPU assignment</dt><dd>{{ model.instance.gpu_assignment|join(', ') or 'AUTO' }}</dd>
+        <dt>Estimated allocation</dt><dd>{{ model.instance.estimated_vram_gb or 'not calculated' }} GB</dd>
+        <dt>VRAM target</dt><dd>{{ model.instance.gpu_memory_utilization }}</dd>
+        <dt>Context</dt><dd>{{ model.max_model_len }}</dd>
+        <dt>Sequences</dt><dd>{{ model.instance.max_num_seqs }}</dd>
+        <dt>Tensor parallel</dt><dd>{{ model.instance.tensor_parallel_size }}</dd>
+      </dl>
+
+      {% if model.instance.desired_active %}
+      <div class="alert warning"><strong>The model is active.</strong> Stop it before changing runtime parameters. Existing weights and configuration are preserved; active requests will be interrupted.</div>
+      <form method="post" action="/admin/performance/{{ model.id }}/deactivate" class="actions">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <button class="danger">Deactivate to change profile</button>
+      </form>
+      {% else %}
+      <form method="post" action="/admin/performance/{{ model.id }}" class="stack">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label>Performance profile
+          <select name="profile">
+            {% for profile in ['AUTO','CONSERVATIVE','BALANCED','PERFORMANCE','MAXIMUM','CUSTOM'] %}<option value="{{ profile }}" {% if model.instance.performance_profile == profile %}selected{% endif %}>{{ profile }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="checkbox"><input type="checkbox" name="confirm_maximum" value="true"> I acknowledge that MAXIMUM uses a smaller safety reserve</label>
+        <div class="actions">
+          <button class="primary" name="activate_after_apply" value="true">Validate, apply and activate</button>
+          <button>Validate and apply only</button>
+        </div>
+      </form>
+      {% endif %}
+      {% endif %}
+    </article>
+    {% endfor %}
+  </section>
+</div>
+{% endblock %}

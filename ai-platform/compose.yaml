@@ -1,0 +1,198 @@
+name: vllm-ai-platform
+
+x-service-security: &service-security
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+x-app-environment: &app-environment
+  AI_PLATFORM_SCHEMA_VERSION: ${AI_PLATFORM_SCHEMA_VERSION:-2}
+  AI_DOMAIN: ${AI_DOMAIN}
+  DATABASE_URL: ${DATABASE_URL}
+  REDIS_URL: ${REDIS_URL}
+  APP_SECRET: ${APP_SECRET}
+  API_KEY_PEPPER: ${API_KEY_PEPPER}
+  INTERNAL_GATEWAY_TOKEN: ${INTERNAL_GATEWAY_TOKEN}
+  CONTROLLER_TOKEN: ${CONTROLLER_TOKEN}
+  PROXY_SHARED_TOKEN: ${PROXY_SHARED_TOKEN}
+  TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.16.0.0/12}
+  GLOBAL_ALLOWED_CIDRS: ${GLOBAL_ALLOWED_CIDRS:-}
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+  COOKIE_SECURE: ${COOKIE_SECURE:-true}
+  ADMIN_PANEL_ENABLED: ${ADMIN_PANEL_ENABLED:-true}
+  CHAT_PORTAL_ENABLED: ${CHAT_PORTAL_ENABLED:-true}
+  PROMPT_LOGGING: ${PROMPT_LOGGING:-false}
+  AI_DISK_RESERVE_GB: ${AI_DISK_RESERVE_GB:-20}
+  AI_INTERNAL_NETWORK: ${AI_INTERNAL_NETWORK:-vllm-ai-internal}
+  AI_SHARED_NETWORK: ${AI_SHARED_NETWORK:-laravel-shared}
+  AI_PLATFORM_ROOT: ${AI_PLATFORM_ROOT:-/opt/vllm-ai-platform}
+  VLLM_IMAGE: ${VLLM_IMAGE:-vllm/vllm-openai:v0.30.0}
+  HF_TOKEN_FILE: /run/secrets/hf_token
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+    <<: *service-security
+    # The official image starts as root and drops to the postgres UID after
+    # fixing bind-mount ownership; retain its default capability set.
+    cap_drop: []
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - ./redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks:
+      - internal
+    <<: *service-security
+    # Redis likewise uses its entrypoint to drop from root to its service UID.
+    cap_drop: []
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    read_only: true
+    tmpfs:
+      - /tmp
+    <<: *service-security
+
+  gateway:
+    build: .
+    restart: unless-stopped
+    command: ["uvicorn", "app.gateway:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers", "--no-server-header"]
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./hardware:/platform/hardware:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      internal:
+      laravel-shared:
+        aliases:
+          - ai-gateway
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    <<: *service-security
+
+  web:
+    build: .
+    restart: unless-stopped
+    command: ["uvicorn", "app.web:app", "--host", "0.0.0.0", "--port", "8080", "--no-proxy-headers", "--no-server-header"]
+    environment:
+      <<: *app-environment
+      GATEWAY_INTERNAL_URL: http://gateway:8000
+      CONTROLLER_INTERNAL_URL: http://controller:8090
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      gateway:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./hardware:/platform/hardware:ro
+      - ./notebooks:/platform/notebooks:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      internal:
+      laravel-shared:
+        aliases:
+          - ai-web
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    <<: *service-security
+
+  controller:
+    build: .
+    restart: unless-stopped
+    user: "0:0"
+    command: ["uvicorn", "app.controller:app", "--host", "0.0.0.0", "--port", "8090", "--no-proxy-headers", "--no-server-header"]
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./models:/models
+      - ./hf-cache:/root/.cache/huggingface
+      - ./hardware:/platform/hardware
+      - ./model-configs:/platform/model-configs
+      - ./generated:/platform/generated
+      - ./secrets/hf_token:/run/secrets/hf_token:ro
+    networks:
+      - internal
+      - egress
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+networks:
+  internal:
+    name: ${AI_INTERNAL_NETWORK:-vllm-ai-internal}
+    internal: true
+  laravel-shared:
+    name: ${AI_SHARED_NETWORK:-laravel-shared}
+    external: true
+  egress:
+    name: vllm-ai-egress
+
+

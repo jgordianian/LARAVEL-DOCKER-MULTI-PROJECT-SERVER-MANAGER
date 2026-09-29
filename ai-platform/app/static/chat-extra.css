@@ -1,0 +1,13 @@
+.chat-controls { display: flex !important; grid-auto-flow: column; align-items: center; gap: 8px; }
+.message-meta { display: flex; gap: 12px; align-items: center; margin-top: 5px; color: var(--muted); font-size: 11px; }
+.message-actions { display: flex; gap: 4px; }
+.message-actions button, .copy-code { border: 0; background: transparent; color: var(--muted); padding: 2px 5px; font-size: 11px; }
+.message-actions button:hover, .copy-code:hover { color: var(--brand); }
+.message-content pre { position: relative; padding-top: 35px; }
+.copy-code { position: absolute; right: 8px; top: 6px; }
+.syntax-keyword { color: #8db6ff; font-weight: 600; }
+@media (max-width: 650px) {
+  .chat-controls .secondary, .chat-controls .danger { display: none; }
+  .chat-controls { grid-auto-flow: row; }
+  .chat-head select { max-width: 150px; }
+}

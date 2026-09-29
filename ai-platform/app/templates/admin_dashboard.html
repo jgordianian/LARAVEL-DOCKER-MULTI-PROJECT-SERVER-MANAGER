@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Administration · AI Platform{% endblock %}
+{% block content %}
+<div class="admin-layout">
+  {% include "admin_nav.html" %}
+  <section>
+    <div class="heading"><div><p class="eyebrow">SYSTEM OVERVIEW</p><h1>AI platform</h1></div><span class="pill good">Operational data</span></div>
+    <div class="cards">
+      <article><span>Users</span><strong>{{ counts.users }}</strong></article>
+      <article><span>Active API keys</span><strong>{{ counts.api_keys }}</strong></article>
+      <article><span>Downloaded / registered models</span><strong>{{ counts.models }}</strong></article>
+      <article><span>Ready models</span><strong>{{ counts.active_models }}</strong></article>
+      <article><span>Recorded requests</span><strong>{{ counts.requests_24h or 0 }}</strong></article>
+      <article><span>Tokens in / out (24h)</span><strong>{{ counts.input_tokens_24h }} / {{ counts.output_tokens_24h }}</strong></article>
+      <article><span>Average latency (24h)</span><strong>{{ counts.average_latency_24h }} ms</strong></article>
+    </div>
+    <div class="grid-2">
+      <article class="panel">
+        <h2>Hardware snapshot</h2>
+        {% if hardware %}
+          <dl class="facts">
+            <dt>CPU</dt><dd>{{ hardware.cpu.model }} · {{ hardware.cpu.cores }} cores · load {{ hardware.cpu.load_average|join(', ') }}</dd>
+            <dt>RAM</dt><dd>{{ '%.1f'|format(hardware.memory.used_bytes / 1073741824) }} GB used · {{ '%.1f'|format(hardware.memory.available_bytes / 1073741824) }} GB available · {{ '%.1f'|format(hardware.memory.total_bytes / 1073741824) }} GB total</dd>
+            <dt>Disk free</dt><dd>{{ '%.1f'|format(hardware.storage.free_bytes / 1073741824) }} GB</dd>
+            <dt>GPU count</dt><dd>{{ hardware.gpus|length }}</dd>
+          </dl>
+          {% for gpu in hardware.gpus %}<p><strong>GPU {{ gpu.index }}</strong> {{ gpu.name }} · {{ gpu.utilization_percent or 0 }}% · VRAM {{ '%.1f'|format((gpu.memory_used_bytes or 0) / 1073741824) }}/{{ '%.1f'|format(gpu.memory_total_bytes / 1073741824) }} GB · {{ gpu.temperature_c if gpu.temperature_c is not none else 'n/a' }}°C · {{ (gpu.power_draw_w|string ~ ' W') if gpu.power_draw_w is not none else 'power n/a' }}</p>{% endfor %}
+          <p class="muted">Active/queued request and token-rate gauges remain version-specific vLLM metrics; inspect them per ready model from Models &amp; instances.</p>
+        {% else %}<p class="muted">Hardware snapshot is unavailable. Run the manager hardware analysis.</p>{% endif %}
+      </article>
+      <article class="panel">
+        <h2>Recent administration</h2>
+        <div class="timeline">{% for item in recent %}<div><span>{{ item.occurred_at.strftime('%Y-%m-%d %H:%M') }}</span><strong>{{ item.action }}</strong><small>{{ item.result }}</small></div>{% else %}<p class="muted">No audit events yet.</p>{% endfor %}</div>
+      </article>
+    </div>
+  </section>
+</div>
+<script src="/static/dashboard.js" defer></script>
+{% endblock %}
+
