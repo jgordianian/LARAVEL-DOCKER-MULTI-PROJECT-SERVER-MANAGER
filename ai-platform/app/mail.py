@@ -4,6 +4,7 @@ import smtplib
 import ssl
 from dataclasses import dataclass
 from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -68,6 +69,9 @@ def send_email(configuration: SMTPConfiguration, recipient: str, subject: str, t
     message["From"] = f"{configuration.from_name} <{configuration.from_email}>"
     message["To"] = recipient
     message["Subject"] = subject
+    message["Date"] = formatdate(localtime=False, usegmt=True)
+    message_id_domain = configuration.from_email.rsplit("@", 1)[-1] if "@" in configuration.from_email else None
+    message["Message-ID"] = make_msgid(domain=message_id_domain)
     message.set_content(text_body)
 
     context = ssl.create_default_context()

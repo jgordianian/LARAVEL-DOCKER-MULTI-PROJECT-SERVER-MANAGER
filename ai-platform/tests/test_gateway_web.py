@@ -16,8 +16,53 @@ from sqlalchemy import select
 
 from app import gateway, web
 from app.config import get_settings
+from app.mail import SMTPConfiguration, send_email
 from app.models import APIKey, AuditLog, Conversation, IPRule, ModelInstance, ModelRecord, PasswordResetToken, ServiceAccount, SystemSetting, UsageRecord, User, WebSession
 from app.security import create_web_session, generate_api_key, hash_password, verify_password
+
+
+def test_send_email_adds_required_date_and_message_id_headers(monkeypatch):
+    delivered = {}
+
+    class SMTPClient:
+        def __init__(self, **kwargs):
+            delivered["connection"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def ehlo(self):
+            return None
+
+        def login(self, username, password):
+            delivered["login"] = (username, password)
+
+        def send_message(self, message):
+            delivered["message"] = message
+            return {}
+
+    monkeypatch.setattr("app.mail.smtplib.SMTP_SSL", SMTPClient)
+    configuration = SMTPConfiguration(
+        enabled=True,
+        host="mail.example.com",
+        port=465,
+        security="ssl",
+        username="mailer",
+        password="secret",
+        from_email="notifications@example.com",
+        from_name="Example AI",
+    )
+
+    send_email(configuration, "recipient@example.net", "SMTP test", "Delivered")
+
+    message = delivered["message"]
+    assert message["Date"]
+    assert message["Message-ID"].endswith("@example.com>")
+    assert message["From"] == "Example AI <notifications@example.com>"
+    assert message["To"] == "recipient@example.net"
 
 
 def api_fixture(db):
