@@ -30,7 +30,7 @@ from .config import get_settings
 from .db import SessionLocal, get_db
 from .environment import load_environment_snapshot
 from .i18n import SUPPORTED_LANGUAGES, normalize_language, translate
-from .mail import SMTPConfiguration, send_email, smtp_configuration
+from .mail import EmailBranding, SMTPConfiguration, password_reset_email, send_email, smtp_configuration, smtp_test_email
 from .models import (
     APIKey,
     AuditLog,
@@ -231,6 +231,26 @@ def password_reset_url(token: str) -> str:
     if not domain.startswith(("http://", "https://")):
         domain = f"{'https' if settings.cookie_secure else 'http'}://{domain}"
     return f"{domain}/reset-password?token={token}"
+
+
+def absolute_portal_url(value: str) -> str:
+    url = str(value or "").strip()
+    if not url or url.startswith(("http://", "https://", "data:")):
+        return url
+    domain = settings.ai_domain.strip().rstrip("/")
+    if not domain.startswith(("http://", "https://")):
+        domain = f"{'https' if settings.cookie_secure else 'http'}://{domain}"
+    return f"{domain}/{url.lstrip('/')}"
+
+
+def email_branding(presentation: dict[str, Any]) -> EmailBranding:
+    branding = presentation["branding"]
+    logo_url = branding["logo_dark_url"] or branding["logo_light_url"] or branding["login_logo_url"]
+    return EmailBranding(
+        brand_name=branding["brand_name"],
+        logo_url=absolute_portal_url(logo_url),
+        footer_text=branding["footer_text"],
+    )
 
 
 def brand_asset_extension(body: bytes, *, favicon: bool) -> str:
@@ -455,18 +475,15 @@ def forgot_password_request(
             )
             try:
                 presentation = site_presentation()
-                brand_name = presentation["branding"]["brand_name"]
                 email_language = normalize_language(user.preferred_language, presentation["system_language"])
                 reset_url = password_reset_url(raw_token)
+                email = password_reset_email(email_branding(presentation), email_language, reset_url)
                 send_email(
                     configuration,
                     user.email,
-                    translate(email_language, "Reset your {brand_name} password", brand_name=brand_name),
-                    translate(
-                        email_language,
-                        "A password reset was requested for your account.\n\nOpen this link within 30 minutes:\n{url}\n\nIf you did not request this, you can ignore this email.",
-                        url=reset_url,
-                    ),
+                    email.subject,
+                    email.text_body,
+                    email.html_body,
                 )
                 audit(db, None, request, "user.password_reset_requested", "user", user.id)
                 db.commit()
@@ -1948,13 +1965,16 @@ def smtp_update(
     test_succeeded = None
     if action == "test":
         configuration = SMTPConfiguration(password=effective_password, **{key.removeprefix("smtp_"): value for key, value in values.items()})
-        test_language = normalize_language(session.user.preferred_language, site_presentation()["system_language"])
+        presentation = site_presentation()
+        test_language = normalize_language(session.user.preferred_language, presentation["system_language"])
+        email = smtp_test_email(email_branding(presentation), test_language, recipient)
         try:
             send_email(
                 configuration,
                 recipient,
-                translate(test_language, "{brand_name} SMTP test", brand_name=configuration.from_name),
-                translate(test_language, "SMTP is configured correctly. Password reset emails can now be delivered."),
+                email.subject,
+                email.text_body,
+                email.html_body,
             )
             result = "smtp-tested"
             test_succeeded = True

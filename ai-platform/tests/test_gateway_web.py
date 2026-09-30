@@ -16,7 +16,7 @@ from sqlalchemy import select
 
 from app import gateway, web
 from app.config import get_settings
-from app.mail import SMTPConfiguration, send_email
+from app.mail import EmailBranding, SMTPConfiguration, send_email, smtp_test_email
 from app.models import APIKey, AuditLog, Conversation, IPRule, ModelInstance, ModelRecord, PasswordResetToken, ServiceAccount, SystemSetting, UsageRecord, User, WebSession
 from app.security import create_web_session, generate_api_key, hash_password, verify_password
 
@@ -56,13 +56,38 @@ def test_send_email_adds_required_date_and_message_id_headers(monkeypatch):
         from_name="Example AI",
     )
 
-    send_email(configuration, "recipient@example.net", "SMTP test", "Delivered")
+    send_email(configuration, "recipient@example.net", "SMTP test", "Delivered", "<strong>Delivered</strong>")
 
     message = delivered["message"]
     assert message["Date"]
     assert message["Message-ID"].endswith("@example.com>")
     assert message["From"] == "Example AI <notifications@example.com>"
     assert message["To"] == "recipient@example.net"
+    assert message.is_multipart()
+    assert message.get_body(preferencelist=("plain",)).get_content().strip() == "Delivered"
+    assert "<strong>Delivered</strong>" in message.get_body(preferencelist=("html",)).get_content()
+
+
+def test_smtp_test_email_uses_professional_branded_spanish_template():
+    email = smtp_test_email(
+        EmailBranding(
+            brand_name="Omnivis AI",
+            logo_url="https://ia.omnivis.net/branding/logo.png?v=1&size=2",
+            footer_text="Omnivis AI ©2026",
+        ),
+        "es",
+        "recipient@example.net",
+    )
+
+    assert email.subject == "Prueba SMTP de Omnivis AI"
+    assert '<html lang="es">' in email.html_body
+    assert 'role="presentation"' in email.html_body
+    assert "Prueba SMTP exitosa" in email.html_body
+    assert "Configuración verificada" in email.html_body
+    assert "recipient@example.net" in email.html_body
+    assert "https://ia.omnivis.net/branding/logo.png?v=1&amp;size=2" in email.html_body
+    assert "mensaje automático" in email.html_body
+    assert "legal" not in email.html_body.lower()
 
 
 def api_fixture(db):
@@ -707,8 +732,8 @@ def test_smtp_password_reset_uses_single_use_hashed_token(db, monkeypatch):
 
     delivered = {}
 
-    def capture_email(configuration, recipient, subject, text_body):
-        delivered.update(recipient=recipient, subject=subject, body=text_body)
+    def capture_email(configuration, recipient, subject, text_body, html_body=None):
+        delivered.update(recipient=recipient, subject=subject, body=text_body, html=html_body)
 
     monkeypatch.setattr(web, "send_email", capture_email)
     client = TestClient(web.app)
@@ -723,6 +748,10 @@ def test_smtp_password_reset_uses_single_use_hashed_token(db, monkeypatch):
     assert delivered["recipient"] == user.email
     assert delivered["subject"].startswith("Restablece tu contraseña")
     assert "Se solicitó restablecer" in delivered["body"]
+    assert '<html lang="es">' in delivered["html"]
+    assert "Restablecer contraseña" in delivered["html"]
+    assert "mensaje automático" in delivered["html"]
+    assert 'role="presentation"' in delivered["html"]
     assert "smtp-secret" not in delivered["body"]
     token = re.search(r"token=([^\s]+)", delivered["body"]).group(1)
     stored = db.query(PasswordResetToken).one()

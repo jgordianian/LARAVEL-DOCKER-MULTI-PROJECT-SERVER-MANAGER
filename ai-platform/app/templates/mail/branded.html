@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="{{ language }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{{ title }}</title>
+</head>
+<body style="margin:0;padding:0;background:#f1f5f9;color:#0f172a;font-family:Inter,'Segoe UI',Arial,sans-serif;">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">{{ preheader }}</div>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f1f5f9;padding:32px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:640px;border-collapse:separate;background:#ffffff;border:1px solid #dbe4ef;border-radius:16px;overflow:hidden;box-shadow:0 12px 32px rgba(15,23,42,.08);">
+          <tr>
+            <td style="padding:28px 32px;background:#0b1224;background-image:linear-gradient(135deg,#0b1224 0%,#111d38 100%);">
+              {% if branding.logo_url %}
+                <img src="{{ branding.logo_url }}" alt="{{ branding.brand_name }}" height="48" style="display:block;width:auto;max-width:180px;height:48px;max-height:48px;border:0;outline:none;text-decoration:none;-ms-interpolation-mode:bicubic;">
+              {% else %}
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr>
+                  <td style="width:46px;height:46px;border-radius:12px;background:#67e8d1;background-image:linear-gradient(135deg,#67e8d1,#55b8ed);color:#07111f;font-size:17px;font-weight:800;text-align:center;vertical-align:middle;">AI</td>
+                  <td style="padding-left:14px;color:#ffffff;font-size:18px;font-weight:700;vertical-align:middle;">{{ branding.brand_name }}</td>
+                </tr></table>
+              {% endif %}
+              {% if branding.logo_url %}<div style="margin-top:12px;color:#cbd5e1;font-size:13px;line-height:1.4;">{{ branding.brand_name }}</div>{% endif %}
+            </td>
+          </tr>
+          <tr>
+            <td style="height:4px;background:#67e8d1;background-image:linear-gradient(90deg,#67e8d1,#55b8ed);"></td>
+          </tr>
+          <tr>
+            <td style="padding:32px;">
+              <div style="margin:0 0 9px;color:#0f8f8a;font-size:12px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;">{{ eyebrow }}</div>
+              <h1 style="margin:0;color:#0f172a;font-size:26px;line-height:1.25;font-weight:750;">{{ title }}</h1>
+              <p style="margin:14px 0 0;color:#475569;font-size:15px;line-height:1.7;">{{ introduction }}</p>
+
+              {% if action_url and action_label %}
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin-top:26px;"><tr>
+                  <td style="border-radius:9px;background:#55b8ed;background-image:linear-gradient(135deg,#67e8d1,#55b8ed);">
+                    <a href="{{ action_url }}" style="display:inline-block;padding:14px 22px;color:#07111f;font-size:15px;font-weight:800;text-decoration:none;border-radius:9px;">{{ action_label }}</a>
+                  </td>
+                </tr></table>
+              {% endif %}
+
+              {% for paragraph in supporting_paragraphs %}
+                <p style="margin:{{ '24px' if loop.first else '10px' }} 0 0;color:#475569;font-size:14px;line-height:1.65;">{{ paragraph }}</p>
+              {% endfor %}
+
+              {% if details %}
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;margin-top:24px;border-collapse:collapse;border-top:1px solid #e2e8f0;">
+                  {% for label, value in details %}
+                    <tr>
+                      <td style="width:38%;padding:12px 0;border-bottom:1px solid #e2e8f0;color:#64748b;font-size:13px;line-height:1.5;">{{ label }}</td>
+                      <td align="right" style="padding:12px 0;border-bottom:1px solid #e2e8f0;color:#0f172a;font-size:13px;font-weight:700;line-height:1.5;word-break:break-word;">{{ value }}</td>
+                    </tr>
+                  {% endfor %}
+                </table>
+              {% endif %}
+
+              {% if action_url and raw_url_label %}
+                <div style="margin-top:24px;padding:14px 16px;border:1px solid #dbe4ef;border-radius:10px;background:#f8fafc;color:#64748b;font-size:12px;line-height:1.6;">
+                  {{ raw_url_label }}<br>
+                  <a href="{{ action_url }}" style="color:#087f8c;text-decoration:none;word-break:break-all;">{{ action_url }}</a>
+                </div>
+              {% endif %}
+
+              <div style="margin-top:26px;padding:13px 15px;border:1px solid #e2e8f0;border-radius:9px;background:#f8fafc;color:#64748b;font-size:12px;line-height:1.6;">
+                {{ automated_notice }}
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:18px 28px;border-top:1px solid #e2e8f0;background:#f8fafc;color:#64748b;font-size:12px;line-height:1.5;">
+              {{ branding.footer_text }}
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
