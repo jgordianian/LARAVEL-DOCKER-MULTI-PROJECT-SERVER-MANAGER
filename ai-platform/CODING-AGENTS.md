@@ -172,7 +172,11 @@ wire_api = "responses"
 
 Export `OMNIVIS_CODING_API_KEY` before starting Codex from the repository directory. The alias must exactly match the Gateway alias; the client never needs a vLLM container name, port, Docker hostname or Hugging Face ID.
 
-This format follows the official [Codex configuration reference](https://developers.openai.com/codex/config-reference), which defines custom provider `base_url`, `env_key` and the `responses` wire API. vLLM's [Codex integration guide](https://docs.vllm.ai/en/latest/serving/integrations/codex/) also requires a Responses-capable model with correct tool calling.
+Administrators can also open **Administration > API access > Configure Codex** on an active key. The modal generates one PowerShell, Linux shell or macOS Terminal command. That command authenticates to `GET /v1/codex/install`, downloads the platform-specific installer, backs up an existing `~/.codex/config.toml`, writes the permitted model catalog and stores the API key in a private local token file used through Codex command-backed authentication. Because API secrets are hashed at rest, the modal can prefill the complete key only on the response immediately following key creation or rotation; otherwise paste the previously saved key or rotate it.
+
+The key and its owner policy must allow the `responses`, `tools` and `coding` scopes and `/v1/responses`, and at least one permitted active model must expose Responses, coding/agentic and tool-calling capabilities.
+
+This format follows the official [Codex configuration reference](https://developers.openai.com/codex/config-reference), which defines custom provider `base_url`, environment-key or command-backed authentication, and the `responses` wire API. vLLM's [Codex integration guide](https://docs.vllm.ai/en/latest/serving/integrations/codex/) also requires a Responses-capable model with correct tool calling.
 
 Codex executes its local tools according to the client's sandbox and approval policy. Connecting it to this Gateway does not give the server access to the repository.
 

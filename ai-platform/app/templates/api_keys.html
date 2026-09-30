@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 {% block title %}API access · {{ branding.browser_title }}{% endblock %}
 {% block content %}
-<div class="admin-layout">
+<div class="admin-layout" id="codex-setup-root" data-installer-url="{{ codex_installer_url }}" data-created-key-id="{{ created_key_id or '' }}">
   {% include "admin_nav.html" %}
   <section>
     <h1>API access</h1>
     <p class="muted">Keys are hashed at rest. The complete secret appears once. Limits here are enforced by the Gateway.</p>
-    {% if created_secret %}<div class="secret-once"><strong>Copy this key now. It cannot be shown again.</strong><code>{{ created_secret }}</code></div>{% endif %}
+    {% if created_secret %}<div class="secret-once"><strong>Copy this key now. It cannot be shown again.</strong><code id="created-secret-value">{{ created_secret }}</code><button type="button" class="codex-setup-button primary" data-key-id="{{ created_key_id }}" data-key-name="New API key">Configure Codex</button></div>{% endif %}
     <article class="panel">
       <h2>Create API key</h2>
       <form method="post" class="form-grid">
@@ -43,6 +43,7 @@
             <td>{{ key.requests_per_minute }} rpm · {{ key.tokens_per_minute }} tpm · {{ key.concurrent_requests }} concurrent</td>
             <td><span class="pill {{ 'good' if key.enabled and not key.revoked_at else 'bad' }}">{{ 'Active' if key.enabled and not key.revoked_at else 'Revoked' }}</span><br><small>{{ 'Expires ' ~ key.expires_at if key.expires_at else 'No expiry' }}</small></td>
             <td><div class="actions">
+              {% if key.enabled and not key.revoked_at %}<button type="button" class="codex-setup-button" data-key-id="{{ key.id }}" data-key-name="{{ key.name }}">Configure Codex</button>{% endif %}
               <form method="post" action="/admin/api-keys/{{ key.id }}/rotate"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button>Rotate</button></form>
               {% if key.enabled and not key.revoked_at %}<form method="post" action="/admin/api-keys/{{ key.id }}/revoke"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="danger">Revoke</button></form>{% endif %}
             </div></td>
@@ -52,4 +53,33 @@
     </article>
   </section>
 </div>
+
+<dialog id="codex-setup-dialog" class="codex-setup-dialog" aria-labelledby="codex-setup-title">
+  <div class="codex-dialog-head">
+    <div><p class="eyebrow">CODEX FOR VISUAL STUDIO CODE</p><h2 id="codex-setup-title">Configure Codex</h2></div>
+    <button type="button" class="codex-dialog-close" aria-label="Close">×</button>
+  </div>
+  <p class="muted">Choose the operating system where Visual Studio Code and the Codex extension are installed.</p>
+  <p class="small muted">The key must allow responses, tools and coding scopes, plus access to /v1/responses.</p>
+  <div class="codex-platforms" role="group" aria-label="Operating system">
+    <button type="button" data-platform="windows">Windows</button>
+    <button type="button" data-platform="linux">Linux</button>
+    <button type="button" data-platform="macos">macOS</button>
+  </div>
+  <label>API key
+    <input id="codex-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste the complete API key">
+    <small>The complete key is only prefilled immediately after creation or rotation.</small>
+  </label>
+  <label>Installation command</label>
+  <div class="codex-command-box">
+    <pre data-no-translate><code id="codex-install-command"></code></pre>
+    <button type="button" id="codex-copy-command">Copy command</button>
+  </div>
+  <p id="codex-command-status" class="small muted" aria-live="polite">Enter the complete API key to generate the command.</p>
+  <div class="alert warning">This command contains the API key. Do not share it. Your existing Codex configuration will be backed up before installation.</div>
+  <div class="actions codex-dialog-actions">
+    <button type="button" class="codex-dialog-close secondary">Close</button>
+  </div>
+</dialog>
 {% endblock %}
+{% block scripts %}<script src="/static/codex-setup.js?v=1.2.0-codex7" defer></script>{% endblock %}

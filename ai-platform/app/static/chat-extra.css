@@ -85,6 +85,28 @@
 .language-menu-options button.selected { background: #173047; color: var(--brand); }
 .language-check { visibility: hidden; color: var(--brand); font-weight: 800; }
 .language-menu-options button.selected .language-check { visibility: visible; }
+.codex-setup-dialog {
+  width: min(760px, calc(100% - 28px));
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 24px;
+  background: linear-gradient(150deg, var(--panel), #0d1527);
+  color: var(--text);
+  box-shadow: 0 28px 90px #02040ad9;
+}
+.codex-setup-dialog::backdrop { background: #02050dcc; backdrop-filter: blur(4px); }
+.codex-dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.codex-dialog-head h2 { margin-bottom: 0; }
+.codex-dialog-close { font-size: 18px; line-height: 1; }
+.codex-platforms { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 20px 0; }
+.codex-platforms button { background: #0c1428; }
+.codex-platforms button.selected { border-color: var(--brand); background: #173047; color: var(--brand); box-shadow: 0 0 0 2px #73e0c11f; }
+.codex-command-box { position: relative; margin-top: 7px; }
+.codex-command-box pre { min-height: 110px; max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; padding: 16px 145px 16px 16px; border: 1px solid var(--line); border-radius: 11px; background: #060a13; color: #cde1ff; }
+.codex-command-box button { position: absolute; top: 10px; right: 10px; }
+.codex-dialog-actions { justify-content: flex-end; }
 @media (max-width: 650px) {
   .chat-controls .secondary, .chat-controls .danger { display: none; }
   .chat-controls { grid-auto-flow: row; }
@@ -93,4 +115,6 @@
   .compact-control span { display: none; }
   .language-menu > summary { min-width: 100px; padding-inline: 9px; }
   .language-menu-options { right: auto; left: 0; }
+  .codex-platforms { grid-template-columns: 1fr; }
+  .codex-command-box pre { padding: 54px 13px 13px; }
 }

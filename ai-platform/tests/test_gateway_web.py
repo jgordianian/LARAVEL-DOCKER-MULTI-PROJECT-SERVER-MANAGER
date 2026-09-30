@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
 import re
+import subprocess
+import tomllib
 from html import unescape
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -12,7 +16,7 @@ from sqlalchemy import select
 
 from app import gateway, web
 from app.config import get_settings
-from app.models import APIKey, AuditLog, Conversation, IPRule, ModelInstance, ModelRecord, PasswordResetToken, SystemSetting, UsageRecord, User, WebSession
+from app.models import APIKey, AuditLog, Conversation, IPRule, ModelInstance, ModelRecord, PasswordResetToken, ServiceAccount, SystemSetting, UsageRecord, User, WebSession
 from app.security import create_web_session, generate_api_key, hash_password, verify_password
 
 
@@ -59,6 +63,99 @@ def test_models_requires_auth_and_returns_only_ready_models(db):
     assert response.status_code == 200
     assert response.json()["data"][0]["id"] == "alpha"
     assert response.headers["x-request-id"].startswith("req_")
+
+
+def test_codex_installer_requires_coding_policy_and_generates_each_platform(db, tmp_path):
+    owner = User(
+        name="Codex Owner",
+        email="codex-owner@example.com",
+        password_hash=hash_password("GoodPassword!123"),
+        role="super_admin",
+    )
+    model = ModelRecord(
+        hf_model_id="Qwen/Qwen3-14B-AWQ",
+        alias="omnivis-coder",
+        revision="stable-revision",
+        download_status="downloaded",
+        capabilities=["chat", "coding", "agentic", "reasoning", "responses"],
+        max_model_len=32_768,
+        tool_calling=True,
+        tool_call_parser="qwen3_coder",
+        is_default=True,
+    )
+    model.instance = ModelInstance(
+        container_name="vllm-omnivis-coder",
+        internal_url="http://vllm-omnivis-coder:8000",
+        desired_active=True,
+        status="ready",
+        gpu_assignment=[0],
+    )
+    raw, key_id, prefix, secret_hash = generate_api_key(get_settings())
+    db.add_all([owner, model])
+    db.flush()
+    key = APIKey(
+        name="Codex installer",
+        key_id=key_id,
+        key_prefix=prefix,
+        secret_hash=secret_hash,
+        user_id=owner.id,
+        allowed_models=[model.alias],
+        scopes=["models", "responses", "tools", "coding"],
+        allowed_endpoints=["/v1/models", "/v1/responses"],
+    )
+    db.add(key)
+    db.commit()
+    client = TestClient(gateway.app)
+    headers = {"Authorization": f"Bearer {raw}"}
+
+    missing = client.get("/v1/codex/install?platform=windows")
+    assert missing.status_code == 401
+    invalid = client.get("/v1/codex/install?platform=android", headers=headers)
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["type"] == "invalid_platform"
+
+    windows = client.get("/v1/codex/install?platform=windows", headers=headers)
+    assert windows.status_code == 200
+    assert windows.headers["content-disposition"] == 'attachment; filename="omnivis-codex-setup.ps1"'
+    assert "$env:OMNIVIS_CODING_API_KEY" in windows.text
+    assert raw not in windows.text
+    payloads = re.findall(r"FromBase64String\('([A-Za-z0-9+/=]+)'\)", windows.text)
+    assert len(payloads) == 2
+    config_text = base64.b64decode(payloads[0]).decode().replace("__CODEX_CATALOG_PATH__", "C:/Users/Test/.codex/omnivis-models.json").replace("__CODEX_TOKEN_PATH__", "C:/Users/Test/.codex/omnivis-api-key")
+    parsed_config = tomllib.loads(config_text)
+    assert parsed_config["model"] == "omnivis-coder"
+    assert parsed_config["model_provider"] == "omnivis_gateway"
+    assert parsed_config["model_context_window"] == 32_768
+    assert parsed_config["model_providers"]["omnivis_gateway"]["base_url"] == "http://testserver/v1"
+    assert parsed_config["model_providers"]["omnivis_gateway"]["wire_api"] == "responses"
+    assert parsed_config["model_providers"]["omnivis_gateway"]["auth"]["command"] == "powershell.exe"
+    catalog = json.loads(base64.b64decode(payloads[1]))
+    assert catalog["models"][0]["slug"] == "omnivis-coder"
+    assert catalog["models"][0]["supported_reasoning_levels"][-1]["effort"] == "high"
+
+    linux = client.get("/v1/codex/install?platform=linux", headers=headers)
+    macos = client.get("/v1/codex/install?platform=macos", headers=headers)
+    assert linux.status_code == macos.status_code == 200
+    assert "base64 -d" in linux.text
+    assert "base64 -D" in macos.text
+    assert linux.headers["content-disposition"] == 'attachment; filename="omnivis-codex-setup.sh"'
+    codex_home = tmp_path / "codex-home"
+    environment = os.environ.copy()
+    environment.update(OMNIVIS_CODING_API_KEY=raw, CODEX_HOME=str(codex_home))
+    installed = subprocess.run(["sh"], input=linux.text, text=True, capture_output=True, env=environment, check=False)
+    assert installed.returncode == 0, installed.stderr
+    assert "installed successfully" in installed.stdout
+    installed_config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert installed_config["model"] == "omnivis-coder"
+    assert installed_config["model_providers"]["omnivis_gateway"]["auth"]["command"] == "sh"
+    assert json.loads((codex_home / "omnivis-models.json").read_text())["models"][0]["slug"] == "omnivis-coder"
+    assert (codex_home / "omnivis-api-key").read_text().strip() == raw
+
+    key.scopes = ["models", "responses", "tools"]
+    db.commit()
+    denied = client.get("/v1/codex/install?platform=linux", headers=headers)
+    assert denied.status_code == 403
+    assert denied.json()["error"]["type"] == "codex_configuration_unavailable"
 
 
 def test_gateway_ip_allowlist_denial(db):
@@ -325,7 +422,7 @@ def test_global_and_per_user_language_preferences(db):
     inherited = client.get("/")
     assert inherited.status_code == 200
     assert '<html lang="es">' in inherited.text
-    assert 'src="/static/i18n.js?v=1.2.0-profile6"' in inherited.text
+    assert 'src="/static/i18n.js?v=1.2.0-codex7"' in inherited.text
     assert 'class="language-menu"' in inherited.text
     assert '<span class="language-current">System</span>' in inherited.text
     assert 'name="preferred_language" value="" class="selected" aria-current="true"' in inherited.text
@@ -425,6 +522,65 @@ def test_user_can_manage_profile_and_email_change_is_reauthenticated(db):
     event = db.scalar(select(AuditLog).where(AuditLog.action == "user.profile_changed"))
     assert event is not None
     assert event.after["other_sessions_terminated"] is True
+
+
+def test_api_key_page_builds_codex_setup_command_without_revealing_stored_secrets(db):
+    admin = User(
+        name="Codex Admin",
+        email="codex-admin@example.com",
+        password_hash=hash_password("GoodPassword!123"),
+        role="super_admin",
+    )
+    account = ServiceAccount(
+        name="VS Code Codex",
+        purpose="coding_agent",
+        allowed_models=["omnivis-coder"],
+        allowed_scopes=["models", "responses", "tools", "coding"],
+        allowed_endpoints=["/v1/models", "/v1/responses"],
+    )
+    db.add_all([admin, account])
+    db.flush()
+    raw_session, session = create_web_session(db, admin, "127.0.0.1", "test")
+    db.commit()
+    client = TestClient(web.app)
+    client.cookies.set("ai_session", raw_session)
+
+    created = client.post(
+        "/admin/api-keys",
+        data={
+            "name": "VS Code workstation",
+            "owner_type": "service_account",
+            "owner_id": str(account.id),
+            "allowed_models": "omnivis-coder",
+            "scopes": "models,responses,tools,coding",
+            "allowed_endpoints": "/v1/models,/v1/responses",
+            "csrf_token": session.csrf_token,
+        },
+    )
+    assert created.status_code == 200
+    key = db.query(APIKey).one()
+    secret = re.search(r'<code id="created-secret-value">([^<]+)</code>', created.text).group(1)
+    assert secret.startswith("ovai_live_")
+    assert created.text.count(secret) == 1
+    assert f'data-created-key-id="{key.id}"' in created.text
+    assert f'data-key-id="{key.id}"' in created.text
+    assert 'id="codex-setup-dialog"' in created.text
+    assert 'data-installer-url="http://testserver/v1/codex/install"' in created.text
+    assert 'src="/static/codex-setup.js?v=1.2.0-codex7"' in created.text
+
+    later = client.get("/admin/api-keys")
+    assert later.status_code == 200
+    assert secret not in later.text
+    assert "Configure Codex" in later.text
+
+    rotated = client.post(
+        f"/admin/api-keys/{key.id}/rotate",
+        data={"csrf_token": session.csrf_token},
+    )
+    rotated_secret = re.search(r'<code id="created-secret-value">([^<]+)</code>', rotated.text).group(1)
+    assert rotated_secret != secret
+    assert rotated.text.count(rotated_secret) == 1
+    assert f'data-created-key-id="{key.id}"' in rotated.text
 
 
 def test_spanish_dictionary_covers_every_static_admin_literal():

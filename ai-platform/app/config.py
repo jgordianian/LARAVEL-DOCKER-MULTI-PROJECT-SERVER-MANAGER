@@ -13,6 +13,7 @@ class Settings(BaseSettings):
 
     ai_platform_schema_version: int = 2
     ai_domain: str = "localhost"
+    cloudflare_api_hostname: str = ""
     database_url: str
     redis_url: str
     app_secret: str
@@ -101,4 +102,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from . import __version__
 from .capabilities import model_capabilities
+from .codex_setup import codex_installer_script
 from .config import get_settings
 from .db import SessionLocal, get_db
 from .models import APIKey, IPRule, ModelInstance, ModelPermission, ModelRecord, Quota, SystemSetting, UsageRecord, User
@@ -237,6 +238,20 @@ def active_models(db: Session) -> list[ModelRecord]:
     ).all()
 
 
+def codex_models(db: Session, principal: Principal) -> list[ModelRecord]:
+    compatible: list[ModelRecord] = []
+    for model in active_models(db):
+        capabilities = model_capabilities(model)
+        if "responses" not in capabilities or not capabilities.intersection({"coding", "agentic"}) or not model.tool_calling:
+            continue
+        try:
+            authorize_model(db, principal, model, "responses", "/v1/responses", tools_requested=True)
+        except PolicyDenied:
+            continue
+        compatible.append(model)
+    return sorted(compatible, key=lambda model: (not model.is_default, model.alias))
+
+
 def _scope_for(endpoint: str) -> str:
     return {"models": "models", "chat/completions": "chat", "completions": "completions", "embeddings": "embeddings", "responses": "responses"}[endpoint]
 
@@ -418,6 +433,40 @@ def models(request: Request, db: Session = Depends(get_db)):
                 }
             )
         return JSONResponse({"object": "list", "data": rows}, headers={"X-Request-ID": req_id})
+    except (AuthenticationError, PolicyDenied) as exc:
+        return error_response(exc.error_type, exc.message, req_id, exc.status_code)
+
+
+@app.get("/v1/codex/install")
+def codex_install(request: Request, platform: str, db: Session = Depends(get_db)):
+    req_id = request.state.request_id
+    try:
+        normalized_platform = platform.strip().lower()
+        if normalized_platform not in {"windows", "linux", "macos"}:
+            raise PolicyDenied("invalid_platform", "Platform must be windows, linux or macos.", 400)
+        principal = authenticate(request, db)
+        enforce_ip_policy(db, principal, request.state.client_ip)
+        models = codex_models(db, principal)
+        if not models:
+            raise PolicyDenied(
+                "codex_configuration_unavailable",
+                "This API key cannot access an active Responses, tools and coding compatible model.",
+                403,
+            )
+        if settings.cloudflare_api_hostname:
+            api_base_url = f"https://{settings.cloudflare_api_hostname.strip().rstrip('.')}/v1"
+        else:
+            api_base_url = f"{str(request.base_url).rstrip('/')}/v1"
+        script = codex_installer_script(models, api_base_url, normalized_platform)
+        extension = "ps1" if normalized_platform == "windows" else "sh"
+        return Response(
+            content=script,
+            media_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="omnivis-codex-setup.{extension}"',
+                "X-Request-ID": req_id,
+            },
+        )
     except (AuthenticationError, PolicyDenied) as exc:
         return error_response(exc.error_type, exc.message, req_id, exc.status_code)
 

@@ -1215,16 +1215,33 @@ def service_account_policy(
     return RedirectResponse("/admin/service-accounts", 303)
 
 
-@app.get("/admin/api-keys", response_class=HTMLResponse)
-def api_keys_page(request: Request, db: Session = Depends(get_db)):
-    session = require_admin(request, db)
+def api_keys_response(
+    request: Request,
+    session: WebSession,
+    db: Session,
+    *,
+    created_secret: str | None = None,
+    created_key_id: int | None = None,
+):
+    if settings.cloudflare_api_hostname:
+        installer_url = f"https://{settings.cloudflare_api_hostname.strip().rstrip('.')}/v1/codex/install"
+    else:
+        installer_url = f"{str(request.base_url).rstrip('/')}/v1/codex/install"
     return render(
         request, "api_keys.html", session=session,
         keys=db.scalars(select(APIKey).order_by(APIKey.created_at.desc())).all(),
         users=db.scalars(select(User).where(User.enabled.is_(True)).order_by(User.email)).all(),
         accounts=db.scalars(select(ServiceAccount).where(ServiceAccount.enabled.is_(True)).order_by(ServiceAccount.name)).all(),
-        created_secret=None,
+        created_secret=created_secret,
+        created_key_id=created_key_id,
+        codex_installer_url=installer_url,
     )
+
+
+@app.get("/admin/api-keys", response_class=HTMLResponse)
+def api_keys_page(request: Request, db: Session = Depends(get_db)):
+    session = require_admin(request, db)
+    return api_keys_response(request, session, db)
 
 
 @app.post("/admin/api-keys", response_class=HTMLResponse)
@@ -1279,13 +1296,7 @@ def api_key_create(
     db.flush()
     audit(db, session, request, "api_key.created", "api_key", key.id, after={"prefix": prefix, "models": key.allowed_models, "cidrs": cidrs})
     db.commit()
-    return render(
-        request, "api_keys.html", session=session,
-        keys=db.scalars(select(APIKey).order_by(APIKey.created_at.desc())).all(),
-        users=db.scalars(select(User).where(User.enabled.is_(True)).order_by(User.email)).all(),
-        accounts=db.scalars(select(ServiceAccount).where(ServiceAccount.enabled.is_(True)).order_by(ServiceAccount.name)).all(),
-        created_secret=secret,
-    )
+    return api_keys_response(request, session, db, created_secret=secret, created_key_id=key.id)
 
 
 @app.post("/admin/api-keys/{key_id}/revoke")
@@ -1314,13 +1325,7 @@ def api_key_rotate(key_id: int, request: Request, csrf_token: str = Form(), db: 
     key.enabled, key.revoked_at = True, None
     audit(db, session, request, "api_key.rotated", "api_key", key.id, after={"prefix": prefix})
     db.commit()
-    return render(
-        request, "api_keys.html", session=session,
-        keys=db.scalars(select(APIKey).order_by(APIKey.created_at.desc())).all(),
-        users=db.scalars(select(User).where(User.enabled.is_(True)).order_by(User.email)).all(),
-        accounts=db.scalars(select(ServiceAccount).where(ServiceAccount.enabled.is_(True)).order_by(ServiceAccount.name)).all(),
-        created_secret=secret,
-    )
+    return api_keys_response(request, session, db, created_secret=secret, created_key_id=key.id)
 
 
 @app.get("/admin/models", response_class=HTMLResponse)
