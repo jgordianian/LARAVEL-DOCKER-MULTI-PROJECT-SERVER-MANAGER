@@ -13,15 +13,69 @@
   const send = document.getElementById('send');
   const rename = document.getElementById('rename-chat');
   const remove = document.getElementById('delete-chat');
+  const imagePicker = document.getElementById('image-picker');
+  const imageInput = document.getElementById('image-input');
+  const imagePreview = document.getElementById('image-preview');
+  const imageStatus = document.getElementById('image-status');
   let conversationId = null;
   let aborter = null;
   let savedReasoning = reasoning.dataset.savedValue || reasoning.value;
+  let pendingImages = [];
+  let imageStatusError = '';
+  const MAX_IMAGES = 4;
+  const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+  const MAX_TOTAL_IMAGE_BYTES = 5 * 1024 * 1024 / 2;
 
   const modelSupportsReasoning = () => model.selectedOptions[0]?.dataset.reasoning === 'true';
+  const modelSupportsVision = () => model.selectedOptions[0]?.dataset.vision === 'true';
   const effectiveReasoning = () => modelSupportsReasoning() ? reasoning.value : 'none';
   const syncReasoningAvailability = () => {
     reasoning.disabled = !modelSupportsReasoning();
     reasoning.title = reasoning.disabled ? 'The selected model is not configured for reasoning.' : '';
+  };
+  const renderPendingImages = () => {
+    imagePreview.innerHTML = '';
+    imagePreview.hidden = pendingImages.length === 0;
+    pendingImages.forEach((attachment, index) => {
+      const item = document.createElement('div');
+      item.className = 'image-preview-item';
+      const preview = document.createElement('img');
+      preview.src = attachment.data_url;
+      preview.alt = attachment.name;
+      const name = document.createElement('span');
+      name.textContent = attachment.name;
+      const removeImage = document.createElement('button');
+      removeImage.type = 'button';
+      removeImage.className = 'image-remove';
+      removeImage.setAttribute('aria-label', 'Remove image');
+      removeImage.title = 'Remove image';
+      removeImage.textContent = '×';
+      removeImage.addEventListener('click', () => {
+        pendingImages.splice(index, 1);
+        imageStatusError = '';
+        renderPendingImages();
+        syncImageAvailability();
+      });
+      item.append(preview, name, removeImage);
+      imagePreview.appendChild(item);
+    });
+  };
+  const clearPendingImages = () => {
+    pendingImages = [];
+    imageStatusError = '';
+    imageInput.value = '';
+    renderPendingImages();
+  };
+  const syncImageAvailability = () => {
+    const supported = modelSupportsVision();
+    imagePicker.disabled = !supported || Boolean(aborter);
+    imagePicker.title = supported ? 'Attach images' : 'The selected model does not support image inputs.';
+    if (!supported && pendingImages.length) clearPendingImages();
+    imageStatus.textContent = !supported
+      ? 'The selected model does not support image inputs.'
+      : imageStatusError
+        ? imageStatusError
+        : (pendingImages.length ? `${pendingImages.length} of ${MAX_IMAGES} images ready` : 'PNG, JPEG or WebP · 2 MB per image');
   };
 
   const escapeHtml = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -55,7 +109,26 @@
     regenerate.addEventListener('click', () => generate('', true));
     actions.append(copy, regenerate);
   };
-  const bubble = (role, content = '', createdAt = null, final = true) => {
+  const renderAttachments = (container, attachments) => {
+    if (!attachments?.length) return;
+    const gallery = document.createElement('div');
+    gallery.className = 'message-images';
+    attachments.forEach(attachment => {
+      const link = document.createElement('a');
+      const source = attachment.url || attachment.data_url;
+      link.href = source;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      const preview = document.createElement('img');
+      preview.src = source;
+      preview.alt = attachment.name || 'Attached image';
+      preview.loading = 'lazy';
+      link.appendChild(preview);
+      gallery.appendChild(link);
+    });
+    container.appendChild(gallery);
+  };
+  const bubble = (role, content = '', createdAt = null, final = true, attachments = []) => {
     messages.querySelector('.empty')?.remove();
     const row = document.createElement('div');
     row.className = `message ${role}`;
@@ -63,6 +136,7 @@
     row.innerHTML = `<div class="avatar">${role === 'assistant' ? 'AI' : 'YOU'}</div><div><div class="message-content"></div><div class="message-meta"><time></time><span class="message-actions"></span></div></div>`;
     const target = row.querySelector('.message-content');
     renderContent(target, content);
+    renderAttachments(target, attachments);
     row.querySelector('time').textContent = createdAt ? new Date(createdAt).toLocaleString() : new Date().toLocaleTimeString();
     const actions = row.querySelector('.message-actions');
     if (role === 'user') {
@@ -116,17 +190,19 @@
     conversationId = data.id;
     model.value = data.model;
     syncReasoningAvailability();
+    clearPendingImages();
+    syncImageAvailability();
     document.getElementById('chat-title').textContent = data.title;
     rename.hidden = false; remove.hidden = false;
     messages.innerHTML = '';
-    data.messages.forEach(item => bubble(item.role, item.content, item.created_at));
+    data.messages.forEach(item => bubble(item.role, item.content, item.created_at, true, item.attachments));
     document.querySelectorAll('.conversation').forEach(button => button.classList.toggle('active', Number(button.dataset.id) === data.id));
     history.replaceState({}, '', `/?conversation=${conversationId}`);
   };
-  const generate = async (content, regenerate = false) => {
-    if (aborter || (!regenerate && !content)) return;
+  const generate = async (content, regenerate = false, attachments = []) => {
+    if (aborter || (!regenerate && !content && !attachments.length)) return;
     if (!conversationId) await createConversation();
-    if (!regenerate) bubble('user', content);
+    if (!regenerate) bubble('user', content, null, true, attachments);
     else messages.querySelector('.message.assistant:last-of-type')?.remove();
     prompt.value = ''; prompt.style.height = 'auto';
     const output = bubble('assistant', '', null, false);
@@ -134,12 +210,13 @@
     try {
       const response = await fetch('/api/chat', {
         method: 'POST', headers: {'Content-Type':'application/json'}, signal:aborter.signal,
-        body: JSON.stringify({conversation_id:conversationId, content, regenerate, reasoning_effort:effectiveReasoning(), csrf_token:csrf})
+        body: JSON.stringify({conversation_id:conversationId, content, attachments, regenerate, reasoning_effort:effectiveReasoning(), csrf_token:csrf})
       });
       if (!response.ok) {
         const err = await response.json();
         throw new Error(err.error?.message || err.detail || 'Generation failed');
       }
+      if (!regenerate) clearPendingImages();
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '', answer = '';
@@ -172,7 +249,7 @@
         renderContent(output.target, output.row.dataset.content);
       }
     } finally {
-      aborter = null; stop.hidden = true; send.disabled = false;
+      aborter = null; stop.hidden = true; send.disabled = false; syncImageAvailability();
     }
   };
 
@@ -180,6 +257,7 @@
   document.getElementById('new-chat').addEventListener('click', () => {
     conversationId = null;
     history.replaceState({}, '', '/');
+    clearPendingImages();
     emptyState();
   });
   rename.addEventListener('click', async () => {
@@ -204,7 +282,7 @@
     }
   });
   stop.addEventListener('click', () => aborter?.abort());
-  model.addEventListener('change', syncReasoningAvailability);
+  model.addEventListener('change', () => { syncReasoningAvailability(); syncImageAvailability(); });
   reasoning.addEventListener('change', async () => {
     const selected = reasoning.value;
     reasoning.disabled = true;
@@ -240,13 +318,45 @@
   prompt.addEventListener('keydown', event => {
     if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); composer.requestSubmit(); }
   });
+  imagePicker.addEventListener('click', () => imageInput.click());
+  imageInput.addEventListener('change', async () => {
+    const files = [...imageInput.files];
+    imageInput.value = '';
+    if (!modelSupportsVision()) return syncImageAvailability();
+    imageStatusError = '';
+    for (const file of files) {
+      if (pendingImages.length >= MAX_IMAGES) {
+        imageStatusError = `Attach no more than ${MAX_IMAGES} images.`;
+        break;
+      }
+      if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size <= 0 || file.size > MAX_IMAGE_BYTES) {
+        imageStatusError = 'Each image must be PNG, JPEG or WebP and no larger than 2 MB.';
+        continue;
+      }
+      const total = pendingImages.reduce((sum, item) => sum + item.size, 0) + file.size;
+      if (total > MAX_TOTAL_IMAGE_BYTES) {
+        imageStatusError = 'The combined image size cannot exceed 2.5 MB.';
+        break;
+      }
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+      pendingImages.push({name:file.name, media_type:file.type, data_url:dataUrl, size:file.size});
+    }
+    renderPendingImages();
+    syncImageAvailability();
+  });
   composer.addEventListener('submit', async event => {
     event.preventDefault();
     const content = prompt.value.trim();
-    await generate(content, false);
+    await generate(content, false, pendingImages.map(({name, media_type, data_url}) => ({name, media_type, data_url})));
   });
 
   const initial = new URLSearchParams(location.search).get('conversation');
   syncReasoningAvailability();
+  syncImageAvailability();
   if (initial) loadConversation(initial);
 })();

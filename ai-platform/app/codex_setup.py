@@ -62,7 +62,7 @@ def codex_model_catalog(models: Sequence[ModelRecord]) -> dict[str, Any]:
                 "comp_hash": f"omnivis-{model.id}-{model.revision}",
                 "effective_context_window_percent": 95,
                 "experimental_supported_tools": [],
-                "input_modalities": ["text"],
+                "input_modalities": ["text", "image"] if "vision" in capabilities else ["text"],
                 "supports_search_tool": False,
                 "supports_experimental_context": False,
                 "use_responses_lite": False,

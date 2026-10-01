@@ -16,31 +16,139 @@
       <article><span>Filesystem free</span><strong>{{ ('%.2f'|format(storage_free / 1073741824) ~ ' GB') if storage_free is not none else 'Unavailable' }}</strong></article>
       <article><span>Required reserve</span><strong>{{ '%.0f'|format(storage_reserve / 1073741824) }} GB</strong></article>
     </div>
-    <article class="panel">
-      <h2>Register model</h2>
-      <form method="post" class="form-grid">
-        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
-        <label>Hugging Face model ID<input name="hf_model_id" placeholder="organization/model" required></label>
-        <label>Revision<input name="revision" value="main"></label>
-        <label>Public API alias<input name="alias" placeholder="omnivis-general" pattern="[a-z0-9][a-z0-9._-]*" required></label>
-        <label>Capabilities <small>general, chat, coding, agentic, reasoning, tool_calling, responses, embeddings, vision</small><input name="capabilities" value="chat,completions"></label>
-        <label>Estimated weight GB<input name="estimated_weight_gb" type="number" min="0" step="0.1" value="0"></label>
-        <label>Max context<input name="max_model_len" type="number" min="256" value="4096"></label>
-        <label>Quantization<input name="quantization" placeholder="awq, gptq, fp8, ..."></label>
-        <label>dtype<input name="dtype" value="auto"></label>
-        <label class="checkbox"><input type="checkbox" name="tool_calling" value="true"> Enable compatible tool calling</label>
-        <label>Tool-call parser<input name="tool_call_parser"></label>
-        <label class="checkbox"><input type="checkbox" name="trust_remote_code" value="true"> I explicitly accept remote model code</label>
-        <button class="primary">Register model</button>
-      </form>
+    {% if result == 'catalog-registered' %}<div class="alert success">The stable model was registered with its reviewed defaults and capabilities.</div>{% endif %}
+    {% if result == 'catalog-queued' %}<div class="alert success">Installation started in the background. You can keep using this page while the model downloads and activates.</div>{% endif %}
+    {% if result == 'catalog-downloaded' %}<div class="alert success">The stable model was registered and its pinned weights were downloaded.</div>{% endif %}
+    {% if result == 'catalog-activated' %}<div class="alert success">The stable model was installed, validated and activated.</div>{% endif %}
+    {% if result == 'catalog-refreshed' %}<div class="alert success">The stable model catalog was updated and validated successfully.</div>{% endif %}
+    {% if result == 'catalog-current' %}<div class="alert success">The stable model catalog is already up to date.</div>{% endif %}
+    {% if catalog_form_error == 'alias-exists' %}<div class="alert error">The alias <strong>{{ catalog_error_alias }}</strong> is already in use. Choose the suggested alias or enter another one.</div>{% endif %}
+    {% if catalog_form_error == 'already-registered' %}<div class="alert warning">This stable model is already registered as <strong>{{ catalog_error_alias }}</strong>. Use its existing model card below.</div>{% endif %}
+    {% if catalog_form_error == 'invalid-alias' %}<div class="alert error">The alias must use lowercase letters, numbers, dots, underscores or hyphens.</div>{% endif %}
+    {% if catalog_form_error == 'invalid-catalog' %}<div class="alert error">Select a valid model from the reviewed stable catalog.</div>{% endif %}
+    {% if catalog_form_error == 'download-required' %}<div class="alert error">Enable the model download before requesting activation.</div>{% endif %}
+    {% if catalog_form_error == 'invalid-capabilities' %}<div class="alert error">Select only capabilities supported by this catalog model.</div>{% endif %}
+    {% if catalog_form_error == 'download-failed' %}<div class="alert error">The model <strong>{{ catalog_error_alias }}</strong> was registered, but its download failed. Review its error and use Download / resume from the model card.</div>{% endif %}
+    {% if catalog_form_error == 'activation-failed' %}<div class="alert error">The model <strong>{{ catalog_error_alias }}</strong> was downloaded, but activation failed. Review compatibility and runtime errors in its model card.</div>{% endif %}
+    {% if catalog_form_error == 'catalog-refresh-failed' %}<div class="alert error">The stable model catalog could not be updated. The current validated catalog remains active.</div>{% endif %}
+    <article class="panel guided-installer" id="guided-installer">
+      <div class="heading">
+        <div>
+          <p class="eyebrow">REVIEWED MODEL CATALOG</p>
+          <h2>Install a current stable model</h2>
+          <p class="muted">Choose a reviewed model and apply the same pinned configuration used by option 2 of the terminal administrator.</p>
+        </div>
+        <div class="catalog-heading-actions">
+          {% if catalog_info.version %}<span class="pill good">Stable catalog {{ catalog_info.version }}</span>{% endif %}
+          <form method="post" action="/admin/models/catalog/refresh" class="catalog-refresh-form">
+            <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+            <button type="submit" class="secondary catalog-refresh-button" title="Refresh stable catalog" aria-label="Refresh stable catalog">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5M18.5 9a7 7 0 0 0-12-2L4 9m16 6-2.5 2A7 7 0 0 1 6 15"/></svg>
+              <span>Refresh catalog</span>
+            </button>
+          </form>
+        </div>
+      </div>
+      {% if catalog_error %}
+        <div class="alert error">The stable model catalog could not be loaded: {{ catalog_error }}</div>
+      {% elif curated_models %}
+        <div class="catalog-meta">
+          <span><strong>Reviewed</strong> {{ catalog_info.updated_at }}</span>
+          <span><strong>Validated with vLLM</strong> {{ catalog_info.validated_vllm_version }}</span>
+          <span><strong>Detected GPU VRAM</strong> {{ catalog_info.total_vram_gb }} GB</span>
+        </div>
+        <p class="small">{{ catalog_info.notice }}</p>
+        <form method="post" action="/admin/models/catalog" class="guided-layout" id="guided-model-form" data-existing-aliases="{{ all_model_aliases|join(',') }}">
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <input type="hidden" name="capabilities" id="catalog-capabilities-value">
+          <div class="guided-fields">
+            <label>Select a reviewed model
+              <select name="catalog_key" id="catalog-model-select" required>
+                <option value="">Choose a stable model</option>
+                {% for item in curated_models %}
+                <option
+                  value="{{ item.key }}"
+                  data-key="{{ item.key }}"
+                  data-alias="{{ item.suggested_alias }}"
+                  data-name="{{ item.display_name|e }}"
+                  data-category="{{ item.category|e }}"
+                  data-summary="{{ item.summary|e }}"
+                  data-repository="{{ item.model_id|e }}"
+                  data-revision="{{ item.revision }}"
+                  data-weight="{{ item.estimated_weight_gb }}"
+                  data-vram="{{ item.recommended_vram_gb }}"
+                  data-context="{{ item.default_max_model_len }}"
+                  data-capabilities="{{ item.capabilities|join(',') }}"
+                  data-capabilities-reviewed-at="{{ item.capabilities_reviewed_at }}"
+                  data-capability-source="{{ item.capability_sources[0]|e }}"
+                  data-fit="{{ item.fit }}"
+                  data-registered-alias="{{ item.registered_alias|e }}"
+                  {% if item.registered_alias %}disabled{% endif %}
+                >{{ item.display_name }} · {{ item.category }}{% if item.registered_alias %} · Already registered as {{ item.registered_alias }}{% endif %}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label>Stable API alias<input name="alias" id="catalog-alias" pattern="[a-z0-9][a-z0-9._-]*" maxlength="160" required><small id="catalog-alias-status"></small></label>
+            <fieldset class="catalog-capabilities">
+              <legend>Model capabilities</legend>
+              <p class="small">All supported capabilities are selected by default.</p>
+              <div class="capability-options">
+                {% for capability in capability_options %}
+                <label class="capability-choice" data-capability="{{ capability }}"><input type="checkbox" value="{{ capability }}"> {{ capability|replace('_', ' ')|title }}</label>
+                {% endfor %}
+              </div>
+              <p class="small capability-review-note"><span id="catalog-capability-review">Capabilities are tied to the pinned model revision.</span> <a id="catalog-capability-source" href="#" target="_blank" rel="noopener">Official model source</a></p>
+            </fieldset>
+            <div class="catalog-actions">
+              <label class="checkbox"><input type="checkbox" name="download_now" id="catalog-download" value="true" checked> Download/resume pinned weights now</label>
+              <label class="checkbox"><input type="checkbox" name="activate_now" id="catalog-activate" value="true"> Validate capacity and activate after download</label>
+              <label class="checkbox"><input type="checkbox" name="set_default" id="catalog-default" value="true"> Set as default after activation</label>
+            </div>
+          </div>
+          <aside class="catalog-plan" aria-live="polite">
+            <div class="catalog-plan-heading"><div><span class="small">Installation plan</span><h3 id="catalog-display-name">Select a model</h3></div><span class="pill" id="catalog-fit">UNKNOWN</span></div>
+            <p id="catalog-summary" class="muted">Select a reviewed model to see its pinned installation plan.</p>
+            <dl class="facts">
+              <dt>Category</dt><dd id="catalog-category">—</dd>
+              <dt>Repository</dt><dd id="catalog-repository">—</dd>
+              <dt>Revision</dt><dd><code id="catalog-revision">—</code></dd>
+              <dt>Estimated download</dt><dd id="catalog-weight">—</dd>
+              <dt>Recommended VRAM</dt><dd id="catalog-vram">—</dd>
+              <dt>Default context</dt><dd id="catalog-context">—</dd>
+              <dt>Capability review</dt><dd id="catalog-review-date">—</dd>
+              <dt>Hardware fit</dt><dd id="catalog-fit-detail">—</dd>
+            </dl>
+            <button type="submit" class="primary" id="catalog-submit" disabled>Register and download</button>
+            <p class="small" id="catalog-wait-note">Model downloads can take several minutes. Installation continues in the background, so you may leave and return to this page.</p>
+          </aside>
+        </form>
+      {% endif %}
     </article>
     <div class="model-grid">
       {% for model in models %}
       {% set usage = usage_map.get(model.alias, {}) %}
       {% set plan = activation_plans.get(model.id, {}) %}
-      <article class="panel model">
+      {% set install_job = model.config.get('guided_install', {}) %}
+      {% set capability_profile = capability_profiles.get(model.id, {}) %}
+      <article class="panel model" id="model-{{ model.id }}">
         <div class="heading"><div><h2>{{ model.alias }}</h2><small>{{ model.hf_model_id }} @ {{ model.revision }}</small></div>{% if model.is_default %}<span class="pill">Default</span>{% endif %}</div>
+        {% if install_job.get('status') in ['queued', 'running'] %}
+        <div class="alert warning model-install-progress" data-install-status-url="/admin/models/{{ model.id }}/status" data-model-id="{{ model.id }}">
+          <strong>Installation is running in the background.</strong>
+          <span data-install-message>{{ 'Preparing the model download…' if install_job.get('phase') == 'download' else 'Validating and activating the model…' }}</span>
+        </div>
+        {% elif install_job.get('status') == 'failed' %}
+        <div class="alert error"><strong>Background installation failed.</strong> {{ install_job.get('error') or model.download_error or (model.instance.last_error if model.instance else '') }}</div>
+        {% endif %}
         <p>{% for capability in capability_map.get(model.id, []) %}<span class="pill">{{ capability|replace('_', ' ')|title }}</span> {% endfor %}</p>
+        {% if capability_profile.get('status') == 'reviewed' %}
+        <p class="small capability-review-note">Capabilities synchronized with reviewed catalog {{ capability_profile.get('catalog_version') }} · reviewed {{ capability_profile.get('reviewed_at') }}{% if capability_profile.get('sources') %} · <a href="{{ capability_profile.get('sources')[0] }}" target="_blank" rel="noopener">Official model source</a>{% endif %}{% if capability_profile.get('runtime_verified') %} · Runtime endpoints verified{% endif %}</p>
+        {% elif capability_profile.get('status') == 'revision_mismatch' %}
+        <div class="alert warning">The installed revision no longer matches the reviewed catalog. Stored capabilities remain in use until this exact revision is reviewed or the model is updated.</div>
+        {% else %}
+        <p class="small capability-review-note">Manually configured capabilities. Runtime endpoint availability is still checked when the model is active.</p>
+        {% endif %}
+        {% if capability_profile.get('unavailable_capabilities') %}<div class="alert warning">Not currently advertised because runtime or parser verification failed: {{ capability_profile.get('unavailable_capabilities')|join(', ') }}</div>{% endif %}
         <dl class="facts">
           <dt>Weights</dt><dd>{{ model.download_status }}{% if model.size_bytes %} · {{ '%.2f'|format(model.size_bytes / 1073741824) }} GB{% endif %}</dd>
           <dt>Revision</dt><dd>{{ model.revision }}</dd>
@@ -86,9 +194,9 @@
           <form method="post" action="/admin/models/{{ model.id }}/configure" class="form-grid">
             <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
             <label>Public alias<input name="alias" value="{{ model.alias }}" required></label>
-            <label>Capabilities<input name="capabilities" value="{{ capability_map.get(model.id, [])|join(',') }}"></label>
-            <label class="checkbox"><input type="checkbox" name="tool_calling" value="true" {% if model.tool_calling %}checked{% endif %}> Enable compatible tool calling</label>
-            <label>Tool-call parser<input name="tool_call_parser" value="{{ model.tool_call_parser or '' }}"></label>
+            <label>Capabilities<input name="capabilities" value="{{ capability_map.get(model.id, [])|join(',') }}" {% if capability_profile.get('status') == 'reviewed' %}readonly{% endif %}>{% if capability_profile.get('status') == 'reviewed' %}<small>Reviewed catalog controls capabilities for this pinned model.</small>{% endif %}</label>
+            <label class="checkbox"><input type="checkbox" name="tool_calling" value="true" {% if model.tool_calling %}checked{% endif %} {% if capability_profile.get('status') == 'reviewed' %}disabled{% endif %}> Enable compatible tool calling</label>
+            <label>Tool-call parser<input name="tool_call_parser" value="{{ model.tool_call_parser or '' }}" {% if capability_profile.get('status') == 'reviewed' %}readonly{% endif %}></label>
             <label>GPU indexes <small>comma-separated; blank auto</small><input name="gpu_assignment" value="{{ model.instance.gpu_assignment|join(',') }}"></label>
             <label>Tensor parallel<input name="tensor_parallel_size" type="number" min="1" value="{{ model.instance.tensor_parallel_size }}"></label>
             <label>Pipeline parallel<input name="pipeline_parallel_size" type="number" min="1" value="{{ model.instance.pipeline_parallel_size }}"></label>
@@ -118,3 +226,4 @@
   </section>
 </div>
 {% endblock %}
+{% block scripts %}<script src="/static/models-guided.js?v=1.2.0-refresh1" defer></script>{% endblock %}

@@ -10109,27 +10109,47 @@ ai_sync_proxy_from_env() {
   proxy_dc restart reverse-proxy
 }
 
+ai_model_catalog_path() {
+  local refreshed="${AI_PLATFORM_BASE}/state/model-catalog.json"
+  local bundled="${AI_PLATFORM_BASE}/config/model-catalog.json"
+  local refreshed_date bundled_date refreshed_version bundled_version newest_version
+  if [ -r "$refreshed" ] && jq -e '.schema_version >= 3 and (.models | length > 0)' "$refreshed" >/dev/null 2>&1; then
+    refreshed_date="$(jq -r '.capabilities_reviewed_at // .updated_at // ""' "$refreshed")"
+    bundled_date="$(jq -r '.capabilities_reviewed_at // .updated_at // ""' "$bundled")"
+    refreshed_version="$(jq -r '.catalog_version // "0"' "$refreshed")"
+    bundled_version="$(jq -r '.catalog_version // "0"' "$bundled")"
+    newest_version="$(printf '%s\n%s\n' "$refreshed_version" "$bundled_version" | sort -V | tail -n1)"
+    if [[ "$refreshed_date" > "$bundled_date" ]] || { [ "$refreshed_date" = "$bundled_date" ] && [ "$newest_version" = "$refreshed_version" ]; }; then
+      printf '%s\n' "$refreshed"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$bundled"
+}
+
 ai_add_catalog_model() {
   local catalog_key="$1" alias="$2"
+  local catalog
   local catalog_id catalog_revision catalog_caps catalog_size catalog_context catalog_tools catalog_parser
   local catalog_quantization catalog_dtype catalog_max_sequences catalog_profile catalog_reasoning catalog_gpu_utilization
-  catalog_id="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .model_id' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog="$(ai_model_catalog_path)"
+  catalog_id="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .model_id' "$catalog" | head -n1)"
   if [ -z "$catalog_id" ] || [ "$catalog_id" = "null" ]; then
     echo "Unknown catalog key: ${catalog_key}"
     return 1
   fi
-  catalog_caps="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .capabilities | join(",")' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
-  catalog_size="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .estimated_weight_gb' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
-  catalog_context="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .default_max_model_len' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
-  catalog_tools="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .tool_calling' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
-  catalog_parser="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .tool_call_parser // empty' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
-  catalog_quantization="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .quantization // empty' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
-  catalog_revision="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .revision // "main"' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
-  catalog_dtype="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .dtype // "auto"' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
-  catalog_max_sequences="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .max_num_seqs // 4' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
-  catalog_profile="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .performance_profile // "AUTO"' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
-  catalog_reasoning="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .reasoning_parser // empty' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
-  catalog_gpu_utilization="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .gpu_memory_utilization // 0.82' "${AI_PLATFORM_BASE}/config/model-catalog.json" | head -n1)"
+  catalog_caps="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | (((.model_capabilities // []) + (.runtime_capabilities // []) + (.capabilities // [])) | unique | join(","))' "$catalog" | head -n1)"
+  catalog_size="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .estimated_weight_gb' "$catalog" | head -n1)"
+  catalog_context="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .default_max_model_len' "$catalog" | head -n1)"
+  catalog_tools="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .tool_calling' "$catalog" | head -n1)"
+  catalog_parser="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .tool_call_parser // empty' "$catalog" | head -n1)"
+  catalog_quantization="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .quantization // empty' "$catalog" | head -n1)"
+  catalog_revision="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .revision // "main"' "$catalog" | head -n1)"
+  catalog_dtype="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .dtype // "auto"' "$catalog" | head -n1)"
+  catalog_max_sequences="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .max_num_seqs // 4' "$catalog" | head -n1)"
+  catalog_profile="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .performance_profile // "AUTO"' "$catalog" | head -n1)"
+  catalog_reasoning="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .reasoning_parser // empty' "$catalog" | head -n1)"
+  catalog_gpu_utilization="$(jq -r --arg key "$catalog_key" '.models[] | select(.key == $key) | .gpu_memory_utilization // 0.82' "$catalog" | head -n1)"
   [ -n "$alias" ] || alias="$catalog_key"
   local catalog_args=(models add --model-id "$catalog_id" --revision "$catalog_revision" --alias "$alias"
     --capabilities "$catalog_caps" --estimated-weight-gb "$catalog_size" --max-model-len "$catalog_context"
@@ -10144,7 +10164,8 @@ ai_add_catalog_model() {
 }
 
 ai_catalog_model_wizard() {
-  local catalog="${AI_PLATFORM_BASE}/config/model-catalog.json"
+  local catalog
+  catalog="$(ai_model_catalog_path)"
   local choice count index catalog_key alias confirm download_now activate_now set_default
   local total_vram recommended_vram fit_label activate_default model_id display_name summary category
   local estimated_size max_context revision capabilities
@@ -10200,7 +10221,7 @@ ai_catalog_model_wizard() {
   recommended_vram="$(jq -r --argjson index "$index" '.models[$index].recommended_vram_gb' "$catalog")"
   max_context="$(jq -r --argjson index "$index" '.models[$index].default_max_model_len' "$catalog")"
   revision="$(jq -r --argjson index "$index" '.models[$index].revision' "$catalog")"
-  capabilities="$(jq -r --argjson index "$index" '.models[$index].capabilities | join(",")' "$catalog")"
+  capabilities="$(jq -r --argjson index "$index" '.models[$index] | (((.model_capabilities // []) + (.runtime_capabilities // []) + (.capabilities // [])) | unique | join(","))' "$catalog")"
   fit_label="$(jq -nr --argjson vram "$total_vram" --argjson recommended "$recommended_vram" '
     if $vram <= 0 then "UNKNOWN"
     elif $recommended <= ($vram * 0.82) then "FIT"
@@ -10288,6 +10309,8 @@ ai_install_or_repair() {
     apt-get install -y python3 jq openssl rsync ca-certificates curl gnupg
   fi
   ai_copy_assets
+  chown 10001:10001 "${AI_PLATFORM_BASE}/state"
+  chmod 750 "${AI_PLATFORM_BASE}/state"
 
   domain="$(ai_env_value AI_DOMAIN)"
   prompt domain "AI domain: " "${domain:-ai.example.com}"
@@ -10402,7 +10425,7 @@ ai_install_or_repair() {
         --name "$admin_name" --email "$admin_email" --password-stdin
 
     echo "Curated models available for optional registration:"
-    jq -r '.models[] | "  \(.key): \(.model_id) [\(.capabilities | join(","))]"' "${AI_PLATFORM_BASE}/config/model-catalog.json"
+    jq -r '.models[] | (((.model_capabilities // []) + (.runtime_capabilities // []) + (.capabilities // [])) | unique | join(",")) as $caps | "  \(.key): \(.model_id) [\($caps)]"' "$(ai_model_catalog_path)"
     prompt initial_model "Initial catalog model key (blank skips; registration does not download or activate): " ""
     if [ -n "$initial_model" ]; then
       prompt initial_alias "Stable API alias: " "$initial_model"

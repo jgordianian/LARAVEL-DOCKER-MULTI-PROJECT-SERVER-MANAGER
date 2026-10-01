@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -11,13 +12,17 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from app import gateway, web
+from app import controller, gateway, model_catalog as stable_catalog, web
 from app.config import get_settings
 from app.mail import EmailBranding, SMTPConfiguration, send_email, smtp_test_email
-from app.models import APIKey, AuditLog, Conversation, IPRule, ModelInstance, ModelRecord, PasswordResetToken, ServiceAccount, SystemSetting, UsageRecord, User, WebSession
+from app.codex_setup import codex_model_catalog
+from app.capabilities import model_capability_profile
+from app.model_catalog import load_model_catalog
+from app.models import APIKey, AuditLog, Conversation, IPRule, MessageAttachment, ModelInstance, ModelRecord, PasswordResetToken, ServiceAccount, SystemSetting, UsageRecord, User, WebSession
 from app.security import create_web_session, generate_api_key, hash_password, verify_password
 
 
@@ -202,6 +207,7 @@ def test_codex_installer_requires_coding_policy_and_generates_each_platform(db, 
     catalog = json.loads(base64.b64decode(payloads[1]))
     assert catalog["models"][0]["slug"] == "omnivis-coder"
     assert catalog["models"][0]["supported_reasoning_levels"][-1]["effort"] == "high"
+    assert catalog["models"][0]["input_modalities"] == ["text"]
 
     linux = client.get("/v1/codex/install?platform=linux", headers=headers)
     macos = client.get("/v1/codex/install?platform=macos", headers=headers)
@@ -226,6 +232,19 @@ def test_codex_installer_requires_coding_policy_and_generates_each_platform(db, 
     denied = client.get("/v1/codex/install?platform=linux", headers=headers)
     assert denied.status_code == 403
     assert denied.json()["error"]["type"] == "codex_configuration_unavailable"
+
+
+def test_codex_catalog_advertises_images_only_for_vision_models():
+    vision = ModelRecord(
+        id=42,
+        hf_model_id="Qwen/Qwen3-VL-8B-Instruct-FP8",
+        alias="omnivis-vision",
+        revision="stable",
+        capabilities=["chat", "responses", "coding", "agentic", "tool_calling", "vision"],
+        max_model_len=16_384,
+    )
+    catalog = codex_model_catalog([vision])
+    assert catalog["models"][0]["input_modalities"] == ["text", "image"]
 
 
 def test_gateway_ip_allowlist_denial(db):
@@ -288,6 +307,49 @@ def test_model_permission_and_unavailable_errors(db):
     )
     assert unavailable.status_code == 503
     assert unavailable.json()["error"]["type"] == "model_unavailable"
+
+
+def test_gateway_rejects_images_for_text_models_and_accepts_valid_vision_data_urls(db, monkeypatch):
+    _, model, raw = api_fixture(db)
+    image = b"\x89PNG\r\n\x1a\nprivate-image"
+    data_url = f"data:image/png;base64,{base64.b64encode(image).decode()}"
+    payload = {
+        "model": model.alias,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Describe this image"},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]}],
+    }
+    client = TestClient(gateway.app)
+    denied = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {raw}"}, json=payload)
+    assert denied.status_code == 400
+    assert denied.json()["error"]["type"] == "image_inputs_not_supported"
+
+    model.capabilities = ["chat", "completions", "vision"]
+    db.commit()
+    captured = {}
+    original_async_client = httpx.AsyncClient
+
+    async def upstream(request):
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "A test image"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+        })
+
+    monkeypatch.setattr(
+        gateway.httpx,
+        "AsyncClient",
+        lambda **kwargs: original_async_client(transport=httpx.MockTransport(upstream), timeout=kwargs.get("timeout")),
+    )
+    accepted = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {raw}"}, json=payload)
+    assert accepted.status_code == 200
+    assert captured["payload"]["messages"][0]["content"][1]["image_url"]["url"] == data_url
+
+    payload["messages"][0]["content"][1]["image_url"]["url"] = "https://internal.example/image.png"
+    unsafe = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {raw}"}, json=payload)
+    assert unsafe.status_code == 400
+    assert unsafe.json()["error"]["type"] == "invalid_image_input"
 
 
 def test_unavailable_configured_api_default_is_not_silently_substituted(db):
@@ -477,7 +539,96 @@ def test_reasoning_preference_is_persisted_and_sent_to_gateway(db, monkeypatch):
     assert 'id="reasoning-select"' in page.text
     assert '<option value="high" selected' in page.text
     assert 'data-saved-value="high"' in page.text
-    assert 'src="/static/chat.js?v=1.2.0-reasoning2"' in page.text
+    assert 'src="/static/chat.js?v=1.2.0-vision1"' in page.text
+
+
+def test_portal_persists_private_images_and_sends_multimodal_content(db, monkeypatch):
+    user = User(name="Vision User", email="vision@example.com", password_hash=hash_password("GoodPassword!123"))
+    model = ModelRecord(
+        hf_model_id="Qwen/Qwen3-VL-8B-Instruct-FP8",
+        alias="omnivis-vision",
+        download_status="downloaded",
+        capabilities=["chat", "reasoning", "vision"],
+        is_default=True,
+    )
+    model.instance = ModelInstance(
+        container_name="vllm-vision",
+        internal_url="http://vllm-vision:8000",
+        desired_active=True,
+        status="ready",
+        gpu_assignment=[0],
+    )
+    db.add_all([user, model])
+    db.flush()
+    raw, session = create_web_session(db, user, "127.0.0.1", "test")
+    db.commit()
+
+    captured = {}
+    original_async_client = httpx.AsyncClient
+
+    async def upstream(request):
+        captured["payload"] = json.loads(request.content)
+        event = {"choices": [{"delta": {"content": "I can see it."}}]}
+        return httpx.Response(200, content=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n".encode())
+
+    monkeypatch.setattr(
+        web.httpx,
+        "AsyncClient",
+        lambda **kwargs: original_async_client(transport=httpx.MockTransport(upstream), timeout=kwargs.get("timeout")),
+    )
+    client = TestClient(web.app)
+    client.cookies.set("ai_session", raw)
+    page = client.get("/")
+    assert 'data-vision="true"' in page.text
+    assert 'id="image-picker"' in page.text
+    assert 'src="/static/chat.js?v=1.2.0-vision1"' in page.text
+
+    conversation = client.post(
+        "/api/conversations",
+        json={"model": model.alias, "csrf_token": session.csrf_token},
+    ).json()
+    image = b"\x89PNG\r\n\x1a\nportal-private-image"
+    data_url = f"data:image/png;base64,{base64.b64encode(image).decode()}"
+    response = client.post(
+        "/api/chat",
+        json={
+            "conversation_id": conversation["id"],
+            "content": "Describe this",
+            "attachments": [{"name": "screen.png", "media_type": "image/png", "data_url": data_url}],
+            "reasoning_effort": "medium",
+            "csrf_token": session.csrf_token,
+        },
+    )
+    assert response.status_code == 200
+    multimodal = captured["payload"]["messages"][0]["content"]
+    assert multimodal[0] == {"type": "text", "text": "Describe this"}
+    assert multimodal[1]["image_url"]["url"] == data_url
+
+    history = client.get(f"/api/conversations/{conversation['id']}").json()
+    attachment = history["messages"][0]["attachments"][0]
+    assert attachment["name"] == "screen.png"
+    downloaded = client.get(attachment["url"])
+    assert downloaded.status_code == 200
+    assert downloaded.headers["content-type"] == "image/png"
+    assert downloaded.content == image
+    stored = db.query(MessageAttachment).one()
+    assert stored.sha256 == hashlib.sha256(image).hexdigest()
+
+    model.capabilities = ["chat", "reasoning"]
+    db.commit()
+    rejected = client.post(
+        "/api/chat",
+        json={
+            "conversation_id": conversation["id"],
+            "content": "Another",
+            "attachments": [{"name": "screen.png", "media_type": "image/png", "data_url": data_url}],
+            "reasoning_effort": "medium",
+            "csrf_token": session.csrf_token,
+        },
+    )
+    assert rejected.status_code == 422
+    assert "does not support image inputs" in rejected.json()["detail"]
+    assert db.query(MessageAttachment).count() == 1
 
 
 def test_global_and_per_user_language_preferences(db):
@@ -492,7 +643,7 @@ def test_global_and_per_user_language_preferences(db):
     inherited = client.get("/")
     assert inherited.status_code == 200
     assert '<html lang="es">' in inherited.text
-    assert 'src="/static/i18n.js?v=1.2.0-codex7"' in inherited.text
+    assert 'src="/static/i18n.js?v=1.2.0-models-es4"' in inherited.text
     assert 'class="language-menu"' in inherited.text
     assert '<span class="language-current">System</span>' in inherited.text
     assert 'name="preferred_language" value="" class="selected" aria-current="true"' in inherited.text
@@ -950,6 +1101,371 @@ def test_admin_models_renders_coding_capabilities_and_runtime_state(db):
     assert "Coding" in response.text
     assert "Agentic" in response.text
     assert "Configured; runtime not yet verified" in response.text
+
+
+def test_catalog_refresh_keeps_newer_installed_catalog(monkeypatch, tmp_path):
+    remote = {
+        "schema_version": 2,
+        "catalog_version": "2026.09.28",
+        "updated_at": "2026-09-28",
+    }
+
+    def fetch(*_args, **_kwargs):
+        return httpx.Response(
+            200,
+            content=json.dumps(remote).encode(),
+            request=httpx.Request("GET", stable_catalog.CATALOG_UPDATE_URL),
+        )
+
+    monkeypatch.setattr(stable_catalog.httpx, "get", fetch)
+    destination = tmp_path / "model-catalog.json"
+    result = stable_catalog.refresh_model_catalog(
+        destination=destination,
+        backup_path=tmp_path / "previous.json",
+    )
+
+    assert result["status"] == "current"
+    assert result["catalog_version"] == load_model_catalog()["catalog_version"]
+    assert not destination.exists()
+
+
+def test_catalog_refresh_validates_and_atomically_installs_newer_catalog(monkeypatch, tmp_path):
+    payload = json.loads(stable_catalog.CATALOG_PATH.read_text(encoding="utf-8"))
+    payload["catalog_version"] = "2026.10.02"
+    payload["updated_at"] = "2026-10-02"
+    payload["capabilities_reviewed_at"] = "2026-10-02"
+
+    def fetch(*_args, **_kwargs):
+        return httpx.Response(
+            200,
+            content=json.dumps(payload).encode(),
+            request=httpx.Request("GET", stable_catalog.CATALOG_UPDATE_URL),
+        )
+
+    monkeypatch.setattr(stable_catalog.httpx, "get", fetch)
+    destination = tmp_path / "model-catalog.json"
+    backup = tmp_path / "previous.json"
+    result = stable_catalog.refresh_model_catalog(destination=destination, backup_path=backup)
+
+    assert result == {
+        "status": "updated",
+        "catalog_version": "2026.10.02",
+        "previous_version": load_model_catalog()["catalog_version"],
+        "source": str(destination),
+    }
+    assert stable_catalog.load_model_catalog(destination)["catalog_version"] == "2026.10.02"
+    assert stable_catalog.load_model_catalog(backup)["catalog_version"] == load_model_catalog()["catalog_version"]
+    assert not list(tmp_path.glob(".model-catalog-*.json"))
+
+
+def test_catalog_refresh_rejects_newer_unsupported_schema(monkeypatch, tmp_path):
+    payload = {
+        "schema_version": 99,
+        "catalog_version": "2026.10.03",
+        "updated_at": "2026-10-03",
+        "capabilities_reviewed_at": "2026-10-03",
+    }
+
+    def fetch(*_args, **_kwargs):
+        return httpx.Response(
+            200,
+            content=json.dumps(payload).encode(),
+            request=httpx.Request("GET", stable_catalog.CATALOG_UPDATE_URL),
+        )
+
+    monkeypatch.setattr(stable_catalog.httpx, "get", fetch)
+    with pytest.raises(stable_catalog.ModelCatalogError, match="unsupported schema"):
+        stable_catalog.refresh_model_catalog(
+            destination=tmp_path / "model-catalog.json",
+            backup_path=tmp_path / "previous.json",
+        )
+    assert not (tmp_path / "model-catalog.json").exists()
+
+
+def test_admin_can_refresh_stable_catalog_with_csrf_and_audit(db, monkeypatch):
+    admin = User(name="Admin", email="catalog-refresh@example.com", password_hash=hash_password("GoodPassword!123"), role="super_admin")
+    db.add(admin)
+    db.flush()
+    raw, session = create_web_session(db, admin, "127.0.0.1", "test")
+    db.commit()
+    client = TestClient(web.app)
+    client.cookies.set("ai_session", raw)
+    monkeypatch.setattr(
+        web,
+        "refresh_model_catalog",
+        lambda: {"status": "updated", "catalog_version": "2026.10.02", "previous_version": "2026.10.01.1"},
+    )
+
+    response = client.post(
+        "/admin/models/catalog/refresh",
+        data={"csrf_token": session.csrf_token},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/models?result=catalog-refreshed#guided-installer"
+    event = db.scalar(select(AuditLog).where(AuditLog.action == "model.catalog_refreshed"))
+    assert event is not None
+    assert event.after == {"catalog_version": "2026.10.02", "status": "updated"}
+
+    invalid = client.post(
+        "/admin/models/catalog/refresh",
+        data={"csrf_token": "invalid"},
+        follow_redirects=False,
+    )
+    assert invalid.status_code == 403
+
+
+def test_reviewed_capabilities_follow_exact_revision_and_verified_runtime():
+    catalog = load_model_catalog()
+    entry = next(item for item in catalog["models"] if item["key"] == "qwen3.5-4b")
+    model = ModelRecord(
+        hf_model_id=entry["model_id"],
+        revision=entry["revision"],
+        alias="reviewed-capabilities",
+        capabilities=["chat"],
+        tool_calling=True,
+        tool_call_parser="qwen3_coder",
+        config={
+            "catalog_key": entry["key"],
+            "catalog_version": "outdated",
+            "runtime_api_support": {
+                "verified": True,
+                "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/responses"],
+            },
+        },
+    )
+
+    profile = model_capability_profile(model, catalog)
+    assert profile["status"] == "reviewed"
+    assert profile["catalog_version"] == catalog["catalog_version"]
+    assert profile["reviewed_at"] == catalog["capabilities_reviewed_at"]
+    assert {"coding", "reasoning", "responses", "structured_outputs", "tool_calling", "vision"} <= set(profile["capabilities"])
+    assert "completions" not in profile["capabilities"]
+    assert profile["unavailable_capabilities"] == ["completions"]
+
+    model.tool_call_parser = None
+    without_parser = model_capability_profile(model, catalog)
+    assert "tool_calling" not in without_parser["capabilities"]
+    assert without_parser["unavailable_capabilities"] == ["completions", "tool_calling"]
+
+    model.revision = "f" * 40
+    mismatch = model_capability_profile(model, catalog)
+    assert mismatch["status"] == "revision_mismatch"
+    assert mismatch["capabilities"] == ["chat"]
+
+
+def test_admin_models_guided_catalog_registers_all_reviewed_capabilities(db):
+    admin = User(name="Admin", email="guided-models@example.com", password_hash=hash_password("GoodPassword!123"), role="super_admin")
+    db.add(admin)
+    db.flush()
+    raw, session = create_web_session(db, admin, "127.0.0.1", "test")
+    db.commit()
+    client = TestClient(web.app)
+    client.cookies.set("ai_session", raw)
+
+    page = client.get("/admin/models")
+    assert page.status_code == 200
+    assert 'id="guided-model-form"' in page.text
+    assert "Register an arbitrary model" not in page.text
+    assert 'value="qwen3.5-4b"' in page.text
+    assert 'data-capabilities="agentic,chat,coding,completions,general,reasoning,responses,structured_outputs,tool_calling,vision"' in page.text
+    assert 'data-capabilities-reviewed-at="2026-10-01"' in page.text
+    assert "https://huggingface.co/Qwen/Qwen3.5-4B/tree/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a" in page.text
+    assert 'action="/admin/models/catalog/refresh"' in page.text
+    assert 'class="secondary catalog-refresh-button"' in page.text
+    assert 'aria-label="Refresh stable catalog"' in page.text
+    assert "/static/models-guided.js?v=1.2.0-refresh1" in page.text
+    assert "/static/i18n.js?v=1.2.0-models-es4" in page.text
+
+    response = client.post(
+        "/admin/models/catalog",
+        data={
+            "catalog_key": "qwen3.5-4b",
+            "alias": "qwen-current",
+            "capabilities": "",
+            "csrf_token": session.csrf_token,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/models?result=catalog-registered"
+    catalog_entry = load_model_catalog()["models"][0]
+    model = db.scalar(select(ModelRecord).where(ModelRecord.alias == "qwen-current"))
+    assert model is not None
+    assert model.hf_model_id == catalog_entry["model_id"]
+    assert model.revision == catalog_entry["revision"]
+    assert model.capabilities == catalog_entry["capabilities"]
+    assert model.tool_calling is True
+    assert model.tool_call_parser == "qwen3_coder"
+    assert model.config["catalog_key"] == "qwen3.5-4b"
+    assert model.instance.max_num_seqs == 2
+    assert model.instance.gpu_memory_utilization == 0.82
+    assert model.instance.extra_args == ["--reasoning-parser", "qwen3"]
+
+    model.capabilities = ["chat"]
+    model.tool_calling = False
+    model.tool_call_parser = None
+    db.commit()
+    configured = client.post(
+        f"/admin/models/{model.id}/configure",
+        data={
+            "alias": model.alias,
+            "max_model_len": model.max_model_len,
+            "capabilities": "chat",
+            "gpu_assignment": "",
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "max_num_seqs": model.instance.max_num_seqs,
+            "gpu_memory_utilization": model.instance.gpu_memory_utilization,
+            "cpu_offload_gb": 0,
+            "swap_space_gb": 4,
+            "performance_profile": "AUTO",
+            "system_prompt": "",
+            "chat_template": "",
+            "csrf_token": session.csrf_token,
+        },
+        follow_redirects=False,
+    )
+    assert configured.status_code == 303
+    db.refresh(model)
+    assert model.capabilities == catalog_entry["capabilities"]
+    assert model.tool_calling is True
+    assert model.tool_call_parser == "qwen3_coder"
+    assert model.config["catalog_version"] == load_model_catalog()["catalog_version"]
+
+    duplicate = client.post(
+        "/admin/models/catalog",
+        data={
+            "catalog_key": "qwen3.5-4b",
+            "alias": "another-alias",
+            "csrf_token": session.csrf_token,
+        },
+        follow_redirects=False,
+    )
+    assert duplicate.status_code == 303
+    assert duplicate.headers["location"] == "/admin/models?error=already-registered&error_alias=qwen-current#guided-installer"
+    already_registered = client.get("/admin/models?error=already-registered&error_alias=qwen-current")
+    assert "already registered as" in already_registered.text
+
+    alias_collision = client.post(
+        "/admin/models/catalog",
+        data={
+            "catalog_key": "qwen3-8b-awq",
+            "alias": "qwen-current",
+            "csrf_token": session.csrf_token,
+        },
+        follow_redirects=False,
+    )
+    assert alias_collision.status_code == 303
+    assert alias_collision.headers["location"] == "/admin/models?error=alias-exists&error_alias=qwen-current#guided-installer"
+    collision_page = client.get("/admin/models?error=alias-exists&error_alias=qwen-current")
+    assert "Choose the suggested alias" in collision_page.text
+
+
+def test_guided_catalog_install_queues_background_work_without_waiting(db, monkeypatch):
+    admin = User(name="Admin", email="queued-model@example.com", password_hash=hash_password("GoodPassword!123"), role="super_admin")
+    db.add(admin)
+    db.flush()
+    raw, session = create_web_session(db, admin, "127.0.0.1", "test")
+    db.commit()
+    calls = []
+
+    async def queue_install(model_id, action, params=None):
+        calls.append((model_id, action, params))
+        return httpx.Response(202, json={"status": "queued", "model_id": model_id})
+
+    monkeypatch.setattr(web, "controller_action", queue_install)
+    client = TestClient(web.app)
+    client.cookies.set("ai_session", raw)
+    response = client.post(
+        "/admin/models/catalog",
+        data={
+            "catalog_key": "qwen3.5-4b",
+            "alias": "qwen-background",
+            "capabilities": "",
+            "download_now": "true",
+            "activate_now": "true",
+            "set_default": "true",
+            "csrf_token": session.csrf_token,
+        },
+        follow_redirects=False,
+    )
+
+    model = db.scalar(select(ModelRecord).where(ModelRecord.alias == "qwen-background"))
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/admin/models?result=catalog-queued#model-{model.id}"
+    assert calls == [(model.id, "install", {"activate": True, "set_default": True})]
+
+
+def test_controller_guided_install_worker_tracks_completion(db, monkeypatch):
+    model = ModelRecord(
+        hf_model_id="org/background-model",
+        alias="background-model",
+        download_status="queued",
+        capabilities=["chat"],
+        config={"guided_install": {"status": "queued", "phase": "download", "activate": True, "set_default": True}},
+    )
+    model.instance = ModelInstance(container_name="vllm-background-model", internal_url="", status="inactive")
+    db.add(model)
+    db.commit()
+
+    def fake_download(worker_db, worker_model, _settings):
+        worker_model.download_status = "downloaded"
+        worker_model.local_path = "/models/background-model"
+        worker_db.commit()
+
+    class FakeRuntime:
+        def __init__(self, worker_db, _settings):
+            self.db = worker_db
+
+        def activate(self, worker_model):
+            worker_model.instance.desired_active = True
+            worker_model.instance.status = "ready"
+            self.db.commit()
+            return {"status": "ready"}
+
+    monkeypatch.setattr(controller, "download_model", fake_download)
+    monkeypatch.setattr(controller, "ModelRuntime", FakeRuntime)
+    controller.guided_install_worker(model.id)
+
+    db.expire_all()
+    completed = db.get(ModelRecord, model.id)
+    assert completed.download_status == "downloaded"
+    assert completed.instance.status == "ready"
+    assert completed.is_default is True
+    assert completed.config["guided_install"]["status"] == "completed"
+    assert completed.config["guided_install"]["phase"] == "ready"
+
+
+def test_controller_install_endpoint_returns_accepted_and_persists_queue(db, monkeypatch):
+    model = ModelRecord(hf_model_id="org/queued-model", alias="queued-model", capabilities=["chat"])
+    model.instance = ModelInstance(container_name="vllm-queued-model", internal_url="", status="inactive")
+    db.add(model)
+    db.commit()
+    monkeypatch.setattr(controller, "guided_install_worker", lambda _model_id: None)
+    client = TestClient(controller.app)
+
+    response = client.post(
+        f"/models/{model.id}/install?activate=true&set_default=true",
+        headers={"Authorization": f"Bearer {get_settings().controller_token}"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    db.expire_all()
+    queued = db.get(ModelRecord, model.id)
+    assert queued.download_status == "queued"
+    assert queued.config["guided_install"] | {"updated_at": None} == {
+        "status": "queued",
+        "phase": "download",
+        "activate": True,
+        "set_default": True,
+        "force_download": False,
+        "error": None,
+        "updated_at": None,
+    }
 
 
 def test_model_inspection_and_active_performance_controls_render_inside_admin(db, monkeypatch):

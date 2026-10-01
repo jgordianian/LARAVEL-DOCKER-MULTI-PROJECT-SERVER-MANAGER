@@ -17,14 +17,35 @@ class PolicyDenied(Exception):
         self.status_code = status_code
 
 
+def _tokenizable_input(value):
+    if isinstance(value, list):
+        rows = [_tokenizable_input(item) for item in value]
+        return [row[0] for row in rows], sum(row[1] for row in rows)
+    if not isinstance(value, dict):
+        return value, 0
+    if value.get("type") in {"image_url", "input_image"}:
+        return {"type": value.get("type"), "image": "<uploaded-image>"}, 1
+    result = {}
+    images = 0
+    for key, item in value.items():
+        result[key], count = _tokenizable_input(item)
+        images += count
+    return result, images
+
+
 def approximate_tokens(payload: dict) -> int:
     # Conservative preflight approximation. Authoritative counts are saved from
     # the upstream usage object after generation.
+    tokenizable, image_count = _tokenizable_input(
+        payload.get("messages", payload.get("input", payload.get("prompt", "")))
+    )
     text = json.dumps(
-        payload.get("messages", payload.get("input", payload.get("prompt", ""))),
+        tokenizable,
         ensure_ascii=False,
     )
-    return max(1, (len(text.encode("utf-8")) + 2) // 3)
+    # Image tokenization varies by model and resolution. Reserve a conservative
+    # preflight allowance without counting the base64 transport bytes as text.
+    return max(1, (len(text.encode("utf-8")) + 2) // 3 + image_count * 1_024)
 
 
 def require_scope_access(key: APIKey, scope: str) -> None:

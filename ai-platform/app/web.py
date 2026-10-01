@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import hashlib
 import logging
@@ -11,7 +13,7 @@ from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from redis import Redis
@@ -21,6 +23,7 @@ from sqlalchemy.orm import Session
 from . import __version__
 from .capabilities import (
     MODEL_CAPABILITIES,
+    model_capability_profile,
     model_capabilities,
     normalize_capabilities,
     normalize_endpoints,
@@ -31,12 +34,14 @@ from .db import SessionLocal, get_db
 from .environment import load_environment_snapshot
 from .i18n import SUPPORTED_LANGUAGES, normalize_language, translate
 from .mail import EmailBranding, SMTPConfiguration, password_reset_email, send_email, smtp_configuration, smtp_test_email
+from .model_catalog import ModelCatalogError, catalog_model, load_model_catalog, refresh_model_catalog
 from .models import (
     APIKey,
     AuditLog,
     Conversation,
     IPRule,
     Message,
+    MessageAttachment,
     ModelInstance,
     ModelPermission,
     ModelRecord,
@@ -71,6 +76,8 @@ ENVIRONMENT_SNAPSHOT_PATH = DATA_ROOT / "hardware" / "environment.json"
 NOTEBOOKS_ROOT = DATA_ROOT / "notebooks"
 BRANDING_ROOT = DATA_ROOT / "generated" / "branding"
 BRANDING_ROOT.mkdir(parents=True, exist_ok=True)
+CHAT_ATTACHMENTS_ROOT = DATA_ROOT / "generated" / "chat-attachments"
+CHAT_ATTACHMENTS_ROOT.mkdir(parents=True, exist_ok=True)
 templates = Jinja2Templates(directory=str(BASE / "templates"))
 redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
 logger = logging.getLogger("ai.web")
@@ -90,6 +97,14 @@ BRANDING_DEFAULTS = {
 }
 BRAND_ASSET_SLOTS = {"logo_light", "logo_dark", "login_logo", "favicon"}
 MAX_BRAND_ASSET_BYTES = 2 * 1024 * 1024
+MAX_CHAT_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_CHAT_IMAGE_TOTAL_BYTES = 5 * 1024 * 1024 // 2
+MAX_CHAT_IMAGES = 4
+CHAT_IMAGE_TYPES = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+}
 
 
 @app.middleware("http")
@@ -264,6 +279,88 @@ def brand_asset_extension(body: bytes, *, favicon: bool) -> str:
         return "ico"
     expected = "PNG or ICO" if favicon else "PNG, JPEG or WebP"
     raise HTTPException(422, f"unsupported image format; upload {expected}")
+
+
+def chat_image_extension(body: bytes, declared_media_type: str) -> str:
+    detected = None
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected = "image/png"
+    elif body.startswith(b"\xff\xd8\xff"):
+        detected = "image/jpeg"
+    elif len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        detected = "image/webp"
+    if detected is None or detected != declared_media_type:
+        raise HTTPException(422, "the uploaded image content does not match its PNG, JPEG or WebP type")
+    return CHAT_IMAGE_TYPES[detected]
+
+
+def decode_chat_images(value: Any) -> list[dict[str, Any]]:
+    if value in (None, []):
+        return []
+    if not isinstance(value, list) or len(value) > MAX_CHAT_IMAGES:
+        raise HTTPException(422, f"attach no more than {MAX_CHAT_IMAGES} images")
+    decoded: list[dict[str, Any]] = []
+    total = 0
+    for item in value:
+        if not isinstance(item, dict):
+            raise HTTPException(422, "invalid image attachment")
+        media_type = str(item.get("media_type", "")).strip().lower()
+        data_url = str(item.get("data_url", ""))
+        if media_type not in CHAT_IMAGE_TYPES:
+            raise HTTPException(422, "images must be PNG, JPEG or WebP")
+        header, separator, encoded = data_url.partition(",")
+        if separator != "," or header.lower() != f"data:{media_type};base64":
+            raise HTTPException(422, "invalid image data URL")
+        try:
+            body = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(422, "invalid base64 image data") from None
+        if not body or len(body) > MAX_CHAT_IMAGE_BYTES:
+            raise HTTPException(422, "each image must be between 1 byte and 2 MB")
+        total += len(body)
+        if total > MAX_CHAT_IMAGE_TOTAL_BYTES:
+            raise HTTPException(422, "the combined image size exceeds 2.5 MB")
+        extension = chat_image_extension(body, media_type)
+        filename = Path(str(item.get("name", f"image.{extension}"))).name.strip()[:255] or f"image.{extension}"
+        decoded.append({"body": body, "media_type": media_type, "filename": filename, "extension": extension})
+    return decoded
+
+
+def chat_attachment_path(storage_key: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}\.(png|jpg|webp)", storage_key):
+        raise HTTPException(404, "attachment not found")
+    return CHAT_ATTACHMENTS_ROOT / storage_key
+
+
+def attachment_json(attachment: MessageAttachment) -> dict[str, Any]:
+    return {
+        "id": attachment.id,
+        "name": attachment.filename,
+        "media_type": attachment.media_type,
+        "size_bytes": attachment.size_bytes,
+        "url": f"/api/chat/attachments/{attachment.id}",
+    }
+
+
+def message_for_model(message: Message) -> dict[str, Any]:
+    payload: dict[str, Any] = {"role": message.role, "content": message.content}
+    if message.attachments:
+        content: list[dict[str, Any]] = []
+        if message.content:
+            content.append({"type": "text", "text": message.content})
+        for attachment in message.attachments:
+            path = chat_attachment_path(attachment.storage_key)
+            if not path.is_file():
+                raise HTTPException(409, "a conversation image is unavailable")
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{attachment.media_type};base64,{encoded}"},
+            })
+        payload["content"] = content
+    if message.tool_calls:
+        payload["tool_calls"] = message.tool_calls
+    return payload
 
 
 async def store_brand_asset(slot: str, upload: UploadFile | None) -> str | None:
@@ -819,7 +916,17 @@ def conversation_get(conversation_id: int, request: Request, db: Session = Depen
         raise HTTPException(404, "conversation not found")
     return {
         "id": row.id, "title": row.title, "model": row.model_alias,
-        "messages": [{"id": message.id, "role": message.role, "content": message.content, "tool_calls": message.tool_calls, "created_at": message.created_at.isoformat()} for message in row.messages],
+        "messages": [
+            {
+                "id": message.id,
+                "role": message.role,
+                "content": message.content,
+                "tool_calls": message.tool_calls,
+                "attachments": [attachment_json(attachment) for attachment in message.attachments],
+                "created_at": message.created_at.isoformat(),
+            }
+            for message in row.messages
+        ],
     }
 
 
@@ -861,9 +968,35 @@ async def conversation_delete(conversation_id: int, request: Request, db: Sessio
     row = db.scalar(select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == session.user_id))
     if row is None:
         raise HTTPException(404, "conversation not found")
+    paths = [chat_attachment_path(attachment.storage_key) for message in row.messages for attachment in message.attachments]
     db.delete(row)
     db.commit()
+    for path in paths:
+        path.unlink(missing_ok=True)
     return {"status": "deleted"}
+
+
+@app.get("/api/chat/attachments/{attachment_id}")
+def conversation_attachment(attachment_id: int, request: Request, db: Session = Depends(get_db)):
+    session = require_chat_session(request, db)
+    attachment = db.scalar(
+        select(MessageAttachment)
+        .join(Message, MessageAttachment.message_id == Message.id)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(MessageAttachment.id == attachment_id, Conversation.user_id == session.user_id)
+    )
+    if attachment is None:
+        raise HTTPException(404, "attachment not found")
+    path = chat_attachment_path(attachment.storage_key)
+    if not path.is_file():
+        raise HTTPException(404, "attachment not found")
+    return FileResponse(
+        path,
+        media_type=attachment.media_type,
+        filename=attachment.filename,
+        content_disposition_type="inline",
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 @app.post("/api/chat")
@@ -874,8 +1007,14 @@ async def portal_chat(request: Request, db: Session = Depends(get_db)):
     conversation_id = int(data.get("conversation_id", 0))
     regenerate = bool(data.get("regenerate", False))
     content = str(data.get("content", "")).strip()
-    if not regenerate and (not content or len(content.encode("utf-8")) > settings.max_request_bytes):
-        raise HTTPException(422, "message is empty or too large")
+    raw_attachments = data.get("attachments", [])
+    if regenerate and raw_attachments:
+        raise HTTPException(422, "images cannot be added while regenerating a response")
+    images = [] if regenerate else decode_chat_images(raw_attachments)
+    if not regenerate and not content and not images:
+        raise HTTPException(422, "add a message or at least one image")
+    if len(content.encode("utf-8")) > settings.max_request_bytes:
+        raise HTTPException(422, "message is too large")
     conversation = db.scalar(select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == session.user_id))
     if conversation is None:
         raise HTTPException(404, "conversation not found")
@@ -883,6 +1022,8 @@ async def portal_chat(request: Request, db: Session = Depends(get_db)):
     selected_model = allowed.get(conversation.model_alias)
     if selected_model is None:
         raise HTTPException(409, "the selected model is no longer available")
+    if images and "vision" not in model_capabilities(selected_model):
+        raise HTTPException(422, "the selected model does not support image inputs")
     reasoning_effort = normalized_reasoning_effort(data.get("reasoning_effort", session.user.reasoning_effort))
     if reasoning_effort != "none" and "reasoning" not in model_capabilities(selected_model):
         raise HTTPException(422, "the selected model is not configured for reasoning")
@@ -899,11 +1040,37 @@ async def portal_chat(request: Request, db: Session = Depends(get_db)):
     else:
         user_message = Message(conversation_id=conversation.id, role="user", content=content)
         db.add(user_message)
-        if conversation.title == "New conversation":
-            conversation.title = re.sub(r"\s+", " ", content)[:80]
-    db.commit()
+        stored_paths: list[Path] = []
+        try:
+            db.flush()
+            for image in images:
+                storage_key = f"{secrets.token_hex(16)}.{image['extension']}"
+                destination = chat_attachment_path(storage_key)
+                temporary = CHAT_ATTACHMENTS_ROOT / f".{storage_key}.tmp"
+                temporary.write_bytes(image["body"])
+                temporary.chmod(0o600)
+                temporary.replace(destination)
+                stored_paths.append(destination)
+                db.add(MessageAttachment(
+                    message_id=user_message.id,
+                    filename=image["filename"],
+                    media_type=image["media_type"],
+                    storage_key=storage_key,
+                    size_bytes=len(image["body"]),
+                    sha256=hashlib.sha256(image["body"]).hexdigest(),
+                ))
+            if conversation.title == "New conversation":
+                conversation.title = re.sub(r"\s+", " ", content)[:80] if content else "Image conversation"
+            db.commit()
+        except Exception:
+            db.rollback()
+            for path in stored_paths:
+                path.unlink(missing_ok=True)
+            raise
+    if regenerate:
+        db.commit()
     db.expire(conversation, ["messages"])
-    messages = [{"role": message.role, "content": message.content, **({"tool_calls": message.tool_calls} if message.tool_calls else {})} for message in conversation.messages]
+    messages = [message_for_model(message) for message in conversation.messages]
     payload = {
         "model": conversation.model_alias,
         "messages": messages,
@@ -1346,16 +1513,69 @@ def api_key_rotate(key_id: int, request: Request, csrf_token: str = Form(), db: 
 
 
 @app.get("/admin/models", response_class=HTMLResponse)
-def models_page(request: Request, capability: str = "", db: Session = Depends(get_db)):
+def models_page(
+    request: Request,
+    capability: str = "",
+    result: str = "",
+    error: str = "",
+    error_alias: str = "",
+    db: Session = Depends(get_db),
+):
     session = require_admin(request, db)
     all_models = db.scalars(select(ModelRecord).order_by(ModelRecord.alias)).all()
     selected_capability = capability.strip().lower().replace(" ", "_")
-    models = [model for model in all_models if not selected_capability or selected_capability in model_capabilities(model)]
     hardware = {}
     try:
         hardware = json.loads((DATA_ROOT / "hardware" / "current.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         pass
+    curated_models: list[dict[str, Any]] = []
+    catalog_info: dict[str, Any] = {}
+    catalog_error = None
+    catalog = None
+    try:
+        catalog = load_model_catalog()
+        total_vram_gb = sum(int(gpu.get("memory_total_bytes") or 0) for gpu in hardware.get("gpus", [])) / 1024**3
+        registered = {(model.hf_model_id, model.revision): model.alias for model in all_models}
+        used_aliases = {model.alias for model in all_models}
+        for catalog_entry in catalog["models"]:
+            entry = dict(catalog_entry)
+            recommended_vram = float(entry["recommended_vram_gb"])
+            entry["fit"] = (
+                "UNKNOWN" if total_vram_gb <= 0
+                else "FIT" if recommended_vram <= total_vram_gb * 0.82
+                else "TIGHT" if recommended_vram <= total_vram_gb * 0.97
+                else "TOO LARGE"
+            )
+            entry["registered_alias"] = registered.get((entry["model_id"], entry["revision"]), "")
+            suggested_alias = entry["key"]
+            suffix = 2
+            while suggested_alias in used_aliases:
+                suggested_alias = f"{entry['key']}-{suffix}"
+                suffix += 1
+            entry["suggested_alias"] = suggested_alias
+            curated_models.append(entry)
+        catalog_info = {
+            "version": catalog.get("catalog_version", ""),
+            "updated_at": catalog.get("updated_at", ""),
+            "capabilities_reviewed_at": catalog.get("capabilities_reviewed_at", ""),
+            "validated_vllm_version": catalog.get("validated_vllm_version", ""),
+            "runtime_capability_sources": catalog.get("runtime_capability_sources", []),
+            "notice": catalog.get("notice", ""),
+            "total_vram_gb": round(total_vram_gb, 1),
+        }
+    except ModelCatalogError as exc:
+        catalog_error = str(exc)
+    capability_profiles = {
+        model.id: model_capability_profile(model, catalog) for model in all_models
+    }
+    all_capability_map = {
+        model.id: capability_profiles[model.id]["capabilities"] for model in all_models
+    }
+    models = [
+        model for model in all_models
+        if not selected_capability or selected_capability in all_capability_map[model.id]
+    ]
     plans = {}
     for model in models:
         if model.instance and model.download_status == "downloaded" and not model.instance.desired_active:
@@ -1382,9 +1602,48 @@ def models_page(request: Request, capability: str = "", db: Session = Depends(ge
         storage_free=hardware.get("storage", {}).get("free_bytes"),
         storage_reserve=settings.ai_disk_reserve_gb * 1024**3,
         capability_options=sorted(MODEL_CAPABILITIES), selected_capability=selected_capability,
-        capability_map={model.id: sorted(model_capabilities(model)) for model in models},
+        capability_map={model.id: all_capability_map[model.id] for model in models},
+        capability_profiles={model.id: capability_profiles[model.id] for model in models},
         activation_plans=plans, usage_map=usage_map, account_map=account_map,
+        curated_models=curated_models, catalog_info=catalog_info, catalog_error=catalog_error, result=result,
+        catalog_form_error=error, catalog_error_alias=error_alias,
+        all_model_aliases=sorted(model.alias for model in all_models),
     )
+
+
+@app.post("/admin/models/catalog/refresh")
+def catalog_refresh(request: Request, csrf_token: str = Form(), db: Session = Depends(get_db)):
+    session = require_admin(request, db)
+    verify_csrf(request, session, csrf_token)
+    try:
+        before = load_model_catalog().get("catalog_version")
+        refreshed = refresh_model_catalog()
+    except ModelCatalogError as exc:
+        logger.warning("Stable model catalog refresh failed: %s", exc)
+        audit(
+            db,
+            session,
+            request,
+            "model.catalog_refresh_failed",
+            "model_catalog",
+            before={"catalog_version": locals().get("before")},
+            after={"error": str(exc)[:300]},
+            result="failure",
+        )
+        db.commit()
+        return RedirectResponse("/admin/models?error=catalog-refresh-failed#guided-installer", 303)
+    audit(
+        db,
+        session,
+        request,
+        "model.catalog_refreshed",
+        "model_catalog",
+        before={"catalog_version": before},
+        after={"catalog_version": refreshed.get("catalog_version"), "status": refreshed["status"]},
+    )
+    db.commit()
+    result = "catalog-refreshed" if refreshed["status"] == "updated" else "catalog-current"
+    return RedirectResponse(f"/admin/models?result={result}#guided-installer", 303)
 
 
 @app.post("/admin/models")
@@ -1436,6 +1695,141 @@ async def controller_action(model_id: int, action: str, params: dict[str, Any] |
         )
 
 
+@app.post("/admin/models/catalog")
+async def catalog_model_install(
+    request: Request,
+    catalog_key: str = Form(),
+    alias: str = Form(),
+    capabilities: str = Form(""),
+    download_now: bool = Form(False),
+    activate_now: bool = Form(False),
+    set_default: bool = Form(False),
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    session = require_admin(request, db)
+    verify_csrf(request, session, csrf_token)
+    def form_error(code: str, value: str = "") -> RedirectResponse:
+        suffix = f"&error_alias={value}" if value and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,159}", value) else ""
+        return RedirectResponse(f"/admin/models?error={code}{suffix}#guided-installer", 303)
+
+    try:
+        catalog = load_model_catalog()
+        selected = catalog_model(catalog, catalog_key)
+    except ModelCatalogError:
+        return form_error("invalid-catalog")
+    alias = alias.strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,159}", alias):
+        return form_error("invalid-alias")
+    existing = db.scalar(
+        select(ModelRecord).where(
+            ModelRecord.hf_model_id == selected["model_id"],
+            ModelRecord.revision == selected["revision"],
+        )
+    )
+    if existing:
+        return form_error("already-registered", existing.alias)
+    if db.scalar(select(ModelRecord).where(ModelRecord.alias == alias)):
+        return form_error("alias-exists", alias)
+    if activate_now and not download_now:
+        return form_error("download-required")
+    requested = [value.strip() for value in capabilities.split(",") if value.strip()]
+    if not requested:
+        requested = list(selected["capabilities"])
+    try:
+        normalized_capabilities = normalize_capabilities(requested)
+    except ValueError:
+        return form_error("invalid-capabilities")
+    if not set(normalized_capabilities).issubset(set(selected["capabilities"])):
+        return form_error("invalid-capabilities")
+    tool_calling = bool(selected.get("tool_calling")) and "tool_calling" in normalized_capabilities
+    reasoning_parser = selected.get("reasoning_parser") if "reasoning" in normalized_capabilities else None
+    name = container_name_for(alias)
+    model = ModelRecord(
+        hf_model_id=selected["model_id"],
+        revision=selected["revision"],
+        alias=alias,
+        capabilities=normalized_capabilities,
+        estimated_weight_gb=selected["estimated_weight_gb"],
+        max_model_len=selected["default_max_model_len"],
+        quantization=selected.get("quantization"),
+        dtype=selected["dtype"],
+        trust_remote_code=False,
+        tool_calling=tool_calling,
+        tool_call_parser=selected.get("tool_call_parser") if tool_calling else None,
+        config={
+            "catalog_key": selected["key"],
+            "catalog_version": catalog.get("catalog_version"),
+            "release_channel": selected["release_channel"],
+            "recommended_vram_gb": selected["recommended_vram_gb"],
+        },
+    )
+    model.instance = ModelInstance(
+        container_name=name,
+        internal_url=f"http://{name}:8000" if settings.ai_runtime_mode == "docker" else "",
+        max_num_seqs=selected["max_num_seqs"],
+        gpu_memory_utilization=selected["gpu_memory_utilization"],
+        performance_profile=selected["performance_profile"],
+        extra_args=["--reasoning-parser", reasoning_parser] if reasoning_parser else [],
+    )
+    db.add(model)
+    db.flush()
+    audit(
+        db,
+        session,
+        request,
+        "model.catalog_registered",
+        "model",
+        model.id,
+        after={
+            "catalog_key": selected["key"],
+            "catalog_version": catalog.get("catalog_version"),
+            "model_id": model.hf_model_id,
+            "revision": model.revision,
+            "alias": model.alias,
+            "capabilities": normalized_capabilities,
+        },
+    )
+    db.commit()
+    result = "catalog-registered"
+    if download_now:
+        response = await controller_action(
+            model.id,
+            "install",
+            {"activate": activate_now, "set_default": set_default and activate_now},
+        )
+        audit(db, session, request, "model.catalog_install_queued", "model", model.id, result="success" if response.is_success else "failure")
+        db.commit()
+        if not response.is_success:
+            return form_error("download-failed", model.alias)
+        result = "catalog-queued"
+    anchor = f"#model-{model.id}" if result == "catalog-queued" else ""
+    return RedirectResponse(f"/admin/models?result={result}{anchor}", 303)
+
+
+@app.get("/admin/models/{model_id}/status")
+def model_install_status(model_id: int, request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+    require_admin(request, db)
+    model = db.get(ModelRecord, model_id)
+    if model is None:
+        raise HTTPException(404)
+    job = dict((model.config or {}).get("guided_install") or {})
+    instance = model.instance
+    error = job.get("error") or model.download_error or (instance.last_error if instance else None)
+    return JSONResponse(
+        {
+            "model_id": model.id,
+            "alias": model.alias,
+            "status": job.get("status", "completed" if model.download_status == "downloaded" else model.download_status),
+            "phase": job.get("phase", "ready" if instance and instance.status == "ready" else model.download_status),
+            "download_status": model.download_status,
+            "runtime_status": instance.status if instance else "inactive",
+            "activation_requested": bool(job.get("activate")),
+            "error": str(error or "")[:1000],
+        }
+    )
+
+
 @app.post("/admin/models/{model_id}/action/{action}")
 async def model_action(model_id: int, action: str, request: Request, csrf_token: str = Form(), confirmation: str = Form(""), db: Session = Depends(get_db)):
     session = require_admin(request, db)
@@ -1445,6 +1839,21 @@ async def model_action(model_id: int, action: str, request: Request, csrf_token:
     model = db.get(ModelRecord, model_id)
     if model is None:
         raise HTTPException(404)
+    if action in {"download", "activate"}:
+        response = await controller_action(
+            model_id,
+            "install",
+            {
+                "activate": action == "activate",
+                "set_default": False,
+                "force_download": action == "download" and model.download_status == "downloaded",
+            },
+        )
+        audit(db, session, request, f"model.{action}_queued", "model", model_id, result="success" if response.is_success else "failure")
+        db.commit()
+        if not response.is_success:
+            raise HTTPException(response.status_code, response.text[:1000])
+        return RedirectResponse(f"/admin/models?result=catalog-queued#model-{model_id}", 303)
     controller_name = action
     params = None
     if action in {"delete-record", "delete-weights"}:
@@ -1555,12 +1964,21 @@ def model_configure(
     if performance_profile not in {"AUTO", "CONSERVATIVE", "BALANCED", "PERFORMANCE", "MAXIMUM", "CUSTOM"}:
         raise HTTPException(422, "invalid performance profile")
     before = {"alias": model.alias, "instance": {"gpus": model.instance.gpu_assignment, "tensor_parallel_size": model.instance.tensor_parallel_size, "profile": model.instance.performance_profile}}
-    try:
-        normalized_capabilities = normalize_capabilities(
-            (value.strip() for value in capabilities.split(",")), tool_calling=tool_calling
-        )
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from None
+    capability_profile = model_capability_profile(model)
+    if capability_profile["status"] == "reviewed":
+        current_catalog = load_model_catalog()
+        catalog_entry = catalog_model(current_catalog, capability_profile["catalog_key"])
+        normalized_capabilities = list(catalog_entry["capabilities"])
+        tool_calling = bool(catalog_entry.get("tool_calling"))
+        tool_call_parser = str(catalog_entry.get("tool_call_parser") or "")
+        model.config = dict(model.config or {}) | {"catalog_version": current_catalog.get("catalog_version")}
+    else:
+        try:
+            normalized_capabilities = normalize_capabilities(
+                (value.strip() for value in capabilities.split(",")), tool_calling=tool_calling
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
     model.alias = alias
     model.capabilities = normalized_capabilities
     model.tool_calling = tool_calling

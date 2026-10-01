@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import ipaddress
 import logging
@@ -267,6 +269,58 @@ def _model_supports(model: ModelRecord, endpoint: str) -> bool:
     return True
 
 
+def _image_values(value: Any):
+    if isinstance(value, list):
+        for item in value:
+            yield from _image_values(item)
+        return
+    if not isinstance(value, dict):
+        return
+    item_type = value.get("type")
+    if item_type in {"image_url", "input_image"}:
+        image_value = value.get("image_url")
+        if isinstance(image_value, dict):
+            image_value = image_value.get("url")
+        yield image_value
+    for key, item in value.items():
+        if key not in {"image_url", "type"}:
+            yield from _image_values(item)
+
+
+def _validate_data_image(value: Any) -> None:
+    if not isinstance(value, str) or not value.startswith("data:"):
+        raise PolicyDenied(
+            "invalid_image_input",
+            "Image inputs must be uploaded as PNG, JPEG or WebP data URLs.",
+            400,
+        )
+    header, separator, encoded = value.partition(",")
+    media_type = header.removeprefix("data:").removesuffix(";base64").lower()
+    if separator != "," or not header.lower().endswith(";base64") or media_type not in {"image/png", "image/jpeg", "image/webp"}:
+        raise PolicyDenied("invalid_image_input", "Image inputs must be PNG, JPEG or WebP data URLs.", 400)
+    try:
+        body = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise PolicyDenied("invalid_image_input", "The image contains invalid base64 data.", 400) from None
+    matches = (
+        (media_type == "image/png" and body.startswith(b"\x89PNG\r\n\x1a\n"))
+        or (media_type == "image/jpeg" and body.startswith(b"\xff\xd8\xff"))
+        or (media_type == "image/webp" and len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP")
+    )
+    if not body or not matches:
+        raise PolicyDenied("invalid_image_input", "The image content does not match its declared type.", 400)
+
+
+def _validate_image_inputs(payload: dict[str, Any], model: ModelRecord) -> None:
+    images = list(_image_values(payload.get("messages", payload.get("input", []))))
+    if not images:
+        return
+    if "vision" not in model_capabilities(model):
+        raise PolicyDenied("image_inputs_not_supported", "The requested model does not support image inputs.", 400)
+    for image in images:
+        _validate_data_image(image)
+
+
 def _apply_reasoning_budget(payload: dict[str, Any], endpoint: str) -> None:
     """Translate OpenAI reasoning effort into vLLM's enforceable token budget."""
     effort: Any = None
@@ -517,6 +571,7 @@ async def proxy(request: Request, db: Session, endpoint: str):
             raise PolicyDenied("model_unavailable", "The requested model is not available.", 503)
         if not _model_supports(model, endpoint):
             raise PolicyDenied("endpoint_not_supported", "The requested model does not support this endpoint.", 400)
+        _validate_image_inputs(payload, model)
         scope = _scope_for(endpoint)
         authorize_model(db, principal, model, scope, f"/v1/{endpoint}", bool(payload.get("tools")))
         _apply_system_prompt(db, payload, model, principal)

@@ -103,6 +103,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./hardware:/platform/hardware:ro
+      - ./state:/platform/state:ro
     read_only: true
     tmpfs:
       - /tmp
@@ -135,6 +136,7 @@ services:
       - ./logs:/app/logs
       - ./hardware:/platform/hardware:ro
       - ./notebooks:/platform/notebooks:ro
+      - ./state:/platform/state
     read_only: true
     tmpfs:
       - /tmp
@@ -164,6 +166,7 @@ services:
       - ./models:/models
       - ./hf-cache:/root/.cache/huggingface
       - ./hardware:/platform/hardware
+      - ./state:/platform/state:ro
       - ./model-configs:/platform/model-configs
       - ./generated:/platform/generated
       - ./secrets/hf_token:/run/secrets/hf_token:ro

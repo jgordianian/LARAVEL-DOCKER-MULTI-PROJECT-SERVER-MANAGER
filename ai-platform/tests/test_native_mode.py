@@ -9,6 +9,7 @@ import pytest
 
 from app.config import Settings
 from app.cli import build_parser
+from app.model_catalog import load_model_catalog
 from scripts.native_service import read_environment
 
 
@@ -76,13 +77,25 @@ def test_native_cli_runs_as_the_service_account():
     assert 'runuser -u "$AI_NATIVE_SERVICE_USER" -- "$python" -m app.cli "$@"' in native_cli
 
 
+def test_terminal_model_installer_uses_refreshed_catalog_and_schema_three_capabilities():
+    manager = (Path(__file__).resolve().parents[2] / "laravel-server-manager.sh").read_text(encoding="utf-8")
+    catalog_functions = manager.split("ai_model_catalog_path() {", 1)[1].split("ai_configure_proxy", 1)[0]
+
+    assert '${AI_PLATFORM_BASE}/state/model-catalog.json' in catalog_functions
+    assert "model_capabilities // []" in catalog_functions
+    assert "runtime_capabilities // []" in catalog_functions
+    assert 'catalog="$(ai_model_catalog_path)"' in catalog_functions
+
+
 def test_curated_catalog_contains_pinned_current_stable_models():
     platform_root = Path(__file__).resolve().parents[1]
     catalog = json.loads((platform_root / "config" / "model-catalog.json").read_text(encoding="utf-8"))
     models = catalog["models"]
 
-    assert catalog["schema_version"] >= 2
+    assert catalog["schema_version"] >= 3
     assert catalog["validated_vllm_version"] == "0.30.0"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", catalog["capabilities_reviewed_at"])
+    assert all(source.startswith("https://docs.vllm.ai/") for source in catalog["runtime_capability_sources"])
     assert {"Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B"} <= {model["model_id"] for model in models}
     assert len({model["key"] for model in models}) == len(models)
     qwen3_models = [model for model in models if model["model_id"].startswith("Qwen/Qwen3")]
@@ -94,6 +107,22 @@ def test_curated_catalog_contains_pinned_current_stable_models():
         assert model["display_name"] and model["summary"]
         assert model["estimated_weight_gb"] > 0
         assert model["recommended_vram_gb"] > 0
+        assert set(model["model_capabilities"]).isdisjoint(model["runtime_capabilities"])
+        assert any(model["revision"] in source for source in model["capability_sources"])
+
+    normalized = load_model_catalog()
+    for model in normalized["models"]:
+        assert set(model["model_capabilities"]) | set(model["runtime_capabilities"]) == set(model["capabilities"])
+    qwen35 = next(model for model in normalized["models"] if model["key"] == "qwen3.5-4b")
+    assert qwen35["capabilities"] == sorted(qwen35["capabilities"])
+    assert {"vision", "agentic", "tool_calling", "reasoning", "coding", "structured_outputs"} <= set(qwen35["capabilities"])
+    qwen14 = next(model for model in normalized["models"] if model["key"] == "qwen3-14b-awq")
+    assert {"general", "chat", "completions", "responses", "reasoning", "agentic", "tool_calling", "structured_outputs", "coding"} == set(qwen14["capabilities"])
+    assert qwen14["tool_calling"] is True
+    assert qwen14["tool_call_parser"] == "qwen3_coder"
+    coder = next(model for model in normalized["models"] if model["key"] == "qwen2.5-coder-7b-awq")
+    assert "reasoning" not in coder["capabilities"]
+    assert {"coding", "agentic", "tool_calling", "structured_outputs"} <= set(coder["capabilities"])
 
 
 def test_model_add_cli_accepts_managed_reasoning_and_memory_defaults():
