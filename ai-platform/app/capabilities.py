@@ -36,8 +36,32 @@ API_ENDPOINTS = frozenset(
     }
 )
 
-API_SCOPES = frozenset({"models", "chat", "completions", "responses", "embeddings", "tools", "coding"})
-API_SCOPE_ORDER = ("models", "chat", "completions", "responses", "embeddings", "tools", "coding")
+API_SCOPES = frozenset(
+    {
+        "models",
+        "chat",
+        "completions",
+        "responses",
+        "embeddings",
+        "reasoning",
+        "tools",
+        "structured_outputs",
+        "vision",
+        "coding",
+    }
+)
+API_SCOPE_ORDER = (
+    "models",
+    "chat",
+    "completions",
+    "responses",
+    "embeddings",
+    "reasoning",
+    "tools",
+    "structured_outputs",
+    "vision",
+    "coding",
+)
 
 SERVICE_ACCOUNT_PURPOSES = frozenset({"general_api", "omnivis_production", "coding_agent", "custom"})
 
@@ -143,7 +167,11 @@ def api_scopes_for_capabilities(capabilities: Iterable[str]) -> list[str]:
     """Return Gateway policy scopes supported by a model capability set."""
     values = set(capabilities)
     scopes = {"models"}
-    scopes.update(values.intersection({"chat", "completions", "responses", "embeddings"}))
+    scopes.update(
+        values.intersection(
+            {"chat", "completions", "responses", "embeddings", "reasoning", "structured_outputs", "vision"}
+        )
+    )
     if "tool_calling" in values:
         scopes.add("tools")
     if values.intersection({"coding", "agentic"}):

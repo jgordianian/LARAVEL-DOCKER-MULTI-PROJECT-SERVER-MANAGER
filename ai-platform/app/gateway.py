@@ -216,6 +216,9 @@ def authorize_model(
     scope: str,
     endpoint: str,
     tools_requested: bool = False,
+    reasoning_requested: bool = False,
+    vision_requested: bool = False,
+    structured_outputs_requested: bool = False,
 ) -> None:
     capabilities = model_capabilities(model)
     coding_requested = bool(capabilities.intersection({"coding", "agentic"}))
@@ -223,12 +226,28 @@ def authorize_model(
         require_model_access(principal.api_key, model.alias, scope, endpoint)
         if tools_requested:
             require_scope_access(principal.api_key, "tools")
+        if reasoning_requested:
+            require_scope_access(principal.api_key, "reasoning")
+        if vision_requested:
+            require_scope_access(principal.api_key, "vision")
+        if structured_outputs_requested:
+            require_scope_access(principal.api_key, "structured_outputs")
         if coding_requested:
             require_scope_access(principal.api_key, "coding")
     if principal.user_id and not _user_model_allowed(db, principal.user_id, model, tools_requested, coding_requested):
         raise PolicyDenied("model_access_denied", "This user cannot access the requested model.")
     if tools_requested and not model.tool_calling:
         raise PolicyDenied("tools_not_supported", "The requested model is not configured for tool calling.", 400)
+    if reasoning_requested and "reasoning" not in capabilities:
+        raise PolicyDenied("reasoning_not_supported", "The requested model does not support reasoning controls.", 400)
+    if vision_requested and "vision" not in capabilities:
+        raise PolicyDenied("image_inputs_not_supported", "The requested model does not support image inputs.", 400)
+    if structured_outputs_requested and "structured_outputs" not in capabilities:
+        raise PolicyDenied(
+            "structured_outputs_not_supported",
+            "The requested model does not support structured outputs.",
+            400,
+        )
 
 
 def active_models(db: Session) -> list[ModelRecord]:
@@ -247,7 +266,17 @@ def codex_models(db: Session, principal: Principal) -> list[ModelRecord]:
         if "responses" not in capabilities or not capabilities.intersection({"coding", "agentic"}) or not model.tool_calling:
             continue
         try:
-            authorize_model(db, principal, model, "responses", "/v1/responses", tools_requested=True)
+            authorize_model(
+                db,
+                principal,
+                model,
+                "responses",
+                "/v1/responses",
+                tools_requested=True,
+                reasoning_requested="reasoning" in capabilities,
+                vision_requested="vision" in capabilities,
+                structured_outputs_requested="structured_outputs" in capabilities,
+            )
         except PolicyDenied:
             continue
         compatible.append(model)
@@ -319,6 +348,35 @@ def _validate_image_inputs(payload: dict[str, Any], model: ModelRecord) -> None:
         raise PolicyDenied("image_inputs_not_supported", "The requested model does not support image inputs.", 400)
     for image in images:
         _validate_data_image(image)
+
+
+def _has_image_inputs(payload: dict[str, Any]) -> bool:
+    return next(_image_values(payload.get("messages", payload.get("input", []))), None) is not None
+
+
+def _reasoning_requested(payload: dict[str, Any], endpoint: str) -> bool:
+    effort: Any = None
+    if endpoint == "responses":
+        reasoning = payload.get("reasoning")
+        if isinstance(reasoning, dict):
+            effort = reasoning.get("effort")
+    elif endpoint == "chat/completions":
+        effort = payload.get("reasoning_effort")
+    return effort is not None and effort != "none"
+
+
+def _structured_outputs_requested(payload: dict[str, Any], endpoint: str) -> bool:
+    response_format = payload.get("response_format")
+    if isinstance(response_format, dict) and response_format.get("type") not in {None, "text"}:
+        return True
+    if endpoint == "responses":
+        text = payload.get("text")
+        if isinstance(text, dict) and isinstance(text.get("format"), dict):
+            return text["format"].get("type") not in {None, "text"}
+    return any(
+        key in payload
+        for key in ("structured_outputs", "guided_json", "guided_regex", "guided_choice", "guided_grammar")
+    )
 
 
 def _apply_reasoning_budget(payload: dict[str, Any], endpoint: str) -> None:
@@ -504,7 +562,7 @@ def codex_install(request: Request, platform: str, db: Session = Depends(get_db)
         if not models:
             raise PolicyDenied(
                 "codex_configuration_unavailable",
-                "This API key cannot access an active Responses, tools and coding compatible model.",
+                "This API key cannot access an active Codex-compatible model with all of its required scopes.",
                 403,
             )
         if settings.cloudflare_api_hostname:
@@ -571,9 +629,22 @@ async def proxy(request: Request, db: Session, endpoint: str):
             raise PolicyDenied("model_unavailable", "The requested model is not available.", 503)
         if not _model_supports(model, endpoint):
             raise PolicyDenied("endpoint_not_supported", "The requested model does not support this endpoint.", 400)
+        vision_requested = _has_image_inputs(payload)
+        reasoning_requested = _reasoning_requested(payload, endpoint)
+        structured_outputs_requested = _structured_outputs_requested(payload, endpoint)
         _validate_image_inputs(payload, model)
         scope = _scope_for(endpoint)
-        authorize_model(db, principal, model, scope, f"/v1/{endpoint}", bool(payload.get("tools")))
+        authorize_model(
+            db,
+            principal,
+            model,
+            scope,
+            f"/v1/{endpoint}",
+            bool(payload.get("tools")),
+            reasoning_requested,
+            vision_requested,
+            structured_outputs_requested,
+        )
         _apply_system_prompt(db, payload, model, principal)
         _apply_reasoning_budget(payload, endpoint)
         estimated = approximate_tokens(payload)

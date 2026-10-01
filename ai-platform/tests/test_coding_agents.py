@@ -33,7 +33,15 @@ def coding_fixture(db):
         hf_model_id="org/coder",
         alias="omnivis-coder",
         download_status="downloaded",
-        capabilities=["chat", "responses", "coding", "agentic", "reasoning", "tool_calling"],
+        capabilities=[
+            "chat",
+            "responses",
+            "coding",
+            "agentic",
+            "reasoning",
+            "tool_calling",
+            "structured_outputs",
+        ],
         tool_calling=True,
         tool_call_parser="hermes",
         estimated_weight_gb=1,
@@ -56,7 +64,7 @@ def coding_fixture(db):
         name="Jonah Development",
         purpose="coding_agent",
         allowed_models=[coder.alias],
-        allowed_scopes=["models", "chat", "responses", "tools", "coding"],
+        allowed_scopes=["models", "chat", "responses", "reasoning", "tools", "structured_outputs", "coding"],
         allowed_endpoints=["/v1/models", "/v1/chat/completions", "/v1/responses"],
     )
     db.add_all([general, coder, production, development])
@@ -65,7 +73,13 @@ def coding_fixture(db):
     raw_keys = {}
     for name, owner, models, scopes, endpoints in (
         ("production", production, [general.alias], ["models", "chat"], production.allowed_endpoints),
-        ("coding", development, [coder.alias], ["models", "chat", "responses", "tools", "coding"], development.allowed_endpoints),
+        (
+            "coding",
+            development,
+            [coder.alias],
+            ["models", "chat", "responses", "reasoning", "tools", "structured_outputs", "coding"],
+            development.allowed_endpoints,
+        ),
     ):
         raw, key_id, prefix, secret_hash = generate_api_key(get_settings())
         db.add(
@@ -323,6 +337,36 @@ def test_unknown_reasoning_effort_is_rejected(db):
     )
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_reasoning_effort"
+
+
+@pytest.mark.parametrize(
+    ("scope", "payload"),
+    [
+        ("reasoning", {"model": "omnivis-coder", "input": "think", "reasoning": {"effort": "high"}}),
+        (
+            "structured_outputs",
+            {
+                "model": "omnivis-coder",
+                "input": "return JSON",
+                "text": {"format": {"type": "json_schema", "name": "result", "schema": {"type": "object"}}},
+            },
+        ),
+    ],
+)
+def test_feature_requests_require_their_model_scope(db, scope, payload):
+    _, _, _, development, keys = coding_fixture(db)
+    key = db.query(APIKey).filter(APIKey.service_account_id == development.id).one()
+    key.scopes = [value for value in key.scopes if value != scope]
+    db.commit()
+
+    response = TestClient(gateway.app, client=("198.51.100.7", 50000)).post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {keys['coding']}"},
+        json=payload,
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["type"] == "scope_denied"
 
 
 def test_coding_chat_streaming_and_tool_calls_are_preserved(db, monkeypatch):

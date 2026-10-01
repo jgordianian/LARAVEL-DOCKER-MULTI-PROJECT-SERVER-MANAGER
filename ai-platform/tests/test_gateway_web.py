@@ -176,7 +176,7 @@ def test_codex_installer_requires_coding_policy_and_generates_each_platform(db, 
         secret_hash=secret_hash,
         user_id=owner.id,
         allowed_models=[model.alias],
-        scopes=["models", "responses", "tools", "coding"],
+        scopes=["models", "responses", "reasoning", "tools", "coding"],
         allowed_endpoints=["/v1/models", "/v1/responses"],
     )
     db.add(key)
@@ -327,6 +327,13 @@ def test_gateway_rejects_images_for_text_models_and_accepts_valid_vision_data_ur
     assert denied.json()["error"]["type"] == "image_inputs_not_supported"
 
     model.capabilities = ["chat", "completions", "vision"]
+    db.commit()
+    missing_scope = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {raw}"}, json=payload)
+    assert missing_scope.status_code == 403
+    assert missing_scope.json()["error"]["type"] == "scope_denied"
+
+    key = db.query(APIKey).one()
+    key.scopes = [*key.scopes, "vision"]
     db.commit()
     captured = {}
     original_async_client = httpx.AsyncClient
@@ -697,7 +704,7 @@ def test_global_and_per_user_language_preferences(db):
     inherited = client.get("/")
     assert inherited.status_code == 200
     assert '<html lang="es">' in inherited.text
-    assert 'src="/static/i18n.js?v=1.2.0-thinking1"' in inherited.text
+    assert 'src="/static/i18n.js?v=1.2.0-feature-scopes1"' in inherited.text
     assert 'class="language-menu"' in inherited.text
     assert '<span class="language-current">System</span>' in inherited.text
     assert 'name="preferred_language" value="" class="selected" aria-current="true"' in inherited.text
@@ -884,7 +891,15 @@ def test_service_and_api_policy_selectors_default_to_inheritance(db):
         hf_model_id="org/active-chat",
         alias="active-chat",
         download_status="downloaded",
-        capabilities=["chat", "responses", "coding", "tool_calling"],
+        capabilities=[
+            "chat",
+            "responses",
+            "coding",
+            "reasoning",
+            "tool_calling",
+            "structured_outputs",
+            "vision",
+        ],
         tool_calling=True,
         tool_call_parser="qwen3_coder",
     )
@@ -931,11 +946,22 @@ def test_service_and_api_policy_selectors_default_to_inheritance(db):
     client = TestClient(web.app)
     client.cookies.set("ai_session", raw_session)
 
-    assert model_api_scopes(chat_model) == ["models", "chat", "responses", "tools", "coding"]
+    assert model_api_scopes(chat_model) == [
+        "models",
+        "chat",
+        "responses",
+        "reasoning",
+        "tools",
+        "structured_outputs",
+        "vision",
+        "coding",
+    ]
     service_page = client.get("/admin/service-accounts")
     assert service_page.status_code == 200
     assert 'type="checkbox" name="allowed_models" value="active-chat"' in service_page.text
-    assert 'data-scopes="models,chat,responses,tools,coding"' in service_page.text
+    assert 'data-scopes="models,chat,responses,reasoning,tools,structured_outputs,vision,coding"' in service_page.text
+    for scope in ("reasoning", "structured_outputs", "vision"):
+        assert f'value="{scope}" data-policy-scope' in service_page.text
     assert 'value="active-embedding"' in service_page.text
     assert 'value="inactive-model"' not in service_page.text
     assert "/static/policy-selectors.js?v=1.0.1" in service_page.text
@@ -1068,6 +1094,12 @@ def test_spanish_dictionary_covers_every_static_admin_literal():
         "api_key.revoked", "api_key.rotated", "model.registered", "model.activate",
         "model.deactivate", "model.restart", "model.default_changed",
         "model.configuration_changed", "performance.changed", "ip_rule.created", "ip_rule.deleted",
+        "Model stopped. You can now validate and apply a performance profile.",
+        "Performance profile validated and saved. The model remains stopped.",
+        "Performance profile validated and saved. Model activation started in the background.",
+        "Performance profile validated, saved and activated.",
+        "The performance profile was saved, but model activation could not be queued. Try activating it again.",
+        "SMTP settings were saved, but the test email could not be delivered. Verify the server, port, security mode and credentials.",
     }
     assert dynamic_literals <= keys
     for dynamic_fragment in ("cores", "GB used", "Last used", "last login", "requests", "system_setting"):
@@ -1509,7 +1541,7 @@ def test_admin_models_guided_catalog_registers_all_reviewed_capabilities(db):
     assert 'class="secondary catalog-refresh-button"' in page.text
     assert 'aria-label="Refresh stable catalog"' in page.text
     assert "/static/models-guided.js?v=1.2.0-jobs1" in page.text
-    assert "/static/i18n.js?v=1.2.0-thinking1" in page.text
+    assert "/static/i18n.js?v=1.2.0-feature-scopes1" in page.text
 
     response = client.post(
         "/admin/models/catalog",
