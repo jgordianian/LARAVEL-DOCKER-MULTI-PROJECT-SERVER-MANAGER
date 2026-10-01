@@ -22,7 +22,7 @@ from app.mail import EmailBranding, SMTPConfiguration, send_email, smtp_test_ema
 from app.codex_setup import codex_model_catalog
 from app.capabilities import model_api_scopes, model_capability_profile
 from app.model_catalog import load_model_catalog
-from app.models import APIKey, AuditLog, Conversation, IPRule, MessageAttachment, ModelInstance, ModelRecord, PasswordResetToken, ServiceAccount, SystemSetting, UsageRecord, User, WebSession
+from app.models import APIKey, AuditLog, Conversation, IPRule, Message, MessageAttachment, ModelInstance, ModelRecord, PasswordResetToken, ServiceAccount, SystemSetting, UsageRecord, User, WebSession
 from app.policy import PolicyDenied, require_model_access
 from app.security import create_web_session, generate_api_key, hash_password, verify_password
 
@@ -547,8 +547,8 @@ def test_reasoning_preference_is_persisted_and_sent_to_gateway(db, monkeypatch):
     assert 'id="reasoning-select"' in page.text
     assert '<option value="high" selected' in page.text
     assert 'data-saved-value="high"' in page.text
-    assert 'src="/static/chat.js?v=1.2.0-markdown1"' in page.text
-    assert 'href="/static/chat-extra.css?v=1.2.0-chat-layout2"' in page.text
+    assert 'src="/static/chat.js?v=1.2.0-edit-resend1"' in page.text
+    assert 'href="/static/chat-extra.css?v=1.2.0-profile-avatar2"' in page.text
     assert '<footer class="chat-footer">' in page.text
 
 
@@ -567,6 +567,83 @@ def test_chat_shows_thinking_state_until_the_first_visible_token():
     assert ".thinking-dots span" in styles
     assert "@keyframes thinking-pulse" in styles
     assert ".chat-footer { height: 42px;" in styles
+
+
+def test_edit_and_resend_updates_original_message_and_discards_later_branch(db, monkeypatch):
+    user = User(name="Editing User", email="editing@example.com", password_hash=hash_password("GoodPassword!123"))
+    model = ModelRecord(
+        hf_model_id="Qwen/Qwen3.5-4B",
+        alias="editing-model",
+        download_status="downloaded",
+        capabilities=["chat"],
+        is_default=True,
+    )
+    model.instance = ModelInstance(
+        container_name="vllm-editing-model",
+        internal_url="http://127.0.0.1:19000",
+        desired_active=True,
+        status="ready",
+        gpu_assignment=[0],
+    )
+    db.add_all([user, model])
+    db.flush()
+    raw, session = create_web_session(db, user, "127.0.0.1", "test")
+    conversation = Conversation(user_id=user.id, model_alias=model.alias, title="Original title")
+    db.add(conversation)
+    db.flush()
+    first_user = Message(conversation_id=conversation.id, role="user", content="Keep me")
+    first_answer = Message(conversation_id=conversation.id, role="assistant", content="Kept answer")
+    edited_user = Message(conversation_id=conversation.id, role="user", content="Original prompt")
+    discarded_answer = Message(conversation_id=conversation.id, role="assistant", content="Discard me")
+    db.add_all([first_user, first_answer, edited_user, discarded_answer])
+    db.commit()
+
+    captured = {}
+    original_async_client = httpx.AsyncClient
+
+    async def upstream(request):
+        captured["payload"] = json.loads(request.content)
+        event = {"choices": [{"delta": {"content": "Replacement answer"}}]}
+        return httpx.Response(200, content=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n".encode())
+
+    monkeypatch.setattr(
+        web.httpx,
+        "AsyncClient",
+        lambda **kwargs: original_async_client(transport=httpx.MockTransport(upstream), timeout=kwargs.get("timeout")),
+    )
+    client = TestClient(web.app)
+    client.cookies.set("ai_session", raw)
+    response = client.post(
+        "/api/chat",
+        json={
+            "conversation_id": conversation.id,
+            "content": "Edited prompt",
+            "edit_message_id": edited_user.id,
+            "reasoning_effort": "none",
+            "csrf_token": session.csrf_token,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-ai-user-message-id"] == str(edited_user.id)
+    assert [message["content"] for message in captured["payload"]["messages"]] == [
+        "Keep me",
+        "Kept answer",
+        "Edited prompt",
+    ]
+    history = client.get(f"/api/conversations/{conversation.id}").json()
+    assert [message["content"] for message in history["messages"]] == [
+        "Keep me",
+        "Kept answer",
+        "Edited prompt",
+        "Replacement answer",
+    ]
+    assert history["messages"][2]["id"] == edited_user.id
+    assert "Discard me" not in {message["content"] for message in history["messages"]}
+
+    script = (Path(__file__).resolve().parents[1] / "app" / "static" / "chat.js").read_text(encoding="utf-8")
+    assert "edit_message_id:editMessageId" in script
+    assert "row.dataset.messageId" in script
 
 
 def test_chat_image_decoder_accepts_20_mb_and_rejects_larger_files():
@@ -642,7 +719,7 @@ def test_portal_persists_private_images_and_sends_multimodal_content(db, monkeyp
     page = client.get("/")
     assert 'data-vision="true"' in page.text
     assert 'id="image-picker"' in page.text
-    assert 'src="/static/chat.js?v=1.2.0-markdown1"' in page.text
+    assert 'src="/static/chat.js?v=1.2.0-edit-resend1"' in page.text
 
     conversation = client.post(
         "/api/conversations",
@@ -704,7 +781,7 @@ def test_global_and_per_user_language_preferences(db):
     inherited = client.get("/")
     assert inherited.status_code == 200
     assert '<html lang="es">' in inherited.text
-    assert 'src="/static/i18n.js?v=1.2.0-feature-scopes1"' in inherited.text
+    assert 'src="/static/i18n.js?v=1.2.0-profile-avatar1"' in inherited.text
     assert 'class="language-menu"' in inherited.text
     assert '<span class="language-current">System</span>' in inherited.text
     assert 'name="preferred_language" value="" class="selected" aria-current="true"' in inherited.text
@@ -804,6 +881,91 @@ def test_user_can_manage_profile_and_email_change_is_reauthenticated(db):
     event = db.scalar(select(AuditLog).where(AuditLog.action == "user.profile_changed"))
     assert event is not None
     assert event.after["other_sessions_terminated"] is True
+
+
+def test_user_can_upload_serve_and_remove_private_profile_photo(db):
+    user = User(name="Original Name", email="avatar@example.com", password_hash=hash_password("GoodPassword!123"))
+    other = User(name="Other User", email="other-avatar@example.com", password_hash=hash_password("GoodPassword!123"))
+    db.add_all([user, other])
+    db.flush()
+    raw, session = create_web_session(db, user, "127.0.0.1", "avatar-test")
+    other_raw, _ = create_web_session(db, other, "127.0.0.1", "other-avatar-test")
+    db.commit()
+
+    client = TestClient(web.app)
+    client.cookies.set("ai_session", raw)
+    page = client.get("/profile")
+    assert page.status_code == 200
+    assert 'class="user-menu"' in page.text
+    assert 'class="user-menu-avatar"' in page.text
+    assert '<span>ON</span>' in page.text
+    assert 'src="/static/navigation.js?v=1.2.0-profile-avatar1"' in page.text
+    assert 'src="/static/profile.js?v=1.2.0-profile-preview2"' in page.text
+    profile_script = client.get("/static/profile.js").text
+    assert "reader.readAsDataURL(file)" in profile_script
+    assert "URL.createObjectURL" not in profile_script
+    assert 'enctype="multipart/form-data"' in page.text
+    assert 'name="profile_photo"' in page.text
+
+    form = {
+        "name": user.name,
+        "email": user.email,
+        "preferred_language": "en",
+        "default_model_alias": "",
+        "reasoning_effort": "medium",
+        "system_prompt": "",
+        "current_password": "",
+        "csrf_token": session.csrf_token,
+    }
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    uploaded = client.post(
+        "/profile",
+        data=form,
+        files={"profile_photo": ("avatar.png", png, "image/png")},
+        follow_redirects=False,
+    )
+    assert uploaded.status_code == 303
+    db.expire_all()
+    saved_user = db.get(User, user.id)
+    assert saved_user.profile_photo_key
+    stored_path = web.profile_photo_path(saved_user.profile_photo_key)
+    assert stored_path.read_bytes() == png
+
+    photo = client.get("/profile/photo")
+    assert photo.status_code == 200
+    assert photo.content == png
+    assert photo.headers["content-type"] == "image/png"
+    assert photo.headers["cache-control"] == "private, no-cache"
+    assert '/profile/photo?v=' in client.get("/profile").text
+    saved_profile = client.get("/profile").text
+    assert 'class="user-menu-avatar has-photo"' in saved_profile
+    assert 'fetchpriority="high" decoding="sync"' in saved_profile
+    assert 'class="profile-avatar profile-avatar-large has-photo"' in saved_profile
+
+    other_client = TestClient(web.app)
+    other_client.cookies.set("ai_session", other_raw)
+    assert other_client.get("/profile/photo").status_code == 404
+
+    removed = client.post(
+        "/profile",
+        data={**form, "remove_profile_photo": "true"},
+        follow_redirects=False,
+    )
+    assert removed.status_code == 303
+    db.expire_all()
+    assert db.get(User, user.id).profile_photo_key is None
+    assert not stored_path.exists()
+    assert client.get("/profile/photo").status_code == 404
+
+    invalid = client.post(
+        "/profile",
+        data=form,
+        files={"profile_photo": ("avatar.png", b"not-an-image", "image/png")},
+    )
+    assert invalid.status_code == 200
+    assert "does not match its PNG, JPEG or WebP type" in invalid.text
 
 
 def test_api_key_page_builds_codex_setup_command_without_revealing_stored_secrets(db):
@@ -1541,7 +1703,7 @@ def test_admin_models_guided_catalog_registers_all_reviewed_capabilities(db):
     assert 'class="secondary catalog-refresh-button"' in page.text
     assert 'aria-label="Refresh stable catalog"' in page.text
     assert "/static/models-guided.js?v=1.2.0-jobs1" in page.text
-    assert "/static/i18n.js?v=1.2.0-feature-scopes1" in page.text
+    assert "/static/i18n.js?v=1.2.0-profile-avatar1" in page.text
 
     response = client.post(
         "/admin/models/catalog",

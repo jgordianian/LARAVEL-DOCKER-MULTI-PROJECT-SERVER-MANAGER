@@ -91,6 +91,8 @@ BRANDING_ROOT = DATA_ROOT / "generated" / "branding"
 BRANDING_ROOT.mkdir(parents=True, exist_ok=True)
 CHAT_ATTACHMENTS_ROOT = DATA_ROOT / "generated" / "chat-attachments"
 CHAT_ATTACHMENTS_ROOT.mkdir(parents=True, exist_ok=True)
+PROFILE_PHOTOS_ROOT = DATA_ROOT / "generated" / "profile-photos"
+PROFILE_PHOTOS_ROOT.mkdir(parents=True, exist_ok=True)
 templates = Jinja2Templates(directory=str(BASE / "templates"))
 redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
 logger = logging.getLogger("ai.web")
@@ -113,6 +115,7 @@ MAX_BRAND_ASSET_BYTES = 2 * 1024 * 1024
 MAX_CHAT_IMAGES = 10
 MAX_CHAT_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_CHAT_IMAGE_TOTAL_BYTES = 60 * 1024 * 1024
+MAX_PROFILE_PHOTO_BYTES = 2 * 1024 * 1024
 CHAT_IMAGE_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -307,6 +310,34 @@ def chat_image_extension(body: bytes, declared_media_type: str) -> str:
     return CHAT_IMAGE_TYPES[detected]
 
 
+def profile_photo_path(storage_key: str) -> Path:
+    key = str(storage_key or "")
+    if not key or Path(key).name != key:
+        raise HTTPException(404, "profile photo not found")
+    return PROFILE_PHOTOS_ROOT / key
+
+
+def user_initials(name: str) -> str:
+    parts = [part for part in re.split(r"\s+", str(name or "").strip()) if part]
+    return "".join(part[0] for part in parts[:2]).upper() or "U"
+
+
+def save_profile_photo(user_id: int, upload: UploadFile) -> str:
+    body = upload.file.read(MAX_PROFILE_PHOTO_BYTES + 1)
+    if not body:
+        raise HTTPException(422, "select a profile picture to upload")
+    if len(body) > MAX_PROFILE_PHOTO_BYTES:
+        raise HTTPException(422, "profile pictures cannot exceed 2 MB")
+    extension = chat_image_extension(body, str(upload.content_type or "").lower())
+    storage_key = f"user-{user_id}-{secrets.token_hex(16)}.{extension}"
+    destination = profile_photo_path(storage_key)
+    temporary = PROFILE_PHOTOS_ROOT / f".{storage_key}.tmp"
+    temporary.write_bytes(body)
+    temporary.chmod(0o600)
+    temporary.replace(destination)
+    return storage_key
+
+
 def decode_chat_images(value: Any) -> list[dict[str, Any]]:
     if value in (None, []):
         return []
@@ -419,6 +450,7 @@ def render(request: Request, name: str, session: WebSession | None = None, **con
             **presentation,
             "locale": locale,
             "language_return_path": return_path,
+            "profile_initials": user_initials(session.user.name) if session else "",
             **context,
         },
     )
@@ -788,6 +820,27 @@ def profile_page(request: Request, result: str = "", db: Session = Depends(get_d
     return profile_response(request, session, db, notice=notices.get(result))
 
 
+@app.get("/profile/photo")
+def profile_photo(request: Request, db: Session = Depends(get_db)):
+    session = require_session(request, db)
+    if not session.user.profile_photo_key:
+        raise HTTPException(404, "profile photo not found")
+    path = profile_photo_path(session.user.profile_photo_key)
+    if not path.is_file():
+        raise HTTPException(404, "profile photo not found")
+    media_types = {".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp"}
+    media_type = media_types.get(path.suffix.lower())
+    if media_type is None:
+        raise HTTPException(404, "profile photo not found")
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename="profile-photo" + path.suffix.lower(),
+        content_disposition_type="inline",
+        headers={"Cache-Control": "private, no-cache"},
+    )
+
+
 @app.post("/profile", response_class=HTMLResponse)
 def profile_update(
     request: Request,
@@ -798,6 +851,8 @@ def profile_update(
     reasoning_effort: str = Form("medium"),
     system_prompt: str = Form(""),
     current_password: str = Form(""),
+    profile_photo: UploadFile | None = File(None),
+    remove_profile_photo: bool = Form(False),
     csrf_token: str = Form(),
     db: Session = Depends(get_db),
 ):
@@ -836,7 +891,16 @@ def profile_update(
         error = "Current password is required to change your email address."
     if not error and email_changed and db.scalar(select(User).where(func.lower(User.email) == normalized_email, User.id != session.user_id)):
         error = "Email already exists."
+    photo_upload_requested = bool(profile_photo and profile_photo.filename)
+    new_profile_photo_key = None
+    if not error and photo_upload_requested and not remove_profile_photo:
+        try:
+            new_profile_photo_key = save_profile_photo(session.user_id, profile_photo)
+        except HTTPException as exc:
+            error = str(exc.detail)
     if error:
+        if new_profile_photo_key:
+            profile_photo_path(new_profile_photo_key).unlink(missing_ok=True)
         return profile_response(request, session, db, error=error, values=draft)
 
     before = {
@@ -846,13 +910,19 @@ def profile_update(
         "default_model_alias": session.user.default_model_alias,
         "reasoning_effort": session.user.reasoning_effort,
         "system_prompt_configured": bool(session.user.system_prompt),
+        "profile_photo_configured": bool(session.user.profile_photo_key),
     }
+    previous_profile_photo_key = session.user.profile_photo_key
     session.user.name = draft["name"]
     session.user.email = normalized_email
     session.user.preferred_language = draft["preferred_language"] or None
     session.user.default_model_alias = draft["default_model_alias"] or None
     session.user.reasoning_effort = draft["reasoning_effort"]
     session.user.system_prompt = draft["system_prompt"] or None
+    if remove_profile_photo:
+        session.user.profile_photo_key = None
+    elif new_profile_photo_key:
+        session.user.profile_photo_key = new_profile_photo_key
     if email_changed:
         db.query(WebSession).filter(WebSession.user_id == session.user_id, WebSession.id != session.id).delete(synchronize_session=False)
     audit(
@@ -870,10 +940,22 @@ def profile_update(
             "default_model_alias": session.user.default_model_alias,
             "reasoning_effort": session.user.reasoning_effort,
             "system_prompt_configured": bool(session.user.system_prompt),
+            "profile_photo_configured": bool(session.user.profile_photo_key),
             "other_sessions_terminated": email_changed,
         },
     )
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        if new_profile_photo_key:
+            profile_photo_path(new_profile_photo_key).unlink(missing_ok=True)
+        raise
+    if previous_profile_photo_key and previous_profile_photo_key != session.user.profile_photo_key:
+        try:
+            profile_photo_path(previous_profile_photo_key).unlink(missing_ok=True)
+        except HTTPException:
+            logger.warning("Ignoring invalid stored profile photo key for user %s", session.user_id)
     return RedirectResponse("/profile?result=saved", 303)
 
 
@@ -1019,23 +1101,44 @@ async def portal_chat(request: Request, db: Session = Depends(get_db)):
     verify_csrf(request, session, str(data.get("csrf_token", "")))
     conversation_id = int(data.get("conversation_id", 0))
     regenerate = bool(data.get("regenerate", False))
+    raw_edit_message_id = data.get("edit_message_id")
+    try:
+        edit_message_id = int(raw_edit_message_id) if raw_edit_message_id not in {None, ""} else None
+    except (TypeError, ValueError):
+        raise HTTPException(422, "edit message ID is invalid") from None
+    if regenerate and edit_message_id is not None:
+        raise HTTPException(422, "a message cannot be edited while regenerating a response")
     content = str(data.get("content", "")).strip()
     raw_attachments = data.get("attachments", [])
     if regenerate and raw_attachments:
         raise HTTPException(422, "images cannot be added while regenerating a response")
     images = [] if regenerate else decode_chat_images(raw_attachments)
-    if not regenerate and not content and not images:
+    if not regenerate and edit_message_id is None and not content and not images:
         raise HTTPException(422, "add a message or at least one image")
     if len(content.encode("utf-8")) > settings.max_request_bytes:
         raise HTTPException(422, "message is too large")
     conversation = db.scalar(select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == session.user_id))
     if conversation is None:
         raise HTTPException(404, "conversation not found")
+    edit_message = None
+    if edit_message_id is not None:
+        edit_message = db.scalar(
+            select(Message).where(
+                Message.id == edit_message_id,
+                Message.conversation_id == conversation.id,
+                Message.role == "user",
+            )
+        )
+        if edit_message is None:
+            raise HTTPException(404, "user message to edit was not found")
+        if not content and not images and not edit_message.attachments:
+            raise HTTPException(422, "add a message or at least one image")
     allowed = {model.alias: model for model in permitted_models(db, session.user_id)}
     selected_model = allowed.get(conversation.model_alias)
     if selected_model is None:
         raise HTTPException(409, "the selected model is no longer available")
-    if images and "vision" not in model_capabilities(selected_model):
+    has_image_input = bool(images or (edit_message is not None and not images and edit_message.attachments))
+    if has_image_input and "vision" not in model_capabilities(selected_model):
         raise HTTPException(422, "the selected model does not support image inputs")
     reasoning_effort = normalized_reasoning_effort(data.get("reasoning_effort", session.user.reasoning_effort))
     if reasoning_effort != "none" and "reasoning" not in model_capabilities(selected_model):
@@ -1050,6 +1153,66 @@ async def portal_chat(request: Request, db: Session = Depends(get_db)):
         if last_assistant is None:
             raise HTTPException(409, "there is no assistant response to regenerate")
         db.delete(last_assistant)
+    elif edit_message is not None:
+        discarded_messages = db.scalars(
+            select(Message)
+            .where(
+                Message.conversation_id == conversation.id,
+                or_(
+                    Message.created_at > edit_message.created_at,
+                    (Message.created_at == edit_message.created_at) & (Message.id > edit_message.id),
+                ),
+            )
+            .order_by(Message.created_at, Message.id)
+        ).all()
+        obsolete_paths = [
+            chat_attachment_path(attachment.storage_key)
+            for message in discarded_messages
+            for attachment in message.attachments
+        ]
+        replaced_paths: list[Path] = []
+        stored_paths: list[Path] = []
+        try:
+            for message in discarded_messages:
+                db.delete(message)
+            edit_message.content = content
+            if images:
+                replaced_paths = [chat_attachment_path(attachment.storage_key) for attachment in edit_message.attachments]
+                for attachment in list(edit_message.attachments):
+                    db.delete(attachment)
+                db.flush()
+                for image in images:
+                    storage_key = f"{secrets.token_hex(16)}.{image['extension']}"
+                    destination = chat_attachment_path(storage_key)
+                    temporary = CHAT_ATTACHMENTS_ROOT / f".{storage_key}.tmp"
+                    temporary.write_bytes(image["body"])
+                    temporary.chmod(0o600)
+                    temporary.replace(destination)
+                    stored_paths.append(destination)
+                    db.add(MessageAttachment(
+                        message_id=edit_message.id,
+                        filename=image["filename"],
+                        media_type=image["media_type"],
+                        storage_key=storage_key,
+                        size_bytes=len(image["body"]),
+                        sha256=hashlib.sha256(image["body"]).hexdigest(),
+                    ))
+            conversation.updated_at = datetime.now(timezone.utc)
+            first_user_message = db.scalar(
+                select(Message)
+                .where(Message.conversation_id == conversation.id, Message.role == "user")
+                .order_by(Message.created_at, Message.id)
+            )
+            if first_user_message is not None and first_user_message.id == edit_message.id:
+                conversation.title = re.sub(r"\s+", " ", content)[:80] if content else "Image conversation"
+            db.commit()
+        except Exception:
+            db.rollback()
+            for path in stored_paths:
+                path.unlink(missing_ok=True)
+            raise
+        for path in obsolete_paths + replaced_paths:
+            path.unlink(missing_ok=True)
     else:
         user_message = Message(conversation_id=conversation.id, role="user", content=content)
         db.add(user_message)
@@ -1141,7 +1304,11 @@ async def portal_chat(request: Request, db: Session = Depends(get_db)):
                     ))
                     write_db.commit()
 
-    return StreamingResponse(relay(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
+    persisted_user_message_id = edit_message.id if edit_message is not None else (user_message.id if not regenerate else None)
+    response_headers = {"X-Accel-Buffering": "no"}
+    if persisted_user_message_id is not None:
+        response_headers["X-AI-User-Message-ID"] = str(persisted_user_message_id)
+    return StreamingResponse(relay(), media_type="text/event-stream", headers=response_headers)
 
 
 @app.get("/admin", response_class=HTMLResponse)

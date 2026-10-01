@@ -8,10 +8,33 @@
   {% if notice %}<div class="alert success">{{ notice }}</div>{% endif %}
   {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
 
-  <article class="panel">
-    <h2>Personal information</h2>
-    <form method="post" action="/profile" class="stack">
-      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+  <form method="post" action="/profile" enctype="multipart/form-data" class="profile-form stack">
+    <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+    <article class="panel profile-identity-card">
+      <div class="profile-identity">
+        <div class="profile-avatar profile-avatar-large{% if session.user.profile_photo_key %} has-photo{% endif %}">
+          {% if session.user.profile_photo_key %}<img id="profile-photo-preview" src="/profile/photo?v={{ session.user.updated_at.timestamp()|int }}" alt="{{ session.user.name }}" width="80" height="80" decoding="async">{% else %}<span id="profile-photo-fallback">{{ profile_initials }}</span><img id="profile-photo-preview" alt="{{ session.user.name }}" hidden>{% endif %}
+        </div>
+        <div class="profile-identity-copy">
+          <h2>{{ session.user.name }}</h2>
+          <p>{{ session.user.email }}</p>
+          <span class="profile-role">{{ session.user.role|replace('_', ' ')|title }}</span>
+        </div>
+      </div>
+      <div class="profile-photo-control">
+        <strong>Profile picture</strong>
+        <div class="profile-photo-actions">
+          <input id="profile-photo-input" name="profile_photo" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+          <label for="profile-photo-input" class="secondary profile-photo-upload"><span aria-hidden="true">↑</span> Upload image</label>
+          {% if session.user.profile_photo_key %}<button name="remove_profile_photo" value="true" type="submit" class="danger"><span aria-hidden="true">×</span> Remove profile picture</button>{% endif %}
+        </div>
+        <small id="profile-photo-filename">No file selected</small>
+        <small>PNG, JPEG or WebP · Maximum 2 MB</small>
+      </div>
+    </article>
+
+    <article class="panel">
+      <h2>Personal information</h2>
       <div class="form-grid">
         <label>Display name<input name="name" value="{{ profile_values.name }}" maxlength="160" autocomplete="name" required></label>
         <label>Email address<input name="email" type="email" value="{{ profile_values.email }}" maxlength="320" autocomplete="email" required></label>
@@ -22,8 +45,8 @@
       </div>
       <label>Personal system prompt<textarea name="system_prompt" rows="5" maxlength="12000" placeholder="Optional instructions applied to your conversations.">{{ profile_values.system_prompt }}</textarea></label>
       <button class="primary">Save profile</button>
-    </form>
-  </article>
+    </article>
+  </form>
 
   <article class="panel">
     <h2>Account</h2>
@@ -50,3 +73,4 @@
   </article>
 </section>
 {% endblock %}
+{% block scripts %}<script src="/static/profile.js?v=1.2.0-profile-preview2" defer></script>{% endblock %}

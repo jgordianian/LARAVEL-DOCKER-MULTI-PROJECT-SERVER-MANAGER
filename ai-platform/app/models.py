@@ -36,6 +36,7 @@ class User(TimestampMixin, Base):
     system_prompt: Mapped[str | None] = mapped_column(Text)
     reasoning_effort: Mapped[str] = mapped_column(String(16), default="medium", nullable=False)
     preferred_language: Mapped[str | None] = mapped_column(String(8))
+    profile_photo_key: Mapped[str | None] = mapped_column(String(96))
 
 
 class WebSession(Base):

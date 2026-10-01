@@ -6,8 +6,9 @@
   <title>{% block title %}{{ branding.browser_title }}{% endblock %}</title>
   {% if branding.favicon_url %}<link rel="icon" href="{{ branding.favicon_url }}">{% endif %}
   <link rel="stylesheet" href="/static/app.css?v=1.2.0-localization2">
-  <link rel="stylesheet" href="/static/chat-extra.css?v=1.2.0-chat-layout2">
-  <script src="/static/i18n.js?v=1.2.0-feature-scopes1" defer></script>
+  <link rel="stylesheet" href="/static/chat-extra.css?v=1.2.0-profile-avatar2">
+  <script src="/static/i18n.js?v=1.2.0-profile-avatar1" defer></script>
+  <script src="/static/navigation.js?v=1.2.0-profile-avatar1" defer></script>
 </head>
 <body>
 {% if session %}
@@ -35,8 +36,19 @@
     </details>
     {% if settings.chat_portal_enabled %}<a href="/">Chat</a>{% endif %}
     {% if session.user.role in ['super_admin', 'administrator'] and settings.admin_panel_enabled %}<a href="/admin">Administration</a>{% endif %}
-    <a href="{% if session.user.force_password_reset %}/profile/password{% else %}/profile{% endif %}">Profile</a>
-    <form method="post" action="/logout" class="inline"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="link-button">Sign out</button></form>
+    <details class="user-menu">
+      <summary aria-label="User menu" title="User menu">
+        <span class="user-menu-avatar{% if session.user.profile_photo_key %} has-photo{% endif %}">
+          {% if session.user.profile_photo_key %}<img src="/profile/photo?v={{ session.user.updated_at.timestamp()|int }}" alt="{{ session.user.name }}" width="32" height="32" fetchpriority="high" decoding="sync">{% else %}<span>{{ profile_initials }}</span>{% endif %}
+        </span>
+        <span class="user-menu-name">{{ session.user.name }}</span>
+        <span class="language-chevron" aria-hidden="true"></span>
+      </summary>
+      <div class="user-menu-options">
+        <a href="{% if session.user.force_password_reset %}/profile/password{% else %}/profile{% endif %}"><span class="user-menu-item-icon" aria-hidden="true">◎</span><span>Profile</span></a>
+        <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button type="submit"><span class="user-menu-item-icon" aria-hidden="true">↪</span><span>Sign out</span></button></form>
+      </div>
+    </details>
   </nav>
 </header>
 {% endif %}

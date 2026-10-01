@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from docker.errors import NotFound
 
+from app import cli
 from app.config import Settings
 from app.models import ModelInstance, ModelRecord
 from app.runtime import ModelRuntime, NativeModelRuntime, RuntimeOperationError, activation_plan, build_vllm_args, compatibility_analysis, container_name_for, managed_model_root, supported_vllm_flags
@@ -216,6 +217,36 @@ def test_deactivation_stops_runtime_but_preserves_model(db):
     assert model.instance.desired_active is False
     assert db.get(ModelRecord, model.id) is not None
     assert container.status == "exited"
+
+
+def test_reconcile_preserves_desired_active_after_transient_start_failure(db, monkeypatch):
+    model, instance = model_pair()
+    instance.desired_active = True
+    instance.status = "ready"
+    db.add(model)
+    db.commit()
+
+    class FailingRuntime:
+        @staticmethod
+        def status(_model):
+            return {"healthy": False}
+
+        @staticmethod
+        def activate(candidate, wait_seconds=600):
+            del wait_seconds
+            candidate.instance.desired_active = False
+            candidate.instance.status = "error"
+            raise RuntimeOperationError("transient startup failure")
+
+    monkeypatch.setattr(cli, "ModelRuntime", lambda *_args, **_kwargs: FailingRuntime())
+    args = cli.build_parser().parse_args(["models", "reconcile", "--wait-seconds", "1"])
+
+    cli.cmd_models(args)
+
+    db.expire_all()
+    restored = db.get(ModelRecord, model.id)
+    assert restored.instance.desired_active is True
+    assert restored.instance.status == "error"
 
 
 def test_low_vram_plan_and_switch_preserve_both_downloaded_models(db, tmp_path, monkeypatch):

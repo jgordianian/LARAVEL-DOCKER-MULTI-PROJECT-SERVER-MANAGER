@@ -21,11 +21,16 @@
   let aborter = null;
   let savedReasoning = reasoning.dataset.savedValue || reasoning.value;
   let pendingImages = [];
+  let editingMessageId = null;
   let imageStatusError = '';
   const MAX_IMAGES = 10;
   const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
   const MAX_TOTAL_IMAGE_BYTES = 60 * 1024 * 1024;
   const translate = value => window.aiTranslate ? window.aiTranslate(value) : value;
+  const clearEditing = () => {
+    editingMessageId = null;
+    send.textContent = translate('Send');
+  };
 
   const modelSupportsReasoning = () => model.selectedOptions[0]?.dataset.reasoning === 'true';
   const modelSupportsVision = () => model.selectedOptions[0]?.dataset.vision === 'true';
@@ -230,6 +235,20 @@
     regenerate.addEventListener('click', () => generate('', true));
     actions.append(copy, regenerate);
   };
+  const addUserActions = (actions, row) => {
+    if (actions.childElementCount || !row.dataset.messageId) return;
+    const edit = document.createElement('button');
+    edit.type = 'button'; edit.textContent = 'Edit & resend';
+    edit.addEventListener('click', () => {
+      if (aborter) return;
+      editingMessageId = Number(row.dataset.messageId);
+      prompt.value = row.dataset.content;
+      prompt.dispatchEvent(new Event('input'));
+      send.textContent = translate('Resend');
+      prompt.focus();
+    });
+    actions.appendChild(edit);
+  };
   const renderAttachments = (container, attachments) => {
     if (!attachments?.length) return;
     const gallery = document.createElement('div');
@@ -249,11 +268,12 @@
     });
     container.appendChild(gallery);
   };
-  const bubble = (role, content = '', createdAt = null, final = true, attachments = []) => {
+  const bubble = (role, content = '', createdAt = null, final = true, attachments = [], messageId = null) => {
     messages.querySelector('.empty')?.remove();
     const row = document.createElement('div');
     row.className = `message ${role}`;
     row.dataset.content = content;
+    if (messageId) row.dataset.messageId = messageId;
     row.innerHTML = `<div class="avatar">${role === 'assistant' ? 'AI' : 'YOU'}</div><div><div class="message-content"></div><div class="message-meta"><time></time><span class="message-actions"></span></div></div>`;
     const target = row.querySelector('.message-content');
     renderContent(target, content);
@@ -261,10 +281,7 @@
     row.querySelector('time').textContent = createdAt ? new Date(createdAt).toLocaleString() : new Date().toLocaleTimeString();
     const actions = row.querySelector('.message-actions');
     if (role === 'user') {
-      const edit = document.createElement('button');
-      edit.type = 'button'; edit.textContent = 'Edit & resend';
-      edit.addEventListener('click', () => { prompt.value = row.dataset.content; prompt.focus(); });
-      actions.appendChild(edit);
+      addUserActions(actions, row);
     } else if (final) {
       addAssistantActions(actions, row);
     }
@@ -273,6 +290,7 @@
     return {target, row, actions};
   };
   const emptyState = () => {
+    clearEditing();
     messages.innerHTML = '<div class="empty"><div class="mark">AI</div><h1>How can I help?</h1><p>Choose an active permitted model and start a private conversation.</p></div>';
     document.getElementById('chat-title').textContent = 'New conversation';
     rename.hidden = true; remove.hidden = true;
@@ -308,6 +326,7 @@
     const response = await fetch(`/api/conversations/${id}`);
     if (!response.ok) return;
     const data = await response.json();
+    clearEditing();
     conversationId = data.id;
     model.value = data.model;
     syncReasoningAvailability();
@@ -316,15 +335,32 @@
     document.getElementById('chat-title').textContent = data.title;
     rename.hidden = false; remove.hidden = false;
     messages.innerHTML = '';
-    data.messages.forEach(item => bubble(item.role, item.content, item.created_at, true, item.attachments));
+    data.messages.forEach(item => bubble(item.role, item.content, item.created_at, true, item.attachments, item.id));
     document.querySelectorAll('.conversation').forEach(button => button.classList.toggle('active', Number(button.dataset.id) === data.id));
     history.replaceState({}, '', `/?conversation=${conversationId}`);
   };
   const generate = async (content, regenerate = false, attachments = []) => {
-    if (aborter || (!regenerate && !content && !attachments.length)) return;
+    if (aborter || (!regenerate && !editingMessageId && !content && !attachments.length)) return;
     if (!conversationId) await createConversation();
-    if (!regenerate) bubble('user', content, null, true, attachments);
-    else messages.querySelector('.message.assistant:last-of-type')?.remove();
+    const editMessageId = regenerate ? null : editingMessageId;
+    let userOutput = null;
+    if (!regenerate && !editMessageId) userOutput = bubble('user', content, null, true, attachments);
+    else if (editMessageId) {
+      const editedRow = [...messages.querySelectorAll('.message.user')].find(row => Number(row.dataset.messageId) === editMessageId);
+      if (!editedRow) return;
+      const target = editedRow.querySelector('.message-content');
+      const originalGallery = target.querySelector('.message-images');
+      editedRow.dataset.content = content;
+      renderContent(target, content);
+      if (attachments.length) renderAttachments(target, attachments);
+      else if (originalGallery) target.appendChild(originalGallery);
+      let following = editedRow.nextElementSibling;
+      while (following) {
+        const next = following.nextElementSibling;
+        following.remove();
+        following = next;
+      }
+    } else messages.querySelector('.message.assistant:last-of-type')?.remove();
     prompt.value = ''; prompt.style.height = 'auto';
     const output = bubble('assistant', '', null, false);
     showThinking(output);
@@ -333,13 +369,19 @@
     try {
       const response = await fetch('/api/chat', {
         method: 'POST', headers: {'Content-Type':'application/json'}, signal:aborter.signal,
-        body: JSON.stringify({conversation_id:conversationId, content, attachments, regenerate, reasoning_effort:effectiveReasoning(), csrf_token:csrf})
+        body: JSON.stringify({conversation_id:conversationId, content, attachments, regenerate, edit_message_id:editMessageId, reasoning_effort:effectiveReasoning(), csrf_token:csrf})
       });
       if (!response.ok) {
         const err = await response.json();
         throw new Error(err.error?.message || err.detail || 'Generation failed');
       }
+      const persistedUserMessageId = response.headers.get('X-AI-User-Message-ID');
+      if (userOutput && persistedUserMessageId) {
+        userOutput.row.dataset.messageId = persistedUserMessageId;
+        addUserActions(userOutput.actions, userOutput.row);
+      }
       if (!regenerate) clearPendingImages();
+      if (editMessageId) clearEditing();
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -380,6 +422,7 @@
       } else {
         output.row.dataset.content = `Error: ${error.message}`;
         renderContent(output.target, output.row.dataset.content);
+        if (editMessageId) await loadConversation(conversationId);
       }
     } finally {
       if (output.row.isConnected && output.row.dataset.content) addAssistantActions(output.actions, output.row);

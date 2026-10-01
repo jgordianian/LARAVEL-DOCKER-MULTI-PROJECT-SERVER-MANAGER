@@ -64,10 +64,34 @@ def test_native_cloudflared_supervision_uses_protected_token_file():
     assert "relative_to(SECRETS_ROOT.resolve())" in body
 
 
+def test_native_supervisor_reconciles_previously_active_models_after_restart():
+    platform_root = Path(__file__).resolve().parents[1]
+    runtime_source = (platform_root / "scripts" / "native_runtime.py").read_text(encoding="utf-8")
+
+    assert "[program:model_reconcile]" in runtime_source
+    assert "models reconcile --wait-seconds 600" in runtime_source
+    assert "autostart=true" in runtime_source
+    assert "autorestart=false" in runtime_source
+    assert "startsecs=0" in runtime_source
+
+
 def test_native_example_defaults_to_private_external_exposure():
     environment = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
     assert "EXTERNAL_EXPOSURE_MODE=none" in environment
     assert "CLOUDFLARED_TOKEN_FILE=/opt/vllm-ai-platform/secrets/cloudflare_tunnel_token" in environment
+
+
+def test_provider_supervisor_bootstraps_the_native_platform_after_instance_restart():
+    platform_root = Path(__file__).resolve().parents[1]
+    configuration = (
+        platform_root / "deploy" / "supervisor" / "omnivis-ai-platform.conf"
+    ).read_text(encoding="utf-8")
+
+    assert "[program:omnivis_ai_platform]" in configuration
+    assert "supervisord -n -c /opt/vllm-ai-platform/native/supervisord.conf" in configuration
+    assert "autostart=true" in configuration
+    assert "autorestart=unexpected" in configuration
+    assert "stopasgroup=true" in configuration
 
 
 def test_native_cli_runs_as_the_service_account():

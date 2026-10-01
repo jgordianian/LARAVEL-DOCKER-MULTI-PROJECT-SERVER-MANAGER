@@ -191,6 +191,7 @@ def cmd_models(args) -> None:
             ).all()
             results = []
             for candidate in candidates:
+                desired_active = bool(candidate.instance and candidate.instance.desired_active)
                 current = runtime.status(candidate)
                 if current.get("healthy"):
                     candidate.instance.status = "ready"
@@ -200,6 +201,14 @@ def cmd_models(args) -> None:
                     result = runtime.activate(candidate, wait_seconds=args.wait_seconds)
                     results.append({"model": candidate.alias, "status": result["status"], "action": "started"})
                 except RuntimeOperationError as exc:
+                    # Reconciliation implements desired state. A transient
+                    # startup failure must not silently turn an active model
+                    # into an administratively deactivated one, otherwise the
+                    # next service/instance restart can never retry it.
+                    if candidate.instance is not None and (desired_active or candidate.auto_start):
+                        candidate.instance.desired_active = True
+                        candidate.instance.status = "error"
+                        db.commit()
                     results.append({"model": candidate.alias, "status": "error", "error": str(exc)})
             db.commit()
             print_json(results)

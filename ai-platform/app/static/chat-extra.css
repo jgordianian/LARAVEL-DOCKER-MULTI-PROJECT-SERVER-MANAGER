@@ -68,6 +68,48 @@
 .profile-page > .heading { margin-bottom: 24px; }
 .profile-page > .heading .muted { margin-bottom: 0; }
 .profile-page .panel { margin-block: 18px; }
+.profile-form { margin-top: 0; }
+.profile-form > .panel { margin-block: 0; }
+.profile-identity-card { display: flex; align-items: center; justify-content: space-between; gap: 28px; }
+.profile-identity { min-width: 0; display: flex; align-items: center; gap: 16px; }
+.profile-avatar { display: grid; place-items: center; flex: 0 0 auto; overflow: hidden; border: 1px solid var(--line); border-radius: 50%; background: linear-gradient(135deg, #1d2a47, #0c1428); color: var(--brand); font-weight: 800; text-transform: uppercase; }
+.profile-avatar.has-photo { background: #0c1428; }
+.profile-avatar img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.profile-avatar img[hidden] { display: none; }
+.profile-avatar-large { width: 80px; height: 80px; font-size: 22px; }
+.profile-identity-copy { min-width: 0; }
+.profile-identity-copy h2 { overflow: hidden; margin: 0; font-size: 18px; text-overflow: ellipsis; white-space: nowrap; }
+.profile-identity-copy p { margin: 4px 0 9px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.profile-role { display: inline-flex; border-radius: 999px; padding: 4px 8px; background: var(--panel2); color: var(--muted); font-size: 10px; font-weight: 700; }
+.profile-photo-control { min-width: min(330px, 100%); display: grid; gap: 8px; }
+.profile-photo-control > strong { font-size: 13px; }
+.profile-photo-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.profile-photo-actions .secondary, .profile-photo-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 40px; }
+.profile-photo-upload { cursor: pointer; }
+.profile-photo-control small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-menu { position: relative; margin: 0; }
+.user-menu > summary { min-height: 42px; max-width: 230px; display: flex; align-items: center; gap: 9px; padding: 4px 10px 4px 5px; border: 1px solid var(--line); border-radius: 11px; background: #0c1428; color: var(--text); cursor: pointer; list-style: none; user-select: none; }
+.user-menu > summary::-webkit-details-marker { display: none; }
+.user-menu > summary:hover { border-color: #3a4d75; background: #101a31; }
+.user-menu > summary:focus-visible, .user-menu[open] > summary { border-color: var(--brand2); box-shadow: 0 0 0 3px #5a8cff20; outline: none; }
+.user-menu-avatar { width: 32px; height: 32px; flex: 0 0 32px; display: grid; place-items: center; overflow: hidden; border-radius: 50%; background: linear-gradient(135deg, var(--brand), var(--brand2)); color: #07121c; font-size: 11px; font-weight: 850; }
+.user-menu-avatar.has-photo { background: #0c1428; }
+.user-menu-avatar img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.user-menu-name { max-width: 125px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-menu-options { position: absolute; top: calc(100% + 7px); right: 0; z-index: 40; width: 210px; display: grid; gap: 3px; padding: 6px; border: 1px solid var(--line); border-radius: 12px; background: #10182b; box-shadow: 0 18px 45px #02050dbf; }
+.user-menu-options a, .user-menu-options button { width: 100%; min-height: 38px; display: flex; align-items: center; gap: 9px; border: 0; border-radius: 8px; padding: 9px 10px; background: transparent; color: var(--muted); text-align: left; font-size: 12px; }
+.user-menu-options a:hover, .user-menu-options a:focus-visible, .user-menu-options button:hover, .user-menu-options button:focus-visible { background: var(--panel2); color: var(--text); outline: none; }
+.user-menu-item-icon { width: 17px; color: var(--brand); text-align: center; font-size: 15px; }
+@media (max-width: 850px) {
+  .profile-identity-card { align-items: stretch; flex-direction: column; }
+  .profile-photo-control { min-width: 0; }
+  .topbar nav .user-menu-options a { display: flex; }
+  .user-menu-name { display: none; }
+}
+@media (max-width: 520px) {
+  .profile-avatar-large { width: 64px; height: 64px; font-size: 18px; }
+  .profile-photo-actions > * { width: 100%; }
+}
 .language-menu { position: relative; margin: 0; }
 .language-menu > summary {
   display: flex;

@@ -237,6 +237,22 @@ redirect_stderr=true
 stdout_logfile={LOG_ROOT / 'web.log'}
 stdout_logfile_maxbytes=20MB
 stdout_logfile_backups=5
+
+[program:model_reconcile]
+command={python} -m app.cli models reconcile --wait-seconds 600
+directory={PLATFORM_ROOT}
+user={service_user}
+priority=35
+autostart=true
+autorestart=false
+startsecs=0
+exitcodes=0
+stopasgroup=true
+killasgroup=true
+redirect_stderr=true
+stdout_logfile={LOG_ROOT / 'model-reconcile.log'}
+stdout_logfile_maxbytes=20MB
+stdout_logfile_backups=5
 {cloudflared_program}
 """
     atomic_private_write(SUPERVISOR_CONFIG, supervisor_body)
