@@ -548,7 +548,7 @@ def test_reasoning_preference_is_persisted_and_sent_to_gateway(db, monkeypatch):
     assert '<option value="high" selected' in page.text
     assert 'data-saved-value="high"' in page.text
     assert 'src="/static/chat.js?v=1.2.0-edit-resend1"' in page.text
-    assert 'href="/static/chat-extra.css?v=1.2.0-profile-avatar2"' in page.text
+    assert 'href="/static/chat-extra.css?v=1.2.0-mfa1"' in page.text
     assert '<footer class="chat-footer">' in page.text
 
 
@@ -781,7 +781,7 @@ def test_global_and_per_user_language_preferences(db):
     inherited = client.get("/")
     assert inherited.status_code == 200
     assert '<html lang="es">' in inherited.text
-    assert 'src="/static/i18n.js?v=1.2.0-profile-avatar1"' in inherited.text
+    assert 'src="/static/i18n.js?v=1.2.0-mfa1"' in inherited.text
     assert 'class="language-menu"' in inherited.text
     assert '<span class="language-current">System</span>' in inherited.text
     assert 'name="preferred_language" value="" class="selected" aria-current="true"' in inherited.text
@@ -1703,7 +1703,7 @@ def test_admin_models_guided_catalog_registers_all_reviewed_capabilities(db):
     assert 'class="secondary catalog-refresh-button"' in page.text
     assert 'aria-label="Refresh stable catalog"' in page.text
     assert "/static/models-guided.js?v=1.2.0-jobs1" in page.text
-    assert "/static/i18n.js?v=1.2.0-profile-avatar1" in page.text
+    assert "/static/i18n.js?v=1.2.0-mfa1" in page.text
 
     response = client.post(
         "/admin/models/catalog",

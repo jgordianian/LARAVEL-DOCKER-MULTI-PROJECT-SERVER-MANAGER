@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Configure multi-factor authentication · {{ branding.browser_title }}{% endblock %}
+{% block content %}
+<section class="mfa-page mfa-setup-page">
+  <article class="panel mfa-enrollment-card">
+    <div class="mfa-card-header">
+      <span class="mfa-icon" aria-hidden="true">✓</span>
+      <div><h1>Set up your authenticator</h1><p class="muted">Use Google Authenticator, Microsoft Authenticator or another TOTP-compatible application.</p></div>
+    </div>
+    <div class="mfa-setup-grid">
+      <div class="mfa-qr-column">
+        <div class="mfa-qr"><img src="{{ qr_data_uri }}" alt="MFA setup QR code" width="240" height="240"></div>
+        <form method="post" action="/mfa/setup/regenerate">
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <button class="link-button">Generate a new QR code</button>
+        </form>
+      </div>
+      <div>
+        {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+        {% if mfa_required and mfa_grace %}
+        <div class="alert {{ 'error' if mfa_grace.expired else 'warning' }}">
+          {% if mfa_grace.expired %}Your grace period has expired. Configure MFA to continue.{% else %}You may postpone setup for {{ mfa_grace.days_remaining }} more day(s).{% endif %}
+        </div>
+        {% endif %}
+        <ol class="mfa-steps">
+          <li><span>1</span><p>Open your authenticator application and choose the option to scan a QR code.</p></li>
+          <li><span>2</span><p>Scan the QR code. If scanning is unavailable, enter this setup key manually.</p></li>
+        </ol>
+        <div class="mfa-secret" data-no-translate>{{ secret }}</div>
+        <div class="mfa-step"><span>3</span><p>Enter the six-digit code shown by the application to confirm setup.</p></div>
+        <form method="post" action="/mfa/setup/confirm" class="stack mfa-code-form">
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <label>Authentication code<input name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="7" required autofocus></label>
+          <button class="primary">Enable MFA</button>
+        </form>
+        {% if mfa_required and mfa_grace and not mfa_grace.expired %}
+        <form method="post" action="/mfa/skip" class="mfa-secondary-form">
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <button class="secondary">Remind me next time I sign in</button>
+        </form>
+        {% elif not mfa_required %}<a href="/profile" class="secondary secondary-link mfa-cancel">Cancel</a>{% endif %}
+      </div>
+    </div>
+  </article>
+</section>
+{% endblock %}

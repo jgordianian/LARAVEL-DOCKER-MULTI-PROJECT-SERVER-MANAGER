@@ -114,6 +114,7 @@ BACKUP_RETENTION_DAYS=""
 BACKUP_INTERVAL_HOURS=""
 BACKUP_CLOUD_ENABLED=""
 BACKUP_CLOUD_SCOPE=""
+BACKUP_CLOUD_RETENTION_ENABLED=""
 BACKUP_CLOUD_PROVIDER=""
 BACKUP_CLOUD_REMOTE=""
 BACKUP_CLOUD_FOLDER=""
@@ -444,6 +445,19 @@ read_project_backup_cloud_scope() {
   case "${scope,,}" in
     manual|automatic|both) echo "${scope,,}" ;;
     *) echo "automatic" ;;
+  esac
+}
+
+read_project_backup_cloud_retention_enabled() {
+  local app_dir="$1"
+  local enabled
+  enabled="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_RETENTION_ENABLED")"
+
+  # Cloud retention was always enabled before this setting existed, so an
+  # unset value preserves the behavior of existing projects.
+  case "${enabled,,}" in
+    no) echo "no" ;;
+    *) echo "yes" ;;
   esac
 }
 
@@ -2406,7 +2420,8 @@ write_project_files() {
   local pma_container="${project_name}-phpmyadmin"
   local php_image_tag redis_command redis_healthcheck mysql_sql_mode_line
   local backup_retention_days backup_interval_hours backup_cloud_enabled
-  local backup_cloud_scope backup_cloud_provider backup_cloud_remote backup_cloud_folder
+  local backup_cloud_scope backup_cloud_retention_enabled
+  local backup_cloud_provider backup_cloud_remote backup_cloud_folder
   local ufw_pma_allowed_sources ufw_pma_restricted ufw_pma_port
   local project_access_allowed_sources project_access_restricted
   local laravel_queue_connection="" laravel_queue_names="" laravel_queue_sleep="" laravel_queue_tries=""
@@ -2446,6 +2461,7 @@ write_project_files() {
   backup_interval_hours="$(read_project_backup_interval_hours "$app_dir")"
   backup_cloud_enabled="$(read_project_backup_cloud_enabled "$app_dir")"
   backup_cloud_scope="$(read_project_backup_cloud_scope "$app_dir")"
+  backup_cloud_retention_enabled="$(read_project_backup_cloud_retention_enabled "$app_dir")"
   backup_cloud_provider="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_PROVIDER")"
   backup_cloud_remote="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_REMOTE")"
   backup_cloud_folder="$(normalize_backup_cloud_folder "$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_FOLDER")")"
@@ -2535,6 +2551,7 @@ EOF
       printf 'BACKUP_INTERVAL_HOURS=%q\n' "$backup_interval_hours"
       printf 'BACKUP_CLOUD_ENABLED=%q\n' "$backup_cloud_enabled"
       printf 'BACKUP_CLOUD_SCOPE=%q\n' "$backup_cloud_scope"
+      printf 'BACKUP_CLOUD_RETENTION_ENABLED=%q\n' "$backup_cloud_retention_enabled"
       printf 'BACKUP_CLOUD_PROVIDER=%q\n' "$backup_cloud_provider"
       printf 'BACKUP_CLOUD_REMOTE=%q\n' "$backup_cloud_remote"
       printf 'BACKUP_CLOUD_FOLDER=%q\n' "$backup_cloud_folder"
@@ -2846,6 +2863,7 @@ EOF
     printf 'BACKUP_INTERVAL_HOURS=%q\n' "$backup_interval_hours"
     printf 'BACKUP_CLOUD_ENABLED=%q\n' "$backup_cloud_enabled"
     printf 'BACKUP_CLOUD_SCOPE=%q\n' "$backup_cloud_scope"
+    printf 'BACKUP_CLOUD_RETENTION_ENABLED=%q\n' "$backup_cloud_retention_enabled"
     printf 'BACKUP_CLOUD_PROVIDER=%q\n' "$backup_cloud_provider"
     printf 'BACKUP_CLOUD_REMOTE=%q\n' "$backup_cloud_remote"
     printf 'BACKUP_CLOUD_FOLDER=%q\n' "$backup_cloud_folder"
@@ -7294,10 +7312,11 @@ upload_backup_to_cloud() {
   local archive_path="$3"
   local retention_days="$4"
   local backup_kind="$5"
-  local enabled provider remote folder remote_dir archive_name
+  local enabled cloud_retention_enabled provider remote folder remote_dir archive_name
 
   enabled="$(read_project_backup_cloud_enabled "$app_dir")"
   [ "$enabled" = "yes" ] || return 0
+  cloud_retention_enabled="$(read_project_backup_cloud_retention_enabled "$app_dir")"
 
   provider="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_PROVIDER")"
   remote="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_REMOTE")"
@@ -7320,13 +7339,15 @@ upload_backup_to_cloud() {
     return 1
   fi
 
-  echo "Pruning cloud backups older than ${retention_days} day(s)..."
-  if ! rclone delete "$remote_dir" \
-    --min-age "${retention_days}d" \
-    --include "${project_name}-*.tar.gz" \
-    --max-depth 1; then
-    echo "Cloud retention cleanup failed for ${project_name}."
-    return 1
+  if [ "$cloud_retention_enabled" = "yes" ]; then
+    echo "Pruning cloud backups older than ${retention_days} day(s)..."
+    if ! rclone delete "$remote_dir" \
+      --min-age "${retention_days}d" \
+      --include "${project_name}-*.tar.gz" \
+      --max-depth 1; then
+      echo "Cloud retention cleanup failed for ${project_name}."
+      return 1
+    fi
   fi
 
   echo "Cloud backup uploaded: ${remote_dir}/${archive_name}"
@@ -7599,9 +7620,11 @@ backup_all() {
 
 manage_backup_settings() {
   local project_slug project_name app_dir current_days new_days current_hours new_hours
-  local current_cloud_enabled current_cloud_scope current_provider current_remote current_folder
-  local enable_cloud scope_choice scope_default provider_choice
+  local current_cloud_enabled current_cloud_scope current_cloud_retention_enabled
+  local current_provider current_remote current_folder
+  local enable_cloud enable_cloud_retention scope_choice scope_default provider_choice
   local new_cloud_enabled="no" new_cloud_scope="automatic" new_provider="" new_remote="" new_folder=""
+  local new_cloud_retention_enabled="yes"
 
   echo ""
   echo "Existing projects:"
@@ -7628,6 +7651,8 @@ manage_backup_settings() {
   current_cloud_enabled="$(read_project_backup_cloud_enabled "$app_dir")"
   current_cloud_scope="$(read_project_backup_cloud_scope "$app_dir")"
   new_cloud_scope="$current_cloud_scope"
+  current_cloud_retention_enabled="$(read_project_backup_cloud_retention_enabled "$app_dir")"
+  new_cloud_retention_enabled="$current_cloud_retention_enabled"
   current_provider="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_PROVIDER")"
   current_remote="$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_REMOTE")"
   current_folder="$(normalize_backup_cloud_folder "$(read_project_meta_var "$app_dir" "BACKUP_CLOUD_FOLDER")")"
@@ -7638,6 +7663,11 @@ manage_backup_settings() {
   echo "Current automatic interval: every ${current_hours} hour(s)."
   if [ "$current_cloud_enabled" = "yes" ]; then
     echo "Current cloud copy: ${current_provider} (${current_remote}:${current_folder:-/}); scope: ${current_cloud_scope}."
+    if [ "$current_cloud_retention_enabled" = "yes" ]; then
+      echo "Current cloud retention: same ${current_days}-day limit as local backups."
+    else
+      echo "Current cloud retention: disabled."
+    fi
   else
     echo "Current cloud copy: disabled."
   fi
@@ -7678,6 +7708,12 @@ manage_backup_settings() {
       3) new_cloud_scope="both" ;;
       *) echo "Invalid backup replication scope."; exit 1 ;;
     esac
+
+    prompt enable_cloud_retention "Apply the same retention limit to cloud backups? (yes/no): " "$current_cloud_retention_enabled"
+    if ! new_cloud_retention_enabled="$(normalize_yes_no "$enable_cloud_retention")"; then
+      echo "Invalid choice. Use yes or no."
+      exit 1
+    fi
 
     if ! ensure_latest_stable_rclone; then
       exit 1
@@ -7720,6 +7756,7 @@ manage_backup_settings() {
   set_project_meta_var "${app_dir}/.project-meta" "BACKUP_INTERVAL_HOURS" "$new_hours"
   set_project_meta_var "${app_dir}/.project-meta" "BACKUP_CLOUD_ENABLED" "$new_cloud_enabled"
   set_project_meta_var "${app_dir}/.project-meta" "BACKUP_CLOUD_SCOPE" "$new_cloud_scope"
+  set_project_meta_var "${app_dir}/.project-meta" "BACKUP_CLOUD_RETENTION_ENABLED" "$new_cloud_retention_enabled"
   set_project_meta_var "${app_dir}/.project-meta" "BACKUP_CLOUD_PROVIDER" "$new_provider"
   set_project_meta_var "${app_dir}/.project-meta" "BACKUP_CLOUD_REMOTE" "$new_remote"
   set_project_meta_var "${app_dir}/.project-meta" "BACKUP_CLOUD_FOLDER" "$new_folder"
@@ -7734,12 +7771,18 @@ manage_backup_settings() {
   if [ "$new_cloud_enabled" = "yes" ]; then
     echo "Cloud copy: ${new_provider} (${new_remote}:${new_folder:-/})."
     echo "Cloud replication scope: ${new_cloud_scope}."
-    echo "Cloud copies use the same ${new_days}-day retention as local backups."
+    if [ "$new_cloud_retention_enabled" = "yes" ]; then
+      echo "Cloud copies use the same ${new_days}-day retention as local backups."
+    else
+      echo "Cloud retention cleanup: disabled. Cloud backups are kept until removed manually."
+    fi
   else
     echo "Cloud copy: disabled."
   fi
   echo "Old local backups are pruned whenever a backup runs."
-  echo "Old cloud backups are pruned whenever a backup is replicated."
+  if [ "$new_cloud_enabled" = "yes" ] && [ "$new_cloud_retention_enabled" = "yes" ]; then
+    echo "Old cloud backups are pruned whenever a backup is replicated."
+  fi
 }
 
 restore_project() {

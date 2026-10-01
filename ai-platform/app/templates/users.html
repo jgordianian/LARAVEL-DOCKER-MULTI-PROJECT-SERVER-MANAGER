@@ -29,6 +29,13 @@
           <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
           <button class="secondary" {% if user.id == session.user_id %}disabled{% endif %}>{{ 'Disable and end sessions' if user.enabled else 'Enable' }}</button>
         </form>
+        <span class="pill {{ 'good' if user.totp_enabled else '' }}">MFA · {{ 'configured' if user.totp_enabled else 'not configured' }}</span>
+        {% if user.totp_enabled %}
+        <form method="post" action="/admin/users/{{ user.id }}/reset-mfa">
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <button class="danger" {% if user.id == session.user_id %}disabled title="Another administrator must reset MFA for your account"{% endif %}>Reset MFA and end sessions</button>
+        </form>
+        {% endif %}
       </div>
       <details>
         <summary>Edit identity and defaults</summary>

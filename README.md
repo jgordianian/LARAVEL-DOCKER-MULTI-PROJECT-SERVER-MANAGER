@@ -212,9 +212,10 @@ Use `18) Backup settings` to configure each project independently:
 - The number of days local backups are retained (14 by default).
 - How many hours must pass between automatic backups, using a 1-to-24-hour daily cycle (24 by default).
 - Optional replication of manual backups, automatic backups, or both to Google Drive or OneDrive through `rclone`.
+- Whether the local retention limit should also prune old cloud backups.
 - Interactive navigation and folder creation when selecting the destination in the configured cloud account.
 
-The manager checks for due backups hourly at minute 30. It prevents overlapping scheduled runs and records successful runs in `/var/lib/laravel-manager/backup-state`. When cloud copies are enabled, each project can replicate manual backups only, automatic backups only, or both. The same per-project retention period is applied to local and cloud copies.
+The manager checks for due backups hourly at minute 30. It prevents overlapping scheduled runs and records successful runs in `/var/lib/laravel-manager/backup-state`. When cloud copies are enabled, each project can replicate manual backups only, automatic backups only, or both. You can apply the same per-project retention period to cloud copies or keep every cloud backup until it is removed manually.
 
 When cloud copies are enabled, the manager compares the installed rclone version with the official stable-release manifest. It runs rclone's official HTTPS installer only when rclone is missing or outdated, and verifies the resulting version before opening the account-configuration wizard. It does not install the outdated Ubuntu repository package. OAuth credentials remain in rclone's root-user configuration; they are not written to `.project-meta`.
 

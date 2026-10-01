@@ -50,6 +50,41 @@
       </form>
     </article>
 
+    <article class="panel mfa-settings-card">
+      <div class="heading">
+        <div>
+          <h2>Multi-factor authentication (MFA)</h2>
+          <p class="muted">Compatible with Google Authenticator, Microsoft Authenticator and other TOTP applications.</p>
+        </div>
+        <span class="mfa-shield" aria-hidden="true">◇</span>
+      </div>
+      <form method="post" action="/admin/settings/mfa" class="stack" id="mfa-settings-form">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label class="checkbox-card">
+          <input type="checkbox" name="mfa_required" value="true" {% if mfa.required %}checked{% endif %}>
+          <span><strong>Require MFA for all users</strong><small>Disabling this requirement does not remove MFA from users who already configured it.</small></span>
+        </label>
+        <label>Request code
+          <select name="mfa_challenge_mode" id="mfa-challenge-mode" required>
+            <option value="login" {% if mfa.challenge_mode == 'login' %}selected{% endif %}>Only when signing in</option>
+            <option value="interval" {% if mfa.challenge_mode == 'interval' %}selected{% endif %}>Every number of hours</option>
+            <option value="daily" {% if mfa.challenge_mode == 'daily' %}selected{% endif %}>Once daily after a specified time</option>
+          </select>
+        </label>
+        <label class="mfa-conditional" data-mfa-mode="interval">Number of hours
+          <input type="number" name="mfa_interval_hours" min="1" max="720" value="{{ mfa.interval_hours }}">
+        </label>
+        <label class="mfa-conditional" data-mfa-mode="daily">Daily request time (UTC)
+          <input type="time" name="mfa_daily_time" value="{{ mfa.daily_time }}">
+        </label>
+        <label>Grace period for enrollment (days)
+          <input type="number" name="mfa_grace_days" min="0" max="365" value="{{ mfa.grace_days }}" required>
+        </label>
+        <p class="settings-note">A code is always required for every new session. The selected frequency applies only while that session remains active.</p>
+        <button class="primary">Save MFA settings</button>
+      </form>
+    </article>
+
     <article class="panel">
       <h2>Localization</h2>
       <p class="muted">Choose the default language for guests and users who inherit the system preference.</p>
@@ -87,3 +122,4 @@
   </section>
 </div>
 {% endblock %}
+{% block scripts %}<script src="/static/mfa-settings.js?v=1.2.0-mfa1" defer></script>{% endblock %}

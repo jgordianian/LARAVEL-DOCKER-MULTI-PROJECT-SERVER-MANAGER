@@ -36,6 +36,22 @@ from .db import SessionLocal, get_db
 from .environment import load_environment_snapshot
 from .i18n import SUPPORTED_LANGUAGES, normalize_language, translate
 from .mail import EmailBranding, SMTPConfiguration, password_reset_email, send_email, smtp_configuration, smtp_test_email
+from .mfa import (
+    MFA_MODES,
+    MFA_MODE_DAILY,
+    MFA_MODE_INTERVAL,
+    MFA_MODE_LOGIN,
+    decrypt_secret,
+    encrypt_secret,
+    ensure_grace,
+    generate_secret,
+    matching_counter,
+    mfa_policy,
+    provisioning_uri,
+    qr_data_uri,
+    should_challenge,
+    utc_now,
+)
 from .model_catalog import ModelCatalogError, catalog_model, load_model_catalog, refresh_model_catalog
 from .models import (
     APIKey,
@@ -101,6 +117,18 @@ app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
 app.mount("/branding", StaticFiles(directory=str(BRANDING_ROOT)), name="branding")
 ADMIN_ROLES = {"super_admin", "administrator"}
 REASONING_EFFORTS = {"none", "low", "medium", "high"}
+MFA_UNGATED_PATHS = {
+    "/logout",
+    "/mfa/setup",
+    "/mfa/setup/regenerate",
+    "/mfa/setup/confirm",
+    "/mfa/challenge",
+    "/mfa/verify",
+    "/mfa/skip",
+    "/profile/language",
+    "/profile/password",
+    "/profile/photo",
+}
 BRANDING_DEFAULTS = {
     "brand_name": "Aperture AI",
     "browser_title": "AI Platform",
@@ -156,12 +184,58 @@ def session_for(request: Request, db: Session) -> WebSession | None:
     return get_web_session(db, request.cookies.get("ai_session"), settings)
 
 
+def safe_local_path(value: str | None, fallback: str = "/profile") -> str:
+    candidate = str(value or "").strip()
+    if not candidate.startswith("/") or candidate.startswith("//") or "\r" in candidate or "\n" in candidate:
+        return fallback
+    if candidate.startswith("/mfa/") or candidate == "/profile/photo":
+        return fallback
+    return candidate
+
+
+def remember_mfa_destination(request: Request, session: WebSession) -> None:
+    if session.mfa_intended_path or request.method != "GET":
+        return
+    query = f"?{request.url.query}" if request.url.query else ""
+    session.mfa_intended_path = safe_local_path(f"{request.url.path}{query}")
+
+
+def consume_mfa_destination(session: WebSession, fallback: str = "/profile") -> str:
+    destination = safe_local_path(session.mfa_intended_path, fallback)
+    session.mfa_intended_path = None
+    return destination
+
+
+def mfa_access_redirect(session: WebSession, db: Session) -> str | None:
+    policy = mfa_policy(db)
+    if session.user.totp_enabled:
+        return "/mfa/challenge" if should_challenge(session, policy) else None
+    if not policy.required:
+        return None
+    grace = ensure_grace(session.user, policy)
+    if session.mfa_grace_skipped and not grace.expired:
+        return None
+    return "/mfa/setup"
+
+
 def require_session(request: Request, db: Session = Depends(get_db)) -> WebSession:
     session = session_for(request, db)
     if session is None:
         raise HTTPException(401, "authentication required")
     if session.user.force_password_reset and request.url.path not in {"/profile/password", "/logout"}:
         raise HTTPException(403, "password change required before using the platform")
+    if request.url.path not in MFA_UNGATED_PATHS:
+        destination = mfa_access_redirect(session, db)
+        if destination:
+            remember_mfa_destination(request, session)
+            db.commit()
+            if request.url.path.startswith("/api/"):
+                raise HTTPException(
+                    423,
+                    "multi-factor authentication is required",
+                    headers={"X-AI-MFA-Redirect": destination},
+                )
+            raise HTTPException(303, "multi-factor authentication is required", headers={"Location": destination})
     return session
 
 
@@ -495,8 +569,9 @@ def login(request: Request, email: str = Form(), password: str = Form(), csrf_to
     raw, web_session = create_web_session(db, user, ip, request.headers.get("user-agent", ""), settings)
     user.last_login_at = datetime.now(timezone.utc)
     audit(db, web_session, request, "user.login", "user", user.id)
+    destination = "/profile/password" if user.force_password_reset else mfa_access_redirect(web_session, db) or "/"
     db.commit()
-    response = RedirectResponse("/profile/password" if user.force_password_reset else "/", 303)
+    response = RedirectResponse(destination, 303)
     response.set_cookie("ai_session", raw, secure=settings.cookie_secure, httponly=True, samesite="lax", max_age=settings.session_ttl_seconds)
     response.delete_cookie("ai_login_csrf")
     return response
@@ -512,6 +587,211 @@ def logout(request: Request, csrf_token: str = Form(), db: Session = Depends(get
     response = RedirectResponse("/login", 303)
     response.delete_cookie("ai_session")
     return response
+
+
+def mfa_attempt_allowed(session: WebSession, stage: str) -> bool:
+    key = f"aip:mfa:{stage}:{session.user_id}:{session.id}"
+    attempts = int(redis_client.incr(key))
+    if attempts == 1:
+        redis_client.expire(key, 60)
+    return attempts <= 6
+
+
+def clear_mfa_attempts(session: WebSession, stage: str) -> None:
+    redis_client.delete(f"aip:mfa:{stage}:{session.user_id}:{session.id}")
+
+
+def mfa_setup_response(
+    request: Request,
+    session: WebSession,
+    db: Session,
+    *,
+    error: str | None = None,
+):
+    policy = mfa_policy(db)
+    encrypted = session.user.totp_secret_encrypted
+    try:
+        secret = decrypt_secret(encrypted, settings) if encrypted else ""
+    except ValueError:
+        secret = ""
+    if not secret:
+        secret = generate_secret()
+        session.user.totp_secret_encrypted = encrypt_secret(secret, settings)
+        db.commit()
+    presentation = site_presentation()
+    uri = provisioning_uri(secret, session.user.email, presentation["branding"]["brand_name"])
+    grace = ensure_grace(session.user, policy) if policy.required else None
+    if session.user in db.dirty:
+        db.commit()
+    response = render(
+        request,
+        "mfa_setup.html",
+        session=session,
+        secret=secret,
+        qr_data_uri=qr_data_uri(uri),
+        mfa_required=policy.required,
+        mfa_grace=grace,
+        error=error,
+    )
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@app.get("/mfa/setup", response_class=HTMLResponse)
+def mfa_setup_page(request: Request, db: Session = Depends(get_db)):
+    session = require_session(request, db)
+    if session.user.totp_enabled:
+        return RedirectResponse("/profile", 303)
+    return mfa_setup_response(request, session, db)
+
+
+@app.post("/mfa/setup/regenerate")
+def mfa_setup_regenerate(
+    request: Request,
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    session = require_session(request, db)
+    verify_csrf(request, session, csrf_token)
+    if session.user.totp_enabled:
+        return RedirectResponse("/profile", 303)
+    session.user.totp_secret_encrypted = encrypt_secret(generate_secret(), settings)
+    audit(db, session, request, "user.mfa_setup_regenerated", "user", session.user_id)
+    db.commit()
+    return RedirectResponse("/mfa/setup", 303)
+
+
+@app.post("/mfa/setup/confirm", response_class=HTMLResponse)
+def mfa_setup_confirm(
+    request: Request,
+    code: str = Form(),
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    session = require_session(request, db)
+    verify_csrf(request, session, csrf_token)
+    if session.user.totp_enabled:
+        return RedirectResponse("/profile", 303)
+    if not mfa_attempt_allowed(session, "setup"):
+        response = mfa_setup_response(request, session, db, error="Too many verification attempts. Try again in one minute.")
+        response.status_code = 429
+        return response
+    user = db.scalar(select(User).where(User.id == session.user_id).with_for_update())
+    try:
+        secret = decrypt_secret(user.totp_secret_encrypted or "", settings)
+    except ValueError:
+        user.totp_secret_encrypted = None
+        db.commit()
+        return mfa_setup_response(request, session, db, error="The setup session expired. A new QR code was generated.")
+    step = matching_counter(secret, code)
+    if step is None or (user.totp_last_used_step is not None and step <= user.totp_last_used_step):
+        audit(db, session, request, "user.mfa_setup_failed", "user", user.id, result="failure")
+        db.commit()
+        response = mfa_setup_response(request, session, db, error="The authentication code is invalid, expired or has already been used.")
+        response.status_code = 400
+        return response
+    verified_at = utc_now()
+    user.totp_enabled = True
+    user.totp_confirmed_at = verified_at
+    user.totp_last_verified_at = verified_at
+    user.totp_last_used_step = step
+    user.totp_grace_started_at = None
+    user.totp_grace_expires_at = None
+    session.mfa_verified_at = verified_at
+    session.mfa_grace_skipped = False
+    destination = consume_mfa_destination(session)
+    audit(db, session, request, "user.mfa_enabled", "user", user.id)
+    db.commit()
+    clear_mfa_attempts(session, "setup")
+    return RedirectResponse(f"{destination}{'&' if '?' in destination else '?'}result=mfa-enabled" if destination == "/profile" else destination, 303)
+
+
+def mfa_challenge_response(request: Request, session: WebSession, *, error: str | None = None):
+    response = render(request, "mfa_challenge.html", session=session, error=error)
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@app.get("/mfa/challenge", response_class=HTMLResponse)
+def mfa_challenge_page(request: Request, db: Session = Depends(get_db)):
+    session = require_session(request, db)
+    policy = mfa_policy(db)
+    if not session.user.totp_enabled:
+        destination = "/mfa/setup" if policy.required else consume_mfa_destination(session)
+        db.commit()
+        return RedirectResponse(destination, 303)
+    if not should_challenge(session, policy):
+        destination = consume_mfa_destination(session, "/")
+        db.commit()
+        return RedirectResponse(destination, 303)
+    return mfa_challenge_response(request, session)
+
+
+@app.post("/mfa/verify", response_class=HTMLResponse)
+def mfa_verify(
+    request: Request,
+    code: str = Form(),
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    session = require_session(request, db)
+    verify_csrf(request, session, csrf_token)
+    if not session.user.totp_enabled:
+        return RedirectResponse("/mfa/setup", 303)
+    if not mfa_attempt_allowed(session, "challenge"):
+        response = mfa_challenge_response(request, session, error="Too many verification attempts. Try again in one minute.")
+        response.status_code = 429
+        return response
+    user = db.scalar(select(User).where(User.id == session.user_id).with_for_update())
+    try:
+        secret = decrypt_secret(user.totp_secret_encrypted or "", settings)
+    except ValueError:
+        logger.error("Unable to decrypt MFA secret for user %s", user.id)
+        response = mfa_challenge_response(request, session, error="MFA cannot be verified. Contact an administrator to reset it.")
+        response.status_code = 409
+        return response
+    step = matching_counter(secret, code)
+    if step is None or (user.totp_last_used_step is not None and step <= user.totp_last_used_step):
+        audit(db, session, request, "user.mfa_verification_failed", "user", user.id, result="failure")
+        db.commit()
+        response = mfa_challenge_response(request, session, error="The authentication code is invalid, expired or has already been used.")
+        response.status_code = 400
+        return response
+    verified_at = utc_now()
+    user.totp_last_verified_at = verified_at
+    user.totp_last_used_step = step
+    session.mfa_verified_at = verified_at
+    destination = consume_mfa_destination(session, "/")
+    audit(db, session, request, "user.mfa_verified", "user", user.id)
+    db.commit()
+    clear_mfa_attempts(session, "challenge")
+    return RedirectResponse(destination, 303)
+
+
+@app.post("/mfa/skip")
+def mfa_skip(
+    request: Request,
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    session = require_session(request, db)
+    verify_csrf(request, session, csrf_token)
+    policy = mfa_policy(db)
+    if session.user.totp_enabled or not policy.required:
+        destination = consume_mfa_destination(session)
+        db.commit()
+        return RedirectResponse(destination, 303)
+    grace = ensure_grace(session.user, policy)
+    if grace.expired:
+        db.commit()
+        return RedirectResponse("/mfa/setup", 303)
+    session.mfa_grace_skipped = True
+    destination = consume_mfa_destination(session, "/")
+    audit(db, session, request, "user.mfa_grace_skipped", "user", session.user_id)
+    db.commit()
+    return RedirectResponse(destination, 303)
 
 
 @app.post("/profile/language")
@@ -816,7 +1096,11 @@ def profile_response(
 @app.get("/profile", response_class=HTMLResponse)
 def profile_page(request: Request, result: str = "", db: Session = Depends(get_db)):
     session = require_session(request, db)
-    notices = {"saved": "Profile saved.", "password-saved": "Password changed."}
+    notices = {
+        "saved": "Profile saved.",
+        "password-saved": "Password changed.",
+        "mfa-enabled": "Multi-factor authentication was enabled successfully.",
+    }
     return profile_response(request, session, db, notice=notices.get(result))
 
 
@@ -966,6 +1250,11 @@ def chat_page(request: Request, q: str = "", db: Session = Depends(get_db)):
     session = session_for(request, db)
     if session is None:
         return RedirectResponse("/login", 303)
+    destination = mfa_access_redirect(session, db)
+    if destination:
+        remember_mfa_destination(request, session)
+        db.commit()
+        return RedirectResponse(destination, 303)
     query = select(Conversation).where(Conversation.user_id == session.user_id, Conversation.archived.is_(False))
     if q:
         query = query.where(Conversation.title.ilike(f"%{q[:100]}%"))
@@ -1424,6 +1713,45 @@ def user_reset_password(user_id: int, request: Request, password: str = Form(), 
     user.force_password_reset = True
     db.query(WebSession).filter(WebSession.user_id == user.id).delete()
     audit(db, session, request, "user.password_reset", "user", user.id)
+    db.commit()
+    return RedirectResponse("/admin/users", 303)
+
+
+@app.post("/admin/users/{user_id}/reset-mfa")
+def user_reset_mfa(
+    user_id: int,
+    request: Request,
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    session = require_admin(request, db)
+    verify_csrf(request, session, csrf_token)
+    user = admin_target_user(db, session, user_id)
+    if user.id == session.user_id:
+        raise HTTPException(409, "another administrator must reset MFA for your account")
+    if not user.totp_enabled:
+        raise HTTPException(409, "the user does not have MFA configured")
+    policy = mfa_policy(db)
+    forced_grace = utc_now() if policy.required else None
+    was_enabled = user.totp_enabled
+    user.totp_secret_encrypted = None
+    user.totp_enabled = False
+    user.totp_confirmed_at = None
+    user.totp_last_verified_at = None
+    user.totp_last_used_step = None
+    user.totp_grace_started_at = forced_grace
+    user.totp_grace_expires_at = forced_grace
+    db.query(WebSession).filter(WebSession.user_id == user.id).delete(synchronize_session=False)
+    audit(
+        db,
+        session,
+        request,
+        "user.mfa_reset",
+        "user",
+        user.id,
+        before={"totp_enabled": was_enabled},
+        after={"totp_enabled": False, "sessions_terminated": True},
+    )
     db.commit()
     return RedirectResponse("/admin/users", 303)
 
@@ -2504,6 +2832,7 @@ def settings_page(request: Request, result: str = "", db: Session = Depends(get_
         "localization-saved": "Localization settings saved.",
         "smtp-saved": "SMTP settings saved.",
         "smtp-tested": "SMTP settings saved and the test email was accepted by the mail server.",
+        "mfa-saved": "Multi-factor authentication settings saved.",
     }
     errors = {
         "smtp-test-failed": "SMTP settings were saved, but the test email could not be delivered. Verify the server, port, security mode and credentials.",
@@ -2513,6 +2842,7 @@ def settings_page(request: Request, result: str = "", db: Session = Depends(get_
         api_default_model=api_default.value if api_default else "", portal_default_model=portal_default.value if portal_default else "",
         models=db.scalars(select(ModelRecord).order_by(ModelRecord.alias)).all(), branding=presentation["branding"],
         system_language=presentation["system_language"], smtp=smtp, smtp_password_configured=bool(smtp.password),
+        mfa=mfa_policy(db),
         notice=notices.get(result), error=errors.get(result),
     )
 
@@ -2564,6 +2894,67 @@ def localization_update(
     )
     db.commit()
     return RedirectResponse("/admin/settings?result=localization-saved", 303)
+
+
+@app.post("/admin/settings/mfa")
+def mfa_settings_update(
+    request: Request,
+    mfa_required: bool = Form(False),
+    mfa_challenge_mode: str = Form(MFA_MODE_LOGIN),
+    mfa_interval_hours: int = Form(8),
+    mfa_daily_time: str = Form("08:00"),
+    mfa_grace_days: int = Form(15),
+    csrf_token: str = Form(),
+    db: Session = Depends(get_db),
+):
+    session = require_admin(request, db)
+    verify_csrf(request, session, csrf_token)
+    if mfa_challenge_mode not in MFA_MODES:
+        raise HTTPException(422, "invalid MFA challenge mode")
+    if not 1 <= mfa_interval_hours <= 720:
+        raise HTTPException(422, "MFA interval must be between 1 and 720 hours")
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", mfa_daily_time):
+        raise HTTPException(422, "MFA daily time must use HH:MM")
+    if not 0 <= mfa_grace_days <= 365:
+        raise HTTPException(422, "MFA grace period must be between 0 and 365 days")
+    previous = mfa_policy(db)
+    values = {
+        "mfa_required": mfa_required,
+        "mfa_challenge_mode": mfa_challenge_mode,
+        "mfa_interval_hours": mfa_interval_hours,
+        "mfa_daily_time": mfa_daily_time,
+        "mfa_grace_days": mfa_grace_days,
+    }
+    for key, value in values.items():
+        save_setting(db, key, value)
+    unconfigured = db.scalars(select(User).where(User.totp_enabled.is_(False))).all()
+    if not previous.required and mfa_required:
+        for user in unconfigured:
+            user.totp_grace_started_at = None
+            user.totp_grace_expires_at = None
+    elif mfa_required and previous.grace_days != mfa_grace_days:
+        for user in unconfigured:
+            started = user.totp_grace_started_at
+            if started is not None:
+                user.totp_grace_expires_at = started + timedelta(days=mfa_grace_days)
+    audit(
+        db,
+        session,
+        request,
+        "settings.mfa_changed",
+        "system_setting",
+        "mfa",
+        before={
+            "required": previous.required,
+            "challenge_mode": previous.challenge_mode,
+            "interval_hours": previous.interval_hours,
+            "daily_time": previous.daily_time,
+            "grace_days": previous.grace_days,
+        },
+        after=values,
+    )
+    db.commit()
+    return RedirectResponse("/admin/settings?result=mfa-saved", 303)
 
 
 @app.post("/admin/settings/branding")

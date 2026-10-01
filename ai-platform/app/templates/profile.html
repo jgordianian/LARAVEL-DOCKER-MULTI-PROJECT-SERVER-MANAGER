@@ -56,6 +56,20 @@
     </dl>
   </article>
 
+  <article class="panel mfa-profile-card">
+    <div class="heading">
+      <div>
+        <div class="mfa-title-row"><h2>Multi-factor authentication (MFA)</h2><span class="pill {{ 'good' if session.user.totp_enabled else '' }}">{{ 'Configured' if session.user.totp_enabled else 'Not configured' }}</span></div>
+        {% if session.user.totp_enabled %}
+        <p class="muted">Your account is protected with an authenticator application. Contact an administrator if you need to reset it.</p>
+        {% else %}
+        <p class="muted">Add a second verification step using Google Authenticator or Microsoft Authenticator.</p>
+        {% endif %}
+      </div>
+      {% if not session.user.totp_enabled %}<a class="primary secondary-link" href="/mfa/setup">Configure MFA</a>{% endif %}
+    </div>
+  </article>
+
   <article class="panel">
     <h2>Security</h2>
     <p class="muted">Change your password without leaving your profile.</p>

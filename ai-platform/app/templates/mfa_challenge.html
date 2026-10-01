@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Multi-factor authentication · {{ branding.browser_title }}{% endblock %}
+{% block content %}
+<section class="mfa-page mfa-challenge-page">
+  <article class="panel mfa-challenge-card">
+    <span class="mfa-icon mfa-icon-large" aria-hidden="true">✓</span>
+    <h1>Enter your authentication code</h1>
+    <p class="muted">Open your authenticator application and enter the current six-digit code.</p>
+    {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+    <form method="post" action="/mfa/verify" class="stack mfa-code-form">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <label>Authentication code<input name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="7" required autofocus></label>
+      <button class="primary">Verify and continue</button>
+    </form>
+    <form method="post" action="/logout" class="mfa-secondary-form">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <button class="secondary">Sign out</button>
+    </form>
+  </article>
+</section>
+{% endblock %}
