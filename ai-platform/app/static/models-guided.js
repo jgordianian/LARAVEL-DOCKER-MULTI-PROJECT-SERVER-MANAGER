@@ -10,6 +10,7 @@
     });
   }
   const pollInstallation = async element => {
+    const activationOnly = element.dataset.installOperation === 'activation';
     try {
       const response = await fetch(element.dataset.installStatusUrl, {
         credentials: 'same-origin',
@@ -20,26 +21,31 @@
       const message = element.querySelector('[data-install-message]');
       if (data.status === 'completed') {
         element.className = 'alert success model-install-progress';
-        message.textContent = translate(data.activation_requested ? 'Model installed and activated successfully.' : 'Model downloaded successfully.');
+        message.textContent = translate(activationOnly ? 'Model activated successfully.' : data.activation_requested ? 'Model installed and activated successfully.' : 'Model downloaded successfully.');
+        const successUrl = element.dataset.installSuccessUrl;
+        if (successUrl) {
+          window.setTimeout(() => window.location.replace(successUrl), 700);
+          return;
+        }
         const result = data.activation_requested ? 'catalog-activated' : 'catalog-downloaded';
         window.setTimeout(() => window.location.replace(`/admin/models?result=${result}#model-${data.model_id}`), 700);
         return;
       }
       if (data.status === 'failed') {
         element.className = 'alert error model-install-progress';
-        message.textContent = `${translate('Background installation failed.')} ${data.error || translate('Review the model details and retry the operation.')}`;
+        message.textContent = `${translate(activationOnly ? 'Background activation failed.' : 'Background installation failed.')} ${data.error || translate('Review the model details and retry the operation.')}`;
         return;
       }
       message.textContent = translate(
         data.status === 'queued'
-          ? 'Installation queued…'
+          ? (activationOnly ? 'Activation queued…' : 'Installation queued…')
           : data.phase === 'activation'
             ? 'Download complete. Validating capacity and activating…'
             : 'Downloading pinned model weights…'
       );
     } catch (_error) {
       const message = element.querySelector('[data-install-message]');
-      message.textContent = translate('Installation continues in the background; reconnecting to status…');
+      message.textContent = translate(activationOnly ? 'Activation continues in the background; reconnecting to status…' : 'Installation continues in the background; reconnecting to status…');
     }
     window.setTimeout(() => pollInstallation(element), 2500);
   };

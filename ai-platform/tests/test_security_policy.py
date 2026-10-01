@@ -31,8 +31,8 @@ def make_key(db, *, scopes=None, models=None, **limits):
         key_prefix=prefix,
         secret_hash=secret_hash,
         user_id=user.id,
-        scopes=scopes or ["models", "chat"],
-        allowed_models=models or [],
+        scopes=scopes if scopes is not None else ["models", "chat"],
+        allowed_models=models if models is not None else [],
         **limits,
     )
     db.add(key)
@@ -88,6 +88,34 @@ def test_service_account_model_and_scope_policy(db):
         require_model_access(key, "beta", "chat")
     with pytest.raises(PolicyDenied):
         require_model_access(key, "alpha", "models")
+
+
+def test_empty_key_policy_inherits_service_account_models_and_scopes(db):
+    account = ServiceAccount(name="inherited", allowed_models=["alpha"], allowed_scopes=["chat"])
+    db.add(account)
+    db.flush()
+    key = APIKey(
+        name="inherited-key",
+        key_id="inherited1234",
+        key_prefix="ovai_live_inherited1234",
+        secret_hash="not-used",
+        service_account_id=account.id,
+        allowed_models=[],
+        scopes=[],
+    )
+    db.add(key)
+    db.commit()
+
+    require_model_access(key, "alpha", "chat")
+    with pytest.raises(PolicyDenied):
+        require_model_access(key, "beta", "chat")
+    with pytest.raises(PolicyDenied):
+        require_model_access(key, "alpha", "responses")
+
+
+def test_empty_user_key_policy_allows_all_models_and_scopes(db):
+    _, key = make_key(db, scopes=[], models=[])
+    require_model_access(key, "any-active-model", "responses")
 
 
 def test_ipv4_ipv6_and_trusted_proxy_resolution():

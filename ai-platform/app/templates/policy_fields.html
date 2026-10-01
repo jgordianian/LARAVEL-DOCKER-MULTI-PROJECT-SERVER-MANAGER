@@ -1,0 +1,41 @@
+{% macro model_scope_fields(policy_models, policy_scopes, selected_models, selected_scopes, models_help, scopes_help) -%}
+{% set active_aliases = policy_models|map(attribute='alias')|list %}
+<fieldset class="policy-field" data-policy-model-field>
+  <legend>Allowed models</legend>
+  <p class="small muted">{{ models_help }}</p>
+  <div class="policy-options">
+    {% for model in policy_models %}
+    <label class="policy-option">
+      <input type="checkbox" name="allowed_models" value="{{ model.alias }}" data-policy-model data-scopes="{{ model.scopes|join(',') }}" {% if model.alias in selected_models %}checked data-policy-existing="true"{% endif %}>
+      <span><strong>{{ model.alias }}</strong><small>{{ model.model_id }}</small></span>
+    </label>
+    {% else %}
+    <span class="small muted">No active and ready models are available.</span>
+    {% endfor %}
+    {% for alias in selected_models if alias not in active_aliases %}
+    <label class="policy-option unavailable">
+      <input type="checkbox" name="allowed_models" value="{{ alias }}" data-policy-model data-policy-stale="true" data-policy-existing="true" data-scopes="" checked>
+      <span><strong>{{ alias }}</strong><small>Previously selected; currently unavailable.</small></span>
+    </label>
+    {% endfor %}
+  </div>
+</fieldset>
+<fieldset class="policy-field" data-policy-scope-field>
+  <legend>Scopes</legend>
+  <p class="small muted">{{ scopes_help }}</p>
+  <div class="policy-options policy-scope-options">
+    {% for scope in policy_scopes %}
+    <label class="policy-option compact">
+      <input type="checkbox" name="scopes" value="{{ scope }}" data-policy-scope {% if scope in selected_scopes %}checked data-policy-existing="true"{% endif %}>
+      <span><code>{{ scope }}</code></span>
+    </label>
+    {% endfor %}
+    {% for scope in selected_scopes if scope not in policy_scopes %}
+    <label class="policy-option compact unavailable">
+      <input type="checkbox" name="scopes" value="{{ scope }}" data-policy-scope data-policy-existing="true" checked>
+      <span><code>{{ scope }}</code><small>Previously selected; currently unavailable.</small></span>
+    </label>
+    {% endfor %}
+  </div>
+</fieldset>
+{%- endmacro %}

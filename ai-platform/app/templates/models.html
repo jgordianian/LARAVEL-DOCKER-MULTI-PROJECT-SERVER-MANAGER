@@ -132,6 +132,7 @@
       {% set capability_profile = capability_profiles.get(model.id, {}) %}
       <article class="panel model" id="model-{{ model.id }}">
         <div class="heading"><div><h2>{{ model.alias }}</h2><small>{{ model.hf_model_id }} @ {{ model.revision }}</small></div>{% if model.is_default %}<span class="pill">Default</span>{% endif %}</div>
+        {% if catalog_form_error == 'invalid-performance-profile' and catalog_error_alias == model.alias %}<div class="alert error">The selected performance profile is invalid. Reload the page and try again.</div>{% endif %}
         {% if install_job.get('status') in ['queued', 'running'] %}
         <div class="alert warning model-install-progress" data-install-status-url="/admin/models/{{ model.id }}/status" data-model-id="{{ model.id }}">
           <strong>Installation is running in the background.</strong>
@@ -205,7 +206,7 @@
             <label>GPU memory target<input name="gpu_memory_utilization" type="number" min="0.1" max="0.95" step="0.01" value="{{ model.instance.gpu_memory_utilization }}"></label>
             <label>CPU offload GB<input name="cpu_offload_gb" type="number" min="0" step="0.1" value="{{ model.instance.cpu_offload_gb }}"></label>
             <label>Swap space GB<input name="swap_space_gb" type="number" min="0" step="0.1" value="{{ model.instance.swap_space_gb }}"></label>
-            <label>Performance profile<select name="performance_profile">{% for profile in ['AUTO','CONSERVATIVE','BALANCED','PERFORMANCE','MAXIMUM','CUSTOM'] %}<option {% if model.instance.performance_profile == profile %}selected{% endif %}>{{ profile }}</option>{% endfor %}</select></label>
+            <label>Performance profile<select name="performance_profile">{% for profile in ['AUTO','CONSERVATIVE','BALANCED','PERFORMANCE','MAXIMUM','CUSTOM'] %}<option value="{{ profile }}" {% if model.instance.performance_profile == profile %}selected{% endif %}>{{ profile }}</option>{% endfor %}</select></label>
             <label>Per-model system prompt<textarea name="system_prompt">{{ model.system_prompt or '' }}</textarea></label>
             <label>Custom chat template<textarea name="chat_template">{{ model.chat_template or '' }}</textarea></label>
             <button {% if model.instance.desired_active %}disabled title="Deactivate first"{% endif %}>Validate and save</button>
@@ -226,4 +227,4 @@
   </section>
 </div>
 {% endblock %}
-{% block scripts %}<script src="/static/models-guided.js?v=1.2.0-refresh1" defer></script>{% endblock %}
+{% block scripts %}<script src="/static/models-guided.js?v=1.2.0-jobs1" defer></script>{% endblock %}

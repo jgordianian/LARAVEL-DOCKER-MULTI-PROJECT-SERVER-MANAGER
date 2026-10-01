@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "policy_fields.html" import model_scope_fields %}
 {% block title %}API access · {{ branding.browser_title }}{% endblock %}
 {% block content %}
 <div class="admin-layout" id="codex-setup-root" data-installer-url="{{ codex_installer_url }}" data-created-key-id="{{ created_key_id or '' }}">
@@ -9,14 +10,13 @@
     {% if created_secret %}<div class="secret-once"><strong>Copy this key now. It cannot be shown again.</strong><code id="created-secret-value">{{ created_secret }}</code><button type="button" class="codex-setup-button primary" data-key-id="{{ created_key_id }}" data-key-name="New API key">Configure Codex</button></div>{% endif %}
     <article class="panel">
       <h2>Create API key</h2>
-      <form method="post" class="form-grid">
+      <form method="post" class="form-grid" data-policy-form>
         <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
         <label>Name<input name="name" required></label>
-        <label>Owner type<select name="owner_type"><option value="service_account">Service account</option><option value="user">User</option></select></label>
-        <label>Owner ID<select name="owner_id">{% for a in accounts %}<option value="{{ a.id }}">Service: {{ a.name }}</option>{% endfor %}{% for u in users %}<option value="{{ u.id }}">User: {{ u.email }}</option>{% endfor %}</select></label>
-        <label>Models <small>comma-separated; blank inherits owner policy</small><input name="allowed_models"></label>
+        <label>Owner type<select name="owner_type" data-owner-type><option value="service_account">Service account</option><option value="user">User</option></select></label>
+        <label>Owner ID<select name="owner_id" data-owner-id>{% for a in accounts %}<option value="{{ a.id }}" data-owner-type="service_account" data-models="{{ a.allowed_models|join(',') }}" data-scopes="{{ a.allowed_scopes|join(',') }}">Service: {{ a.name }}</option>{% endfor %}{% for u in users %}<option value="{{ u.id }}" data-owner-type="user">User: {{ u.email }}</option>{% endfor %}</select></label>
+        {{ model_scope_fields(policy_models, policy_scopes, [], [], 'Leave blank to inherit the owner model policy.', 'Leave blank to inherit all scopes from the service account.') }}
         <label>Allowed IP/CIDR <small>comma-separated IPv4/IPv6</small><input name="allowed_cidrs"></label>
-        <label>Scopes<input name="scopes" value="models,chat"></label>
         <label>Allowed endpoints <small>blank inherits owner/legacy behavior</small><input name="allowed_endpoints" placeholder="/v1/models,/v1/chat/completions,/v1/responses"></label>
         <label>Expires at <small>optional UTC</small><input name="expires_at" type="datetime-local"></label>
         <label>Requests/minute<input name="requests_per_minute" type="number" min="0" value="60"></label>
@@ -39,7 +39,7 @@
             <td>{{ key.name }}<br><small>Last used {{ key.last_used_at or 'never' }}</small></td>
             <td><code>{{ key.key_prefix }}</code></td>
             <td>{{ key.service_account.name if key.service_account else key.user.email }}</td>
-            <td>Models: {{ key.allowed_models|join(', ') or 'Inherited/all' }}<br><small>Scopes: {{ key.scopes|join(', ') }}<br>Endpoints: {{ key.allowed_endpoints|join(', ') or 'Inherited/legacy' }}</small></td>
+            <td>Models: {{ key.allowed_models|join(', ') or 'Inherited/all' }}<br><small>Scopes: {{ key.scopes|join(', ') or 'Inherited/all' }}<br>Endpoints: {{ key.allowed_endpoints|join(', ') or 'Inherited/legacy' }}</small></td>
             <td>{{ key.requests_per_minute }} rpm · {{ key.tokens_per_minute }} tpm · {{ key.concurrent_requests }} concurrent</td>
             <td><span class="pill {{ 'good' if key.enabled and not key.revoked_at else 'bad' }}">{{ 'Active' if key.enabled and not key.revoked_at else 'Revoked' }}</span><br><small>{{ 'Expires ' ~ key.expires_at if key.expires_at else 'No expiry' }}</small></td>
             <td><div class="actions">
@@ -82,4 +82,4 @@
   </div>
 </dialog>
 {% endblock %}
-{% block scripts %}<script src="/static/codex-setup.js?v=1.2.0-codex7" defer></script>{% endblock %}
+{% block scripts %}<script src="/static/policy-selectors.js?v=1.0.1" defer></script><script src="/static/codex-setup.js?v=1.2.0-codex7" defer></script>{% endblock %}

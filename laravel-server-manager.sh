@@ -9999,7 +9999,7 @@ server {
 
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    client_max_body_size 4m;
+    client_max_body_size 128m;
 
     add_header X-Content-Type-Options nosniff always;
     add_header X-Frame-Options DENY always;

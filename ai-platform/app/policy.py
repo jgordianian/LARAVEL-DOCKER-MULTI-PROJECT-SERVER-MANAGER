@@ -49,7 +49,7 @@ def approximate_tokens(payload: dict) -> int:
 
 
 def require_scope_access(key: APIKey, scope: str) -> None:
-    if scope not in key.scopes:
+    if key.scopes and scope not in key.scopes:
         raise PolicyDenied("scope_denied", "This API key cannot use this endpoint.")
     owner = key.service_account
     if owner is not None and owner.allowed_scopes and scope not in owner.allowed_scopes:

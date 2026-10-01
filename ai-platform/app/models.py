@@ -74,7 +74,7 @@ class ServiceAccount(TimestampMixin, Base):
     purpose: Mapped[str] = mapped_column(String(32), default="general_api", index=True, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     allowed_models: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    allowed_scopes: Mapped[list[str]] = mapped_column(JSON, default=lambda: ["models", "chat"], nullable=False)
+    allowed_scopes: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     allowed_endpoints: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     allow_custom_system_messages: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
@@ -95,7 +95,7 @@ class APIKey(TimestampMixin, Base):
     allowed_cidrs: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     allowed_models: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     allowed_endpoints: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    scopes: Mapped[list[str]] = mapped_column(JSON, default=lambda: ["models", "chat"], nullable=False)
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     requests_per_minute: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
     tokens_per_minute: Mapped[int] = mapped_column(Integer, default=60_000, nullable=False)
     concurrent_requests: Mapped[int] = mapped_column(Integer, default=4, nullable=False)

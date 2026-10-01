@@ -87,6 +87,13 @@ def test_terminal_model_installer_uses_refreshed_catalog_and_schema_three_capabi
     assert 'catalog="$(ai_model_catalog_path)"' in catalog_functions
 
 
+def test_ai_https_proxy_accepts_base64_encoded_chat_images_up_to_the_supported_total():
+    manager = (Path(__file__).resolve().parents[2] / "laravel-server-manager.sh").read_text(encoding="utf-8")
+    ai_proxy = manager.split("ai_write_proxy_https() {", 1)[1].split("ai_configure_proxy() {", 1)[0]
+
+    assert "client_max_body_size 128m;" in ai_proxy
+
+
 def test_curated_catalog_contains_pinned_current_stable_models():
     platform_root = Path(__file__).resolve().parents[1]
     catalog = json.loads((platform_root / "config" / "model-catalog.json").read_text(encoding="utf-8"))

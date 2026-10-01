@@ -20,9 +20,10 @@ from app import controller, gateway, model_catalog as stable_catalog, web
 from app.config import get_settings
 from app.mail import EmailBranding, SMTPConfiguration, send_email, smtp_test_email
 from app.codex_setup import codex_model_catalog
-from app.capabilities import model_capability_profile
+from app.capabilities import model_api_scopes, model_capability_profile
 from app.model_catalog import load_model_catalog
 from app.models import APIKey, AuditLog, Conversation, IPRule, MessageAttachment, ModelInstance, ModelRecord, PasswordResetToken, ServiceAccount, SystemSetting, UsageRecord, User, WebSession
+from app.policy import PolicyDenied, require_model_access
 from app.security import create_web_session, generate_api_key, hash_password, verify_password
 
 
@@ -539,7 +540,60 @@ def test_reasoning_preference_is_persisted_and_sent_to_gateway(db, monkeypatch):
     assert 'id="reasoning-select"' in page.text
     assert '<option value="high" selected' in page.text
     assert 'data-saved-value="high"' in page.text
-    assert 'src="/static/chat.js?v=1.2.0-vision1"' in page.text
+    assert 'src="/static/chat.js?v=1.2.0-markdown1"' in page.text
+    assert 'href="/static/chat-extra.css?v=1.2.0-chat-layout2"' in page.text
+    assert '<footer class="chat-footer">' in page.text
+
+
+def test_chat_shows_thinking_state_until_the_first_visible_token():
+    platform_root = Path(__file__).resolve().parents[1]
+    script = (platform_root / "app" / "static" / "chat.js").read_text(encoding="utf-8")
+    styles = (platform_root / "app" / "static" / "chat-extra.css").read_text(encoding="utf-8")
+
+    assert "showThinking(output);" in script
+    assert "if (!answer) clearThinking(output);" in script
+    assert "label.textContent = translate('AI is thinking');" in script
+    assert "if (!answer) output.row.remove();" in script
+    assert "const inlineMarkdown = value =>" in script
+    assert "output.push(`<h${level}>" in script
+    assert "openList('ul');" in script
+    assert ".thinking-dots span" in styles
+    assert "@keyframes thinking-pulse" in styles
+    assert ".chat-footer { height: 42px;" in styles
+
+
+def test_chat_image_decoder_accepts_20_mb_and_rejects_larger_files():
+    assert web.MAX_CHAT_IMAGES == 10
+    assert web.MAX_CHAT_IMAGE_BYTES == 20 * 1024 * 1024
+    assert web.MAX_CHAT_IMAGE_TOTAL_BYTES == 60 * 1024 * 1024
+
+    small_image = b"\x89PNG\r\n\x1a\nsmall"
+    small_attachment = {
+        "name": "small.png",
+        "media_type": "image/png",
+        "data_url": f"data:image/png;base64,{base64.b64encode(small_image).decode()}",
+    }
+    assert len(web.decode_chat_images([small_attachment] * 10)) == 10
+    with pytest.raises(web.HTTPException) as count_exc_info:
+        web.decode_chat_images([small_attachment] * 11)
+    assert count_exc_info.value.status_code == 422
+    assert "10 images" in count_exc_info.value.detail
+
+    image = b"\x89PNG\r\n\x1a\n" + b"\0" * (web.MAX_CHAT_IMAGE_BYTES - 8)
+    attachment = {
+        "name": "large-screen.png",
+        "media_type": "image/png",
+        "data_url": f"data:image/png;base64,{base64.b64encode(image).decode()}",
+    }
+    decoded = web.decode_chat_images([attachment])
+    assert len(decoded[0]["body"]) == 20 * 1024 * 1024
+
+    oversized_image = image + bytes(1)
+    attachment["data_url"] = f"data:image/png;base64,{base64.b64encode(oversized_image).decode()}"
+    with pytest.raises(web.HTTPException) as exc_info:
+        web.decode_chat_images([attachment])
+    assert exc_info.value.status_code == 422
+    assert "20 MB" in exc_info.value.detail
 
 
 def test_portal_persists_private_images_and_sends_multimodal_content(db, monkeypatch):
@@ -581,7 +635,7 @@ def test_portal_persists_private_images_and_sends_multimodal_content(db, monkeyp
     page = client.get("/")
     assert 'data-vision="true"' in page.text
     assert 'id="image-picker"' in page.text
-    assert 'src="/static/chat.js?v=1.2.0-vision1"' in page.text
+    assert 'src="/static/chat.js?v=1.2.0-markdown1"' in page.text
 
     conversation = client.post(
         "/api/conversations",
@@ -643,7 +697,7 @@ def test_global_and_per_user_language_preferences(db):
     inherited = client.get("/")
     assert inherited.status_code == 200
     assert '<html lang="es">' in inherited.text
-    assert 'src="/static/i18n.js?v=1.2.0-models-es4"' in inherited.text
+    assert 'src="/static/i18n.js?v=1.2.0-thinking1"' in inherited.text
     assert 'class="language-menu"' in inherited.text
     assert '<span class="language-current">System</span>' in inherited.text
     assert 'name="preferred_language" value="" class="selected" aria-current="true"' in inherited.text
@@ -759,7 +813,22 @@ def test_api_key_page_builds_codex_setup_command_without_revealing_stored_secret
         allowed_scopes=["models", "responses", "tools", "coding"],
         allowed_endpoints=["/v1/models", "/v1/responses"],
     )
-    db.add_all([admin, account])
+    model = ModelRecord(
+        hf_model_id="Qwen/Qwen3-Coder",
+        alias="omnivis-coder",
+        download_status="downloaded",
+        capabilities=["chat", "coding", "agentic", "reasoning", "responses", "tool_calling"],
+        tool_calling=True,
+        tool_call_parser="qwen3_coder",
+    )
+    model.instance = ModelInstance(
+        container_name="vllm-omnivis-coder",
+        internal_url="http://vllm-omnivis-coder:8000",
+        desired_active=True,
+        status="ready",
+        gpu_assignment=[0],
+    )
+    db.add_all([admin, account, model])
     db.flush()
     raw_session, session = create_web_session(db, admin, "127.0.0.1", "test")
     db.commit()
@@ -802,6 +871,170 @@ def test_api_key_page_builds_codex_setup_command_without_revealing_stored_secret
     assert rotated_secret != secret
     assert rotated.text.count(rotated_secret) == 1
     assert f'data-created-key-id="{key.id}"' in rotated.text
+
+
+def test_service_and_api_policy_selectors_default_to_inheritance(db):
+    admin = User(
+        name="Policy Admin",
+        email="policy-admin@example.com",
+        password_hash=hash_password("GoodPassword!123"),
+        role="super_admin",
+    )
+    chat_model = ModelRecord(
+        hf_model_id="org/active-chat",
+        alias="active-chat",
+        download_status="downloaded",
+        capabilities=["chat", "responses", "coding", "tool_calling"],
+        tool_calling=True,
+        tool_call_parser="qwen3_coder",
+    )
+    chat_model.instance = ModelInstance(
+        container_name="vllm-active-chat",
+        internal_url="http://vllm-active-chat:8000",
+        desired_active=True,
+        status="ready",
+        gpu_assignment=[0],
+    )
+    embedding_model = ModelRecord(
+        hf_model_id="org/active-embedding",
+        alias="active-embedding",
+        download_status="downloaded",
+        capabilities=["embeddings"],
+    )
+    embedding_model.instance = ModelInstance(
+        container_name="vllm-active-embedding",
+        internal_url="http://vllm-active-embedding:8000",
+        desired_active=True,
+        status="ready",
+        gpu_assignment=[0],
+    )
+    inactive_model = ModelRecord(
+        hf_model_id="org/inactive",
+        alias="inactive-model",
+        capabilities=["chat", "responses"],
+    )
+    inactive_model.instance = ModelInstance(
+        container_name="vllm-inactive",
+        internal_url="http://vllm-inactive:8000",
+        desired_active=False,
+        status="inactive",
+    )
+    stale_account = ServiceAccount(
+        name="Preserved policy",
+        allowed_models=["retired-model"],
+        allowed_scopes=["chat"],
+    )
+    db.add_all([admin, chat_model, embedding_model, inactive_model, stale_account])
+    db.flush()
+    raw_session, session = create_web_session(db, admin, "127.0.0.1", "test")
+    db.commit()
+    client = TestClient(web.app)
+    client.cookies.set("ai_session", raw_session)
+
+    assert model_api_scopes(chat_model) == ["models", "chat", "responses", "tools", "coding"]
+    service_page = client.get("/admin/service-accounts")
+    assert service_page.status_code == 200
+    assert 'type="checkbox" name="allowed_models" value="active-chat"' in service_page.text
+    assert 'data-scopes="models,chat,responses,tools,coding"' in service_page.text
+    assert 'value="active-embedding"' in service_page.text
+    assert 'value="inactive-model"' not in service_page.text
+    assert "/static/policy-selectors.js?v=1.0.1" in service_page.text
+    assert 'value="retired-model" data-policy-model data-policy-stale="true" data-policy-existing="true"' in service_page.text
+    assert 'value="chat" data-policy-scope checked data-policy-existing="true"' in service_page.text
+
+    preserved_service = client.post(
+        f"/admin/service-accounts/{stale_account.id}/policy",
+        data={
+            "purpose": "general_api",
+            "allowed_models": ["retired-model"],
+            "scopes": ["chat"],
+            "csrf_token": session.csrf_token,
+        },
+        follow_redirects=False,
+    )
+    assert preserved_service.status_code == 303
+    db.refresh(stale_account)
+    assert stale_account.allowed_models == ["retired-model"]
+    assert stale_account.allowed_scopes == ["chat"]
+
+    created_service = client.post(
+        "/admin/service-accounts",
+        data={
+            "name": "Inherited policy",
+            "purpose": "general_api",
+            "allowed_endpoints": "",
+            "csrf_token": session.csrf_token,
+        },
+        follow_redirects=False,
+    )
+    assert created_service.status_code == 303
+    inherited_account = db.scalar(select(ServiceAccount).where(ServiceAccount.name == "Inherited policy"))
+    assert inherited_account.allowed_models == []
+    assert inherited_account.allowed_scopes == []
+
+    explicit_service = client.post(
+        "/admin/service-accounts",
+        data={
+            "name": "Chat policy",
+            "purpose": "coding_agent",
+            "allowed_models": ["active-chat"],
+            "scopes": ["chat", "responses"],
+            "allowed_endpoints": "",
+            "csrf_token": session.csrf_token,
+        },
+        follow_redirects=False,
+    )
+    assert explicit_service.status_code == 303
+    chat_account = db.scalar(select(ServiceAccount).where(ServiceAccount.name == "Chat policy"))
+    assert chat_account.allowed_models == ["active-chat"]
+    assert chat_account.allowed_scopes == ["chat", "responses"]
+
+    invalid_service = client.post(
+        "/admin/service-accounts",
+        data={
+            "name": "Invalid policy",
+            "allowed_models": ["active-chat"],
+            "scopes": ["embeddings"],
+            "csrf_token": session.csrf_token,
+        },
+    )
+    assert invalid_service.status_code == 422
+
+    api_page = client.get("/admin/api-keys")
+    assert api_page.status_code == 200
+    assert "Leave blank to inherit all scopes from the service account." in api_page.text
+    assert not re.search(r'name="scopes"[^>]*checked', api_page.text)
+
+    created_key = client.post(
+        "/admin/api-keys",
+        data={
+            "name": "Inherited key",
+            "owner_type": "service_account",
+            "owner_id": str(chat_account.id),
+            "csrf_token": session.csrf_token,
+        },
+    )
+    assert created_key.status_code == 200
+    key = db.scalar(select(APIKey).where(APIKey.name == "Inherited key"))
+    assert key.allowed_models == []
+    assert key.scopes == []
+    require_model_access(key, "active-chat", "chat")
+    with pytest.raises(PolicyDenied):
+        require_model_access(key, "active-embedding", "chat")
+    with pytest.raises(PolicyDenied):
+        require_model_access(key, "active-chat", "tools")
+
+    invalid_key = client.post(
+        "/admin/api-keys",
+        data={
+            "name": "Expanded key",
+            "owner_type": "service_account",
+            "owner_id": str(chat_account.id),
+            "scopes": ["tools"],
+            "csrf_token": session.csrf_token,
+        },
+    )
+    assert invalid_key.status_code == 422
 
 
 def test_spanish_dictionary_covers_every_static_admin_literal():
@@ -1275,8 +1508,8 @@ def test_admin_models_guided_catalog_registers_all_reviewed_capabilities(db):
     assert 'action="/admin/models/catalog/refresh"' in page.text
     assert 'class="secondary catalog-refresh-button"' in page.text
     assert 'aria-label="Refresh stable catalog"' in page.text
-    assert "/static/models-guided.js?v=1.2.0-refresh1" in page.text
-    assert "/static/i18n.js?v=1.2.0-models-es4" in page.text
+    assert "/static/models-guided.js?v=1.2.0-jobs1" in page.text
+    assert "/static/i18n.js?v=1.2.0-thinking1" in page.text
 
     response = client.post(
         "/admin/models/catalog",
@@ -1303,6 +1536,8 @@ def test_admin_models_guided_catalog_registers_all_reviewed_capabilities(db):
     assert model.instance.max_num_seqs == 2
     assert model.instance.gpu_memory_utilization == 0.82
     assert model.instance.extra_args == ["--reasoning-parser", "qwen3"]
+    model_page = client.get("/admin/models")
+    assert '<option value="AUTO" selected>AUTO</option>' in model_page.text
 
     model.capabilities = ["chat"]
     model.tool_calling = False
@@ -1321,7 +1556,7 @@ def test_admin_models_guided_catalog_registers_all_reviewed_capabilities(db):
             "gpu_memory_utilization": model.instance.gpu_memory_utilization,
             "cpu_offload_gb": 0,
             "swap_space_gb": 4,
-            "performance_profile": "AUTO",
+            "performance_profile": "AUTOMÁTICO",
             "system_prompt": "",
             "chat_template": "",
             "csrf_token": session.csrf_token,
@@ -1333,7 +1568,24 @@ def test_admin_models_guided_catalog_registers_all_reviewed_capabilities(db):
     assert model.capabilities == catalog_entry["capabilities"]
     assert model.tool_calling is True
     assert model.tool_call_parser == "qwen3_coder"
+    assert model.instance.performance_profile == "AUTO"
     assert model.config["catalog_version"] == load_model_catalog()["catalog_version"]
+
+    invalid_profile = client.post(
+        f"/admin/models/{model.id}/configure",
+        data={
+            "alias": model.alias,
+            "performance_profile": "invalid-profile",
+            "csrf_token": session.csrf_token,
+        },
+        follow_redirects=False,
+    )
+    assert invalid_profile.status_code == 303
+    assert invalid_profile.headers["location"] == (
+        f"/admin/models?error=invalid-performance-profile&error_alias={model.alias}#model-{model.id}"
+    )
+    error_page = client.get(invalid_profile.headers["location"])
+    assert "The selected performance profile is invalid." in error_page.text
 
     duplicate = client.post(
         "/admin/models/catalog",
@@ -1532,3 +1784,107 @@ def test_model_inspection_and_active_performance_controls_render_inside_admin(db
     assert performance.status_code == 200
     assert "The model is active." in performance.text
     assert "Deactivate to change profile" in performance.text
+
+
+def test_performance_activation_is_queued_and_polled_in_background(db, monkeypatch, tmp_path):
+    admin = User(
+        name="Performance Admin",
+        email="performance-queue@example.com",
+        password_hash=hash_password("GoodPassword!123"),
+        role="super_admin",
+    )
+    model = ModelRecord(
+        hf_model_id="Qwen/Qwen3.5-4B",
+        alias="queued-performance-model",
+        download_status="downloaded",
+        local_path="/models/qwen3.5-4b",
+        capabilities=["chat", "reasoning"],
+        estimated_weight_gb=8.5,
+        max_model_len=8192,
+    )
+    model.instance = ModelInstance(
+        container_name="vllm-queued-performance-model",
+        internal_url="http://127.0.0.1:19001",
+        desired_active=False,
+        status="inactive",
+        gpu_assignment=[0],
+        performance_profile="AUTO",
+    )
+    db.add_all([admin, model])
+    db.flush()
+    raw, session = create_web_session(db, admin, "127.0.0.1", "test")
+    db.commit()
+
+    hardware_dir = tmp_path / "hardware"
+    hardware_dir.mkdir()
+    (hardware_dir / "current.json").write_text('{"gpus": []}', encoding="utf-8")
+    monkeypatch.setattr(web, "DATA_ROOT", tmp_path)
+
+    monkeypatch.setattr(
+        web,
+        "recommend_profile",
+        lambda *_args: {
+            "profile": "AUTO",
+            "resolved_profile": "PERFORMANCE",
+            "gpu_memory_utilization": 0.82,
+            "max_model_len": 8192,
+            "max_num_seqs": 2,
+            "max_num_batched_tokens": 8192,
+        },
+    )
+    monkeypatch.setattr(web, "compatibility_analysis", lambda *_args: {"safe": True, "label": "SAFE"})
+    queued_call = {}
+
+    async def queue_activation(model_id, action, params=None):
+        queued_call.update(model_id=model_id, action=action, params=params)
+        return httpx.Response(202, json={"status": "queued", "model_id": model_id})
+
+    monkeypatch.setattr(web, "controller_action", queue_activation)
+    client = TestClient(web.app)
+    client.cookies.set("ai_session", raw)
+
+    response = client.post(
+        f"/admin/performance/{model.id}",
+        data={
+            "profile": "AUTO",
+            "activate_after_apply": "true",
+            "csrf_token": session.csrf_token,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        f"/admin/performance?result=activation-queued#model-{model.id}"
+    )
+    assert queued_call == {
+        "model_id": model.id,
+        "action": "install",
+        "params": {"activate": True, "set_default": False, "force_download": False},
+    }
+    db.expire_all()
+    saved = db.get(ModelRecord, model.id)
+    assert saved.instance.performance_profile == "AUTO"
+    assert saved.instance.desired_active is False
+    assert db.scalar(select(AuditLog).where(AuditLog.action == "model.performance_activation_queued")) is not None
+
+    saved.config = {
+        **saved.config,
+        "guided_install": {
+            "status": "queued",
+            "phase": "activation",
+            "activate": True,
+            "set_default": False,
+            "force_download": False,
+            "error": None,
+        },
+    }
+    db.commit()
+    (hardware_dir / "current.json").unlink()
+    progress = client.get("/admin/performance?result=activation-queued")
+    assert progress.status_code == 200
+    assert "Model activation is running in the background." in progress.text
+    assert f'data-install-status-url="/admin/models/{model.id}/status"' in progress.text
+    assert f'data-install-success-url="/admin/performance?result=applied-activated#model-{model.id}"' in progress.text
+    assert 'data-install-operation="activation"' in progress.text
+    assert "/static/models-guided.js?v=1.2.0-jobs1" in progress.text

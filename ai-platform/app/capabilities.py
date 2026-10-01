@@ -36,6 +36,9 @@ API_ENDPOINTS = frozenset(
     }
 )
 
+API_SCOPES = frozenset({"models", "chat", "completions", "responses", "embeddings", "tools", "coding"})
+API_SCOPE_ORDER = ("models", "chat", "completions", "responses", "embeddings", "tools", "coding")
+
 SERVICE_ACCOUNT_PURPOSES = frozenset({"general_api", "omnivis_production", "coding_agent", "custom"})
 
 
@@ -134,6 +137,23 @@ def model_capability_profile(model, catalog: dict[str, Any] | None = None) -> di
 def model_capabilities(model) -> set[str]:
     """Return the reviewed capabilities that are actually available."""
     return set(model_capability_profile(model)["capabilities"])
+
+
+def api_scopes_for_capabilities(capabilities: Iterable[str]) -> list[str]:
+    """Return Gateway policy scopes supported by a model capability set."""
+    values = set(capabilities)
+    scopes = {"models"}
+    scopes.update(values.intersection({"chat", "completions", "responses", "embeddings"}))
+    if "tool_calling" in values:
+        scopes.add("tools")
+    if values.intersection({"coding", "agentic"}):
+        scopes.add("coding")
+    return [scope for scope in API_SCOPE_ORDER if scope in scopes]
+
+
+def model_api_scopes(model) -> list[str]:
+    """Return scopes currently usable with an exact registered model revision."""
+    return api_scopes_for_capabilities(model_capabilities(model))
 
 
 def normalize_endpoints(values: Iterable[str]) -> list[str]:

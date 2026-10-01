@@ -7,6 +7,7 @@
     <h1>Performance & hardware</h1>
     <p class="muted">Every value is an estimate and hardware safety limits always win. Runtime parameters are changed only while a model is stopped.</p>
     {% if notice %}<div class="alert success">{{ notice }}</div>{% endif %}
+    {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
     {% if changes.changed %}<div class="alert warning"><strong>Hardware change detected.</strong> Upgrade: {{ changes.upgrade_detected }} · downgrade: {{ changes.downgrade_detected }} · model review: {{ changes.requires_model_review }}</div>{% endif %}
 
     <article class="panel">
@@ -23,7 +24,8 @@
     </article>
 
     {% for model in models %}
-    <article class="panel">
+    {% set install_job = model.config.get('guided_install', {}) %}
+    <article class="panel" id="model-{{ model.id }}">
       <div class="heading">
         <div><h2>{{ model.alias }}</h2><small>{{ model.hf_model_id }}</small></div>
         <span class="pill">{{ model.instance.performance_profile if model.instance else 'unconfigured' }}</span>
@@ -39,7 +41,14 @@
         <dt>Tensor parallel</dt><dd>{{ model.instance.tensor_parallel_size }}</dd>
       </dl>
 
-      {% if model.instance.desired_active %}
+      {% if install_job.get('status') in ['queued', 'running'] and install_job.get('activate') %}
+      <div class="alert warning model-install-progress" data-install-status-url="/admin/models/{{ model.id }}/status" data-install-success-url="/admin/performance?result=applied-activated#model-{{ model.id }}" data-install-operation="activation">
+        <strong>Model activation is running in the background.</strong>
+        <span data-install-message>{{ 'Validating capacity and activating…' if install_job.get('status') == 'running' else 'Activation queued…' }}</span>
+      </div>
+      {% elif install_job.get('status') == 'failed' and install_job.get('activate') %}
+      <div class="alert error"><strong>Background activation failed.</strong> {{ install_job.get('error') or model.instance.last_error or '' }}</div>
+      {% elif model.instance.desired_active %}
       <div class="alert warning"><strong>The model is active.</strong> Stop it before changing runtime parameters. Existing weights and configuration are preserved; active requests will be interrupted.</div>
       <form method="post" action="/admin/performance/{{ model.id }}/deactivate" class="actions">
         <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
@@ -66,3 +75,4 @@
   </section>
 </div>
 {% endblock %}
+{% block scripts %}<script src="/static/models-guided.js?v=1.2.0-jobs1" defer></script>{% endblock %}

@@ -22,9 +22,10 @@
   let savedReasoning = reasoning.dataset.savedValue || reasoning.value;
   let pendingImages = [];
   let imageStatusError = '';
-  const MAX_IMAGES = 4;
-  const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
-  const MAX_TOTAL_IMAGE_BYTES = 5 * 1024 * 1024 / 2;
+  const MAX_IMAGES = 10;
+  const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+  const MAX_TOTAL_IMAGE_BYTES = 60 * 1024 * 1024;
+  const translate = value => window.aiTranslate ? window.aiTranslate(value) : value;
 
   const modelSupportsReasoning = () => model.selectedOptions[0]?.dataset.reasoning === 'true';
   const modelSupportsVision = () => model.selectedOptions[0]?.dataset.vision === 'true';
@@ -75,18 +76,117 @@
       ? 'The selected model does not support image inputs.'
       : imageStatusError
         ? imageStatusError
-        : (pendingImages.length ? `${pendingImages.length} of ${MAX_IMAGES} images ready` : 'PNG, JPEG or WebP · 2 MB per image');
+        : (pendingImages.length ? `${pendingImages.length} of ${MAX_IMAGES} images ready` : 'Up to 10 images · PNG, JPEG or WebP · 20 MB each · 60 MB total');
   };
 
   const escapeHtml = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const highlight = value => value.replace(/\b(const|let|var|function|class|def|return|if|else|for|while|async|await|import|from|try|catch|except|true|false|null|None)\b/g, '<span class="syntax-keyword">$1</span>');
+  const inlineMarkdown = value => {
+    const codeFragments = [];
+    let safe = escapeHtml(value).replace(/`([^`\n]+)`/g, (_, code) => {
+      const token = `\u0000CODE${codeFragments.length}\u0000`;
+      codeFragments.push(`<code>${code}</code>`);
+      return token;
+    });
+    safe = safe.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    safe = safe.replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
+    safe = safe.replace(/(^|[\s(])\*([^*\n]+)\*(?=$|[\s).,!?:;])/g, '$1<em>$2</em>');
+    safe = safe.replace(/(^|[\s(])_([^_\n]+)_(?=$|[\s).,!?:;])/g, '$1<em>$2</em>');
+    codeFragments.forEach((fragment, index) => {
+      safe = safe.replace(`\u0000CODE${index}\u0000`, fragment);
+    });
+    return safe;
+  };
   const markdown = value => {
-    let safe = escapeHtml(value);
-    safe = safe.replace(/```([\w-]*)\n([\s\S]*?)```/g, (_, lang, code) =>
-      `<pre><button type="button" class="copy-code">Copy</button><code data-lang="${lang}">${highlight(code)}</code></pre>`);
-    safe = safe.replace(/`([^`]+)`/g, '<code>$1</code>');
-    safe = safe.replace(new RegExp('\\\\*\\\\*([^*]+)\\\\*\\\\*', 'g'), '<strong>$1</strong>');
-    return safe.replace(/\n/g, '<br>');
+    const lines = String(value).replace(/\r\n?/g, '\n').split('\n');
+    const output = [];
+    let paragraph = [];
+    let listType = '';
+    let inFence = false;
+    let fenceLanguage = '';
+    let fenceLines = [];
+
+    const closeParagraph = () => {
+      if (!paragraph.length) return;
+      output.push(`<p>${paragraph.map(inlineMarkdown).join('<br>')}</p>`);
+      paragraph = [];
+    };
+    const closeList = () => {
+      if (!listType) return;
+      output.push(`</${listType}>`);
+      listType = '';
+    };
+    const openList = type => {
+      closeParagraph();
+      if (listType === type) return;
+      closeList();
+      listType = type;
+      output.push(`<${type}>`);
+    };
+    const closeFence = () => {
+      const language = escapeHtml(fenceLanguage);
+      const code = highlight(escapeHtml(fenceLines.join('\n')));
+      output.push(`<pre><button type="button" class="copy-code">Copy</button><code data-lang="${language}">${code}</code></pre>`);
+      inFence = false;
+      fenceLanguage = '';
+      fenceLines = [];
+    };
+
+    for (const line of lines) {
+      const fence = line.match(/^\s*```([\w-]*)\s*$/);
+      if (fence) {
+        if (inFence) closeFence();
+        else {
+          closeParagraph();
+          closeList();
+          inFence = true;
+          fenceLanguage = fence[1] || '';
+        }
+        continue;
+      }
+      if (inFence) {
+        fenceLines.push(line);
+        continue;
+      }
+      if (!line.trim()) {
+        closeParagraph();
+        closeList();
+        continue;
+      }
+      const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+)$/);
+      if (heading) {
+        closeParagraph();
+        closeList();
+        const level = heading[1].length;
+        output.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`);
+        continue;
+      }
+      const unordered = line.match(/^\s*[-+*]\s+(.+)$/);
+      if (unordered) {
+        openList('ul');
+        output.push(`<li>${inlineMarkdown(unordered[1])}</li>`);
+        continue;
+      }
+      const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+      if (ordered) {
+        openList('ol');
+        output.push(`<li>${inlineMarkdown(ordered[1])}</li>`);
+        continue;
+      }
+      const quote = line.match(/^\s*>\s?(.*)$/);
+      if (quote) {
+        closeParagraph();
+        closeList();
+        output.push(`<blockquote>${inlineMarkdown(quote[1])}</blockquote>`);
+        continue;
+      }
+      closeList();
+      paragraph.push(line.trim());
+    }
+    closeParagraph();
+    closeList();
+    if (inFence) closeFence();
+    return output.join('');
   };
   const wireCopyButtons = container => {
     container.querySelectorAll('.copy-code').forEach(button => button.addEventListener('click', async () => {
@@ -98,6 +198,27 @@
   const renderContent = (container, content) => {
     container.innerHTML = markdown(content);
     wireCopyButtons(container);
+  };
+  const showThinking = output => {
+    output.row.classList.add('is-thinking');
+    const indicator = document.createElement('div');
+    indicator.className = 'thinking-indicator';
+    indicator.setAttribute('role', 'status');
+    indicator.setAttribute('aria-live', 'polite');
+    const label = document.createElement('span');
+    label.className = 'thinking-label';
+    label.textContent = translate('AI is thinking');
+    const dots = document.createElement('span');
+    dots.className = 'thinking-dots';
+    dots.setAttribute('aria-hidden', 'true');
+    dots.append(document.createElement('span'), document.createElement('span'), document.createElement('span'));
+    indicator.append(label, dots);
+    output.target.replaceChildren(indicator);
+  };
+  const clearThinking = output => {
+    if (!output.row.classList.contains('is-thinking')) return;
+    output.row.classList.remove('is-thinking');
+    output.target.replaceChildren();
   };
   const addAssistantActions = (actions, row) => {
     if (actions.childElementCount) return;
@@ -206,7 +327,9 @@
     else messages.querySelector('.message.assistant:last-of-type')?.remove();
     prompt.value = ''; prompt.style.height = 'auto';
     const output = bubble('assistant', '', null, false);
+    showThinking(output);
     aborter = new AbortController(); stop.hidden = false; send.disabled = true;
+    let answer = '';
     try {
       const response = await fetch('/api/chat', {
         method: 'POST', headers: {'Content-Type':'application/json'}, signal:aborter.signal,
@@ -219,7 +342,7 @@
       if (!regenerate) clearPendingImages();
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let buffer = '', answer = '';
+      let buffer = '';
       while (true) {
         const {value, done} = await reader.read();
         if (done) break;
@@ -232,7 +355,10 @@
             try {
               const data = JSON.parse(line.slice(6));
               for (const choice of data.choices || []) {
-                answer += choice.delta?.content || '';
+                const contentDelta = choice.delta?.content || '';
+                if (!contentDelta) continue;
+                if (!answer) clearThinking(output);
+                answer += contentDelta;
                 output.row.dataset.content = answer;
                 renderContent(output.target, answer);
                 messages.scrollTop = messages.scrollHeight;
@@ -241,14 +367,22 @@
           }
         }
       }
-      addAssistantActions(output.actions, output.row);
+      if (!answer) {
+        clearThinking(output);
+        output.row.dataset.content = translate('No response was generated.');
+        renderContent(output.target, output.row.dataset.content);
+      }
       await refreshConversationList();
     } catch (error) {
-      if (error.name !== 'AbortError') {
+      clearThinking(output);
+      if (error.name === 'AbortError') {
+        if (!answer) output.row.remove();
+      } else {
         output.row.dataset.content = `Error: ${error.message}`;
         renderContent(output.target, output.row.dataset.content);
       }
     } finally {
+      if (output.row.isConnected && output.row.dataset.content) addAssistantActions(output.actions, output.row);
       aborter = null; stop.hidden = true; send.disabled = false; syncImageAvailability();
     }
   };
@@ -330,12 +464,12 @@
         break;
       }
       if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size <= 0 || file.size > MAX_IMAGE_BYTES) {
-        imageStatusError = 'Each image must be PNG, JPEG or WebP and no larger than 2 MB.';
+        imageStatusError = 'Each image must be PNG, JPEG or WebP and no larger than 20 MB.';
         continue;
       }
       const total = pendingImages.reduce((sum, item) => sum + item.size, 0) + file.size;
       if (total > MAX_TOTAL_IMAGE_BYTES) {
-        imageStatusError = 'The combined image size cannot exceed 2.5 MB.';
+        imageStatusError = 'The combined image size cannot exceed 60 MB.';
         break;
       }
       const dataUrl = await new Promise((resolve, reject) => {

@@ -22,7 +22,9 @@ from sqlalchemy.orm import Session
 
 from . import __version__
 from .capabilities import (
+    API_SCOPE_ORDER,
     MODEL_CAPABILITIES,
+    model_api_scopes,
     model_capability_profile,
     model_capabilities,
     normalize_capabilities,
@@ -69,6 +71,17 @@ from .security import (
 
 
 settings = get_settings()
+PERFORMANCE_PROFILE_VALUES = {"AUTO", "CONSERVATIVE", "BALANCED", "PERFORMANCE", "MAXIMUM", "CUSTOM"}
+PERFORMANCE_PROFILE_ALIASES = {
+    "AUTOMÁTICO": "AUTO",
+    "AUTOMATICO": "AUTO",
+    "CONSERVADOR": "CONSERVATIVE",
+    "EQUILIBRADO": "BALANCED",
+    "RENDIMIENTO": "PERFORMANCE",
+    "MÁXIMO": "MAXIMUM",
+    "MAXIMO": "MAXIMUM",
+    "PERSONALIZADO": "CUSTOM",
+}
 BASE = Path(__file__).resolve().parent
 CONTAINER_PLATFORM_ROOT = Path("/platform")
 DATA_ROOT = CONTAINER_PLATFORM_ROOT if settings.ai_runtime_mode == "docker" and CONTAINER_PLATFORM_ROOT.is_dir() else settings.ai_platform_root
@@ -97,9 +110,9 @@ BRANDING_DEFAULTS = {
 }
 BRAND_ASSET_SLOTS = {"logo_light", "logo_dark", "login_logo", "favicon"}
 MAX_BRAND_ASSET_BYTES = 2 * 1024 * 1024
-MAX_CHAT_IMAGE_BYTES = 2 * 1024 * 1024
-MAX_CHAT_IMAGE_TOTAL_BYTES = 5 * 1024 * 1024 // 2
-MAX_CHAT_IMAGES = 4
+MAX_CHAT_IMAGES = 10
+MAX_CHAT_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_CHAT_IMAGE_TOTAL_BYTES = 60 * 1024 * 1024
 CHAT_IMAGE_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -316,10 +329,10 @@ def decode_chat_images(value: Any) -> list[dict[str, Any]]:
         except (binascii.Error, ValueError):
             raise HTTPException(422, "invalid base64 image data") from None
         if not body or len(body) > MAX_CHAT_IMAGE_BYTES:
-            raise HTTPException(422, "each image must be between 1 byte and 2 MB")
+            raise HTTPException(422, "each image must be between 1 byte and 20 MB")
         total += len(body)
         if total > MAX_CHAT_IMAGE_TOTAL_BYTES:
-            raise HTTPException(422, "the combined image size exceeds 2.5 MB")
+            raise HTTPException(422, "the combined image size exceeds 60 MB")
         extension = chat_image_extension(body, media_type)
         filename = Path(str(item.get("name", f"image.{extension}"))).name.strip()[:255] or f"image.{extension}"
         decoded.append({"body": body, "media_type": media_type, "filename": filename, "extension": extension})
@@ -1308,18 +1321,98 @@ def user_toggle(user_id: int, request: Request, csrf_token: str = Form(), db: Se
     return RedirectResponse("/admin/users", 303)
 
 
+def normalized_form_selections(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    """Accept repeated form fields while retaining compatibility with comma-separated clients."""
+    normalized: list[str] = []
+    for value in values or []:
+        for item in str(value).split(","):
+            item = item.strip()
+            if item and item not in normalized:
+                normalized.append(item)
+    return normalized
+
+
+def active_policy_models(db: Session) -> list[ModelRecord]:
+    return db.scalars(
+        select(ModelRecord)
+        .join(ModelInstance)
+        .where(ModelInstance.desired_active.is_(True), ModelInstance.status == "ready")
+        .order_by(ModelRecord.alias)
+    ).all()
+
+
+def policy_selector_options(db: Session) -> tuple[list[dict[str, Any]], list[str]]:
+    options = [
+        {
+            "alias": model.alias,
+            "model_id": model.hf_model_id,
+            "scopes": model_api_scopes(model),
+        }
+        for model in active_policy_models(db)
+    ]
+    available = {"models"}
+    for option in options:
+        available.update(option["scopes"])
+    return options, [scope for scope in API_SCOPE_ORDER if scope in available]
+
+
+def validate_policy_selections(
+    db: Session,
+    model_values: list[str] | tuple[str, ...] | None,
+    scope_values: list[str] | tuple[str, ...] | None,
+    *,
+    owner: ServiceAccount | None = None,
+    existing_models: list[str] | tuple[str, ...] | None = None,
+    existing_scopes: list[str] | tuple[str, ...] | None = None,
+) -> tuple[list[str], list[str]]:
+    selected_models = normalized_form_selections(model_values)
+    selected_scopes = normalized_form_selections(scope_values)
+    models = {model.alias: model for model in active_policy_models(db)}
+    preserved_models = set(existing_models or [])
+    preserved_scopes = set(existing_scopes or [])
+    unknown_models = sorted(set(selected_models) - set(models) - preserved_models)
+    if unknown_models:
+        raise ValueError(f"select only active models: {', '.join(unknown_models)}")
+
+    owner_models = set(models)
+    if owner is not None and owner.allowed_models:
+        owner_models.intersection_update(owner.allowed_models)
+        outside_owner = sorted(set(selected_models) - set(owner.allowed_models))
+        if outside_owner:
+            raise ValueError(f"the API key cannot exceed its service-account models: {', '.join(outside_owner)}")
+    active_selections = set(selected_models).intersection(models)
+    effective_models = active_selections if active_selections else owner_models
+
+    available_scopes = {"models"}
+    for alias in effective_models:
+        model = models.get(alias)
+        if model is not None:
+            available_scopes.update(model_api_scopes(model))
+    if owner is not None and owner.allowed_scopes:
+        available_scopes.intersection_update(owner.allowed_scopes)
+    unavailable_scopes = sorted(set(selected_scopes) - available_scopes - preserved_scopes)
+    if unavailable_scopes:
+        raise ValueError(f"select only scopes available to the chosen models and owner: {', '.join(unavailable_scopes)}")
+    return selected_models, selected_scopes
+
+
 @app.get("/admin/service-accounts", response_class=HTMLResponse)
 def service_accounts_page(request: Request, db: Session = Depends(get_db)):
     session = require_admin(request, db)
     accounts = db.scalars(select(ServiceAccount).order_by(ServiceAccount.name)).all()
     quotas = db.scalars(select(Quota).where(Quota.subject_type == "service_account")).all()
-    return render(request, "service_accounts.html", session=session, accounts=accounts, quota_map={quota.subject_id: quota.limits for quota in quotas})
+    policy_models, policy_scopes = policy_selector_options(db)
+    return render(
+        request, "service_accounts.html", session=session, accounts=accounts,
+        quota_map={quota.subject_id: quota.limits for quota in quotas},
+        policy_models=policy_models, policy_scopes=policy_scopes,
+    )
 
 
 @app.post("/admin/service-accounts")
 def service_account_create(
     request: Request, name: str = Form(), description: str = Form(""), purpose: str = Form("general_api"),
-    allowed_models: str = Form(""), scopes: str = Form("models,chat"), allowed_endpoints: str = Form(""),
+    allowed_models: list[str] = Form([]), scopes: list[str] = Form([]), allowed_endpoints: str = Form(""),
     allow_custom_system_messages: bool = Form(False), csrf_token: str = Form(), db: Session = Depends(get_db),
 ):
     session = require_admin(request, db)
@@ -1330,13 +1423,14 @@ def service_account_create(
     try:
         normalized_purpose = validate_service_account_purpose(purpose)
         endpoints = normalize_endpoints(v.strip() for v in allowed_endpoints.split(","))
+        selected_models, selected_scopes = validate_policy_selections(db, allowed_models, scopes)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
     account = ServiceAccount(
         name=name, description=description.strip()[:2000],
         purpose=normalized_purpose,
-        allowed_models=[v.strip() for v in allowed_models.split(",") if v.strip()],
-        allowed_scopes=[v.strip() for v in scopes.split(",") if v.strip()],
+        allowed_models=selected_models,
+        allowed_scopes=selected_scopes,
         allowed_endpoints=endpoints,
         allow_custom_system_messages=allow_custom_system_messages,
     )
@@ -1362,8 +1456,8 @@ def service_account_toggle(account_id: int, request: Request, csrf_token: str = 
 
 @app.post("/admin/service-accounts/{account_id}/policy")
 def service_account_policy(
-    account_id: int, request: Request, purpose: str = Form("general_api"), allowed_models: str = Form(""),
-    scopes: str = Form("models,chat"), allowed_endpoints: str = Form(""),
+    account_id: int, request: Request, purpose: str = Form("general_api"), allowed_models: list[str] = Form([]),
+    scopes: list[str] = Form([]), allowed_endpoints: str = Form(""),
     allow_custom_system_messages: bool = Form(False), requests_per_minute: int = Form(60),
     tokens_per_minute: int = Form(60000), concurrent_requests: int = Form(4), requests_per_day: int = Form(10000),
     requests_per_month: int = Form(100000), tokens_per_day: int = Form(2000000), tokens_per_month: int = Form(20000000),
@@ -1377,10 +1471,17 @@ def service_account_policy(
     try:
         account.purpose = validate_service_account_purpose(purpose)
         account.allowed_endpoints = normalize_endpoints(value.strip() for value in allowed_endpoints.split(","))
+        selected_models, selected_scopes = validate_policy_selections(
+            db,
+            allowed_models,
+            scopes,
+            existing_models=account.allowed_models,
+            existing_scopes=account.allowed_scopes,
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
-    account.allowed_models = [value.strip() for value in allowed_models.split(",") if value.strip()]
-    account.allowed_scopes = [value.strip() for value in scopes.split(",") if value.strip()]
+    account.allowed_models = selected_models
+    account.allowed_scopes = selected_scopes
     account.allow_custom_system_messages = allow_custom_system_messages
     limits = {
         "requests_per_minute": max(0, requests_per_minute), "tokens_per_minute": max(0, tokens_per_minute),
@@ -1411,6 +1512,7 @@ def api_keys_response(
         installer_url = f"https://{settings.cloudflare_api_hostname.strip().rstrip('.')}/v1/codex/install"
     else:
         installer_url = f"{str(request.base_url).rstrip('/')}/v1/codex/install"
+    policy_models, policy_scopes = policy_selector_options(db)
     return render(
         request, "api_keys.html", session=session,
         keys=db.scalars(select(APIKey).order_by(APIKey.created_at.desc())).all(),
@@ -1419,6 +1521,8 @@ def api_keys_response(
         created_secret=created_secret,
         created_key_id=created_key_id,
         codex_installer_url=installer_url,
+        policy_models=policy_models,
+        policy_scopes=policy_scopes,
     )
 
 
@@ -1431,7 +1535,7 @@ def api_keys_page(request: Request, db: Session = Depends(get_db)):
 @app.post("/admin/api-keys", response_class=HTMLResponse)
 def api_key_create(
     request: Request, name: str = Form(), owner_type: str = Form(), owner_id: int = Form(),
-    allowed_models: str = Form(""), allowed_cidrs: str = Form(""), scopes: str = Form("models,chat"),
+    allowed_models: list[str] = Form([]), allowed_cidrs: str = Form(""), scopes: list[str] = Form([]),
     allowed_endpoints: str = Form(""),
     requests_per_minute: int = Form(60), tokens_per_minute: int = Form(60000), concurrent_requests: int = Form(4),
     requests_per_day: int = Form(10000), requests_per_month: int = Form(100000),
@@ -1441,17 +1545,24 @@ def api_key_create(
 ):
     session = require_admin(request, db)
     verify_csrf(request, session, csrf_token)
+    if owner_type not in {"user", "service_account"}:
+        raise HTTPException(422, "valid owner type is required")
+    owner_user = db.get(User, owner_id) if owner_type == "user" else None
+    owner_account = db.get(ServiceAccount, owner_id) if owner_type == "service_account" else None
+    if owner_type == "user" and (owner_user is None or not owner_user.enabled):
+        raise HTTPException(422, "enabled user owner not found")
+    if owner_type == "service_account" and (owner_account is None or not owner_account.enabled):
+        raise HTTPException(422, "enabled service account owner not found")
     cidrs = [value.strip() for value in allowed_cidrs.split(",") if value.strip()]
     try:
         parse_networks(cidrs)
         endpoints = normalize_endpoints(value.strip() for value in allowed_endpoints.split(","))
+        selected_models, selected_scopes = validate_policy_selections(
+            db, allowed_models, scopes, owner=owner_account,
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
     secret, key_id, prefix, secret_hash = generate_api_key(settings)
-    if owner_type == "user" and db.get(User, owner_id) is None:
-        raise HTTPException(422, "user owner not found")
-    if owner_type == "service_account" and db.get(ServiceAccount, owner_id) is None:
-        raise HTTPException(422, "service account owner not found")
     expiry = None
     if expires_at:
         try:
@@ -1463,9 +1574,9 @@ def api_key_create(
         name=name.strip()[:160], key_id=key_id, key_prefix=prefix, secret_hash=secret_hash,
         user_id=owner_id if owner_type == "user" else None,
         service_account_id=owner_id if owner_type == "service_account" else None,
-        allowed_models=[value.strip() for value in allowed_models.split(",") if value.strip()],
+        allowed_models=selected_models,
         allowed_cidrs=cidrs,
-        scopes=[value.strip() for value in scopes.split(",") if value.strip()],
+        scopes=selected_scopes,
         allowed_endpoints=endpoints,
         requests_per_minute=max(0, requests_per_minute), tokens_per_minute=max(0, tokens_per_minute),
         concurrent_requests=max(1, concurrent_requests),
@@ -1478,7 +1589,10 @@ def api_key_create(
         raise HTTPException(422, "valid owner is required")
     db.add(key)
     db.flush()
-    audit(db, session, request, "api_key.created", "api_key", key.id, after={"prefix": prefix, "models": key.allowed_models, "cidrs": cidrs})
+    audit(
+        db, session, request, "api_key.created", "api_key", key.id,
+        after={"prefix": prefix, "models": key.allowed_models, "scopes": key.scopes, "cidrs": cidrs},
+    )
     db.commit()
     return api_keys_response(request, session, db, created_secret=secret, created_key_id=key.id)
 
@@ -1961,8 +2075,13 @@ def model_configure(
         raise HTTPException(422, "selected GPU count must equal tensor x pipeline parallel workers")
     if not 0.1 <= gpu_memory_utilization <= 0.95 or cpu_offload_gb < 0 or swap_space_gb < 0:
         raise HTTPException(422, "invalid memory configuration")
-    if performance_profile not in {"AUTO", "CONSERVATIVE", "BALANCED", "PERFORMANCE", "MAXIMUM", "CUSTOM"}:
-        raise HTTPException(422, "invalid performance profile")
+    performance_profile = performance_profile.strip().upper()
+    performance_profile = PERFORMANCE_PROFILE_ALIASES.get(performance_profile, performance_profile)
+    if performance_profile not in PERFORMANCE_PROFILE_VALUES:
+        return RedirectResponse(
+            f"/admin/models?error=invalid-performance-profile&error_alias={model.alias}#model-{model.id}",
+            303,
+        )
     before = {"alias": model.alias, "instance": {"gpus": model.instance.gpu_assignment, "tensor_parallel_size": model.instance.tensor_parallel_size, "profile": model.instance.performance_profile}}
     capability_profile = model_capability_profile(model)
     if capability_profile["status"] == "reviewed":
@@ -2062,7 +2181,11 @@ def performance_page(request: Request, result: str = "", db: Session = Depends(g
     notices = {
         "deactivated": "Model stopped. You can now validate and apply a performance profile.",
         "applied": "Performance profile validated and saved. The model remains stopped.",
+        "activation-queued": "Performance profile validated and saved. Model activation started in the background.",
         "applied-activated": "Performance profile validated, saved and activated.",
+    }
+    errors = {
+        "activation-queue-failed": "The performance profile was saved, but model activation could not be queued. Try activating it again.",
     }
     return render(
         request,
@@ -2072,6 +2195,7 @@ def performance_page(request: Request, result: str = "", db: Session = Depends(g
         hardware=hardware,
         changes=changes,
         notice=notices.get(result),
+        error=errors.get(result),
     )
 
 
@@ -2178,10 +2302,24 @@ async def performance_apply(
     audit(db, session, request, "performance.changed", "model", model.id, before=before, after=recommendation)
     db.commit()
     if activate_after_apply:
-        response = await controller_action(model_id, "activate")
+        response = await controller_action(
+            model_id,
+            "install",
+            {"activate": True, "set_default": False, "force_download": False},
+        )
+        audit(
+            db,
+            session,
+            request,
+            "model.performance_activation_queued",
+            "model",
+            model.id,
+            result="success" if response.is_success else "failure",
+        )
+        db.commit()
         if not response.is_success:
-            raise HTTPException(response.status_code, response.text[:1000])
-        return RedirectResponse("/admin/performance?result=applied-activated", 303)
+            return RedirectResponse("/admin/performance?result=activation-queue-failed", 303)
+        return RedirectResponse(f"/admin/performance?result=activation-queued#model-{model.id}", 303)
     return RedirectResponse("/admin/performance?result=applied", 303)
 
 
