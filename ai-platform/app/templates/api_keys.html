@@ -10,6 +10,7 @@
     {% if created_secret %}<div class="secret-once"><strong>Copy this key now. It cannot be shown again.</strong><code id="created-secret-value">{{ created_secret }}</code><button type="button" class="codex-setup-button primary" data-key-id="{{ created_key_id }}" data-key-name="New API key">Configure Codex</button></div>{% endif %}
     <article class="panel">
       <h2>Create API key</h2>
+      <p class="small muted">Enter 0 for an unlimited gateway limit. The model context window remains the physical limit.</p>
       <form method="post" class="form-grid" data-policy-form>
         <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
         <label>Name<input name="name" required></label>
@@ -19,15 +20,15 @@
         <label>Allowed IP/CIDR <small>comma-separated IPv4/IPv6</small><input name="allowed_cidrs"></label>
         <label>Allowed endpoints <small>blank inherits owner/legacy behavior</small><input name="allowed_endpoints" placeholder="/v1/models,/v1/chat/completions,/v1/responses"></label>
         <label>Expires at <small>optional UTC</small><input name="expires_at" type="datetime-local"></label>
-        <label>Requests/minute<input name="requests_per_minute" type="number" min="0" value="60"></label>
-        <label>Tokens/minute<input name="tokens_per_minute" type="number" min="0" value="60000"></label>
-        <label>Concurrent requests<input name="concurrent_requests" type="number" min="1" value="4"></label>
-        <label>Requests/day<input name="requests_per_day" type="number" min="0" value="10000"></label>
-        <label>Requests/month<input name="requests_per_month" type="number" min="0" value="100000"></label>
-        <label>Tokens/day<input name="tokens_per_day" type="number" min="0" value="2000000"></label>
-        <label>Tokens/month<input name="tokens_per_month" type="number" min="0" value="20000000"></label>
-        <label>Maximum input tokens<input name="max_input_tokens" type="number" min="1" value="32768"></label>
-        <label>Maximum output tokens<input name="max_output_tokens" type="number" min="1" value="8192"></label>
+        <label>Requests/minute<input name="requests_per_minute" type="number" min="0" value="0"></label>
+        <label>Tokens/minute<input name="tokens_per_minute" type="number" min="0" value="0"></label>
+        <label>Concurrent requests<input name="concurrent_requests" type="number" min="0" value="0"></label>
+        <label>Requests/day<input name="requests_per_day" type="number" min="0" value="0"></label>
+        <label>Requests/month<input name="requests_per_month" type="number" min="0" value="0"></label>
+        <label>Tokens/day<input name="tokens_per_day" type="number" min="0" value="0"></label>
+        <label>Tokens/month<input name="tokens_per_month" type="number" min="0" value="0"></label>
+        <label>Maximum input tokens<input name="max_input_tokens" type="number" min="0" value="0"></label>
+        <label>Maximum output tokens<input name="max_output_tokens" type="number" min="0" value="0"></label>
         <button class="primary">Create key</button>
       </form>
     </article>
@@ -40,7 +41,7 @@
             <td><code>{{ key.key_prefix }}</code></td>
             <td>{{ key.service_account.name if key.service_account else key.user.email }}</td>
             <td>Models: {{ key.allowed_models|join(', ') or 'Inherited/all' }}<br><small>Scopes: {{ key.scopes|join(', ') or 'Inherited/all' }}<br>Endpoints: {{ key.allowed_endpoints|join(', ') or 'Inherited/legacy' }}</small></td>
-            <td>{{ key.requests_per_minute }} rpm · {{ key.tokens_per_minute }} tpm · {{ key.concurrent_requests }} concurrent</td>
+            <td>{{ key.requests_per_minute if key.requests_per_minute > 0 else '∞' }} rpm · {{ key.tokens_per_minute if key.tokens_per_minute > 0 else '∞' }} tpm · {{ key.concurrent_requests if key.concurrent_requests > 0 else '∞' }} concurrent</td>
             <td><span class="pill {{ 'good' if key.enabled and not key.revoked_at else 'bad' }}">{{ 'Active' if key.enabled and not key.revoked_at else 'Revoked' }}</span><br><small>{{ 'Expires ' ~ key.expires_at if key.expires_at else 'No expiry' }}</small></td>
             <td><div class="actions">
               {% if key.enabled and not key.revoked_at %}<button type="button" class="codex-setup-button" data-key-id="{{ key.id }}" data-key-name="{{ key.name }}">Configure Codex</button>{% endif %}

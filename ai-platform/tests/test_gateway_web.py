@@ -403,6 +403,39 @@ def test_non_streaming_chat_proxy_and_usage(db, monkeypatch):
     assert db.query(UsageRecord).count() == 1
 
 
+def test_zero_gateway_token_caps_are_unlimited(db, monkeypatch):
+    _, _, raw = api_fixture(db)
+    key = db.query(APIKey).one()
+    assert key.max_input_tokens == 0
+    assert key.max_output_tokens == 0
+    original_async_client = httpx.AsyncClient
+
+    async def upstream(_request):
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_unlimited",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 40_000, "completion_tokens": 1, "total_tokens": 40_001},
+            },
+        )
+
+    monkeypatch.setattr(
+        gateway.httpx,
+        "AsyncClient",
+        lambda **kwargs: original_async_client(
+            transport=httpx.MockTransport(upstream),
+            timeout=kwargs.get("timeout"),
+        ),
+    )
+    response = TestClient(gateway.app).post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {raw}"},
+        json={"model": "alpha", "messages": [{"role": "user", "content": "x" * 120_000}], "max_tokens": 1_000_000},
+    )
+    assert response.status_code == 200
+
+
 def test_streaming_proxy_records_usage_and_cleans_lease(db, monkeypatch):
     _, _, raw = api_fixture(db)
     original_async_client = httpx.AsyncClient
@@ -781,7 +814,7 @@ def test_global_and_per_user_language_preferences(db):
     inherited = client.get("/")
     assert inherited.status_code == 200
     assert '<html lang="es">' in inherited.text
-    assert 'src="/static/i18n.js?v=1.2.0-mfa1"' in inherited.text
+    assert 'src="/static/i18n.js?v=1.2.0-unlimited1"' in inherited.text
     assert 'class="language-menu"' in inherited.text
     assert '<span class="language-current">System</span>' in inherited.text
     assert 'name="preferred_language" value="" class="selected" aria-current="true"' in inherited.text
@@ -1026,6 +1059,12 @@ def test_api_key_page_builds_codex_setup_command_without_revealing_stored_secret
     assert 'id="codex-setup-dialog"' in created.text
     assert 'data-installer-url="http://testserver/v1/codex/install"' in created.text
     assert 'src="/static/codex-setup.js?v=1.2.0-codex7"' in created.text
+    for field in (
+        "requests_per_minute", "tokens_per_minute", "concurrent_requests", "requests_per_day",
+        "requests_per_month", "tokens_per_day", "tokens_per_month", "max_input_tokens", "max_output_tokens",
+    ):
+        assert getattr(key, field) == 0
+    assert 'name="max_output_tokens" type="number" min="0" value="0"' in created.text
 
     later = client.get("/admin/api-keys")
     assert later.status_code == 200
@@ -1703,7 +1742,7 @@ def test_admin_models_guided_catalog_registers_all_reviewed_capabilities(db):
     assert 'class="secondary catalog-refresh-button"' in page.text
     assert 'aria-label="Refresh stable catalog"' in page.text
     assert "/static/models-guided.js?v=1.2.0-jobs1" in page.text
-    assert "/static/i18n.js?v=1.2.0-mfa1" in page.text
+    assert "/static/i18n.js?v=1.2.0-unlimited1" in page.text
 
     response = client.post(
         "/admin/models/catalog",

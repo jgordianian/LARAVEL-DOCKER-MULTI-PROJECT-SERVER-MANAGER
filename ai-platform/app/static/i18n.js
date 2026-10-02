@@ -262,6 +262,7 @@
     'Requests/minute': 'Solicitudes/minuto',
     'Tokens/minute': 'Tokens/minuto',
     'Concurrent requests': 'Solicitudes simultáneas',
+    'Enter 0 for an unlimited gateway limit. The model context window remains the physical limit.': 'Ingresa 0 para indicar un límite ilimitado en el gateway. La ventana de contexto del modelo sigue siendo el límite físico.',
     'Requests/day': 'Solicitudes/día',
     'Requests/month': 'Solicitudes/mes',
     'Tokens/day': 'Tokens/día',

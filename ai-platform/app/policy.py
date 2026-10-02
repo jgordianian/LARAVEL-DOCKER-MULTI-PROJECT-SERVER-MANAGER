@@ -159,11 +159,13 @@ class RedisPolicyLimiter:
         month, month_ttl = periods["month"]
         # Output is recorded after the request. Preflight input enforcement keeps
         # abuse bounded; a subsequent request is rejected if totals exceeded.
-        for name, ttl in (
-            (f"{prefix}:tpm:{minute}", minute_ttl),
-            (f"{prefix}:tpd:{day}", day_ttl),
-            (f"{prefix}:tpmth:{month}", month_ttl),
+        for name, ttl, limit in (
+            (f"{prefix}:tpm:{minute}", minute_ttl, key.tokens_per_minute),
+            (f"{prefix}:tpd:{day}", day_ttl, key.tokens_per_day),
+            (f"{prefix}:tpmth:{month}", month_ttl, key.tokens_per_month),
         ):
+            if limit <= 0:
+                continue
             self.redis.incrby(name, output_tokens)
             self.redis.expire(name, ttl)
 

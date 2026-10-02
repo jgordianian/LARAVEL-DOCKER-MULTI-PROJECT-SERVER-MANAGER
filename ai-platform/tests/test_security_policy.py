@@ -150,3 +150,27 @@ def test_redis_quotas_and_concurrency(db):
     assert request_limit.value.error_type == "quota_exceeded"
     assert approximate_tokens({"messages": [{"role": "user", "content": "hello"}]}) > 0
 
+
+def test_zero_usage_and_concurrency_limits_are_unlimited(db):
+    _, key = make_key(
+        db,
+        requests_per_minute=0,
+        tokens_per_minute=0,
+        requests_per_day=0,
+        requests_per_month=0,
+        tokens_per_day=0,
+        tokens_per_month=0,
+        concurrent_requests=0,
+        max_input_tokens=0,
+        max_output_tokens=0,
+    )
+    redis = fakeredis.FakeRedis(decode_responses=True)
+    limiter = RedisPolicyLimiter(redis)
+    leases = [limiter.acquire(key, 1_000_000) for _ in range(8)]
+    limiter.record_output(key, 1_000_000)
+
+    quota_counters = [name for name in redis.scan_iter("aip:key:*") if not name.endswith(":concurrent")]
+    assert quota_counters == []
+    for lease in leases:
+        lease.release()
+

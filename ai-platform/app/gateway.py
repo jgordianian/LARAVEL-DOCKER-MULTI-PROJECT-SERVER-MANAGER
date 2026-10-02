@@ -440,10 +440,10 @@ def _virtual_user_key(db: Session, user_id: int) -> Any:
     quota = db.scalar(select(Quota).where(Quota.subject_type == "user", Quota.subject_id == user_id))
     values = quota.limits if quota else {}
     defaults = {
-        "requests_per_minute": 30, "tokens_per_minute": 30_000, "concurrent_requests": 2,
-        "requests_per_day": 2_000, "requests_per_month": 30_000,
-        "tokens_per_day": 500_000, "tokens_per_month": 5_000_000,
-        "max_input_tokens": 16_384, "max_output_tokens": 4_096,
+        "requests_per_minute": 0, "tokens_per_minute": 0, "concurrent_requests": 0,
+        "requests_per_day": 0, "requests_per_month": 0,
+        "tokens_per_day": 0, "tokens_per_month": 0,
+        "max_input_tokens": 0, "max_output_tokens": 0,
     }
     defaults.update({key: int(value) for key, value in values.items() if key in defaults})
     return SimpleNamespace(id=f"user-{user_id}", **defaults)
@@ -649,7 +649,7 @@ async def proxy(request: Request, db: Session, endpoint: str):
         _apply_reasoning_budget(payload, endpoint)
         estimated = approximate_tokens(payload)
         limit_key = _effective_api_key(db, principal.api_key) if principal.api_key else _virtual_user_key(db, principal.user_id or 0)
-        if estimated > limit_key.max_input_tokens:
+        if limit_key.max_input_tokens > 0 and estimated > limit_key.max_input_tokens:
             raise PolicyDenied("input_token_limit", "The estimated input exceeds the configured token limit.", 413)
         try:
             output_requested = int(
@@ -663,7 +663,7 @@ async def proxy(request: Request, db: Session, endpoint: str):
             raise PolicyDenied("invalid_request", "The requested output-token limit must be an integer.", 400) from None
         if output_requested < 0:
             raise PolicyDenied("invalid_request", "The requested output-token limit cannot be negative.", 400)
-        if output_requested > limit_key.max_output_tokens:
+        if limit_key.max_output_tokens > 0 and output_requested > limit_key.max_output_tokens:
             raise PolicyDenied("output_token_limit", "The requested output exceeds the configured token limit.", 400)
         lease = RedisPolicyLimiter(redis_client).acquire(limit_key, estimated)
         model.last_used_at = datetime.now(timezone.utc)

@@ -649,7 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("enable", "disable", "delete"):
         item = ss.add_parser(name); item.add_argument("service_account_id", type=int); item.set_defaults(func=cmd_service_accounts)
     keys = sub.add_parser("keys"); ks = keys.add_subparsers(dest="key_command", required=True); ks.add_parser("list").set_defaults(func=cmd_keys)
-    item = ks.add_parser("create"); item.add_argument("--name", required=True); item.add_argument("--user-id", type=int); item.add_argument("--service-account-id", type=int); item.add_argument("--models", default=""); item.add_argument("--cidrs", default=""); item.add_argument("--scopes", default=""); item.add_argument("--endpoints", default=""); item.add_argument("--rpm", type=int, default=60); item.add_argument("--tpm", type=int, default=60000); item.add_argument("--concurrent", type=int, default=4); item.set_defaults(func=cmd_keys)
+    item = ks.add_parser("create"); item.add_argument("--name", required=True); item.add_argument("--user-id", type=int); item.add_argument("--service-account-id", type=int); item.add_argument("--models", default=""); item.add_argument("--cidrs", default=""); item.add_argument("--scopes", default=""); item.add_argument("--endpoints", default=""); item.add_argument("--rpm", type=int, default=0); item.add_argument("--tpm", type=int, default=0); item.add_argument("--concurrent", type=int, default=0); item.set_defaults(func=cmd_keys)
     for name in ("revoke", "rotate"):
         item = ks.add_parser(name); item.add_argument("key_id", type=int); item.set_defaults(func=cmd_keys)
     ips = sub.add_parser("ip"); ip_sub = ips.add_subparsers(dest="ip_command", required=True); ip_sub.add_parser("list").set_defaults(func=cmd_ip)

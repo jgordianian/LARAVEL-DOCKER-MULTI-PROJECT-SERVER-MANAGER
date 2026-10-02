@@ -1759,10 +1759,10 @@ def user_reset_mfa(
 @app.post("/admin/users/{user_id}/policy")
 def user_policy(
     user_id: int, request: Request, model_ids: str = Form(""), tool_model_ids: str = Form(""), coding_model_ids: str = Form(""),
-    requests_per_minute: int = Form(30), tokens_per_minute: int = Form(30000), concurrent_requests: int = Form(2),
-    requests_per_day: int = Form(2000), requests_per_month: int = Form(30000),
-    tokens_per_day: int = Form(500000), tokens_per_month: int = Form(5000000),
-    max_input_tokens: int = Form(16384), max_output_tokens: int = Form(4096),
+    requests_per_minute: int = Form(0), tokens_per_minute: int = Form(0), concurrent_requests: int = Form(0),
+    requests_per_day: int = Form(0), requests_per_month: int = Form(0),
+    tokens_per_day: int = Form(0), tokens_per_month: int = Form(0),
+    max_input_tokens: int = Form(0), max_output_tokens: int = Form(0),
     csrf_token: str = Form(), db: Session = Depends(get_db),
 ):
     session = require_admin(request, db)
@@ -1784,10 +1784,10 @@ def user_policy(
         )
     limits = {
         "requests_per_minute": max(0, requests_per_minute), "tokens_per_minute": max(0, tokens_per_minute),
-        "concurrent_requests": max(1, concurrent_requests), "requests_per_day": max(0, requests_per_day),
+        "concurrent_requests": max(0, concurrent_requests), "requests_per_day": max(0, requests_per_day),
         "requests_per_month": max(0, requests_per_month), "tokens_per_day": max(0, tokens_per_day),
-        "tokens_per_month": max(0, tokens_per_month), "max_input_tokens": max(1, max_input_tokens),
-        "max_output_tokens": max(1, max_output_tokens),
+        "tokens_per_month": max(0, tokens_per_month), "max_input_tokens": max(0, max_input_tokens),
+        "max_output_tokens": max(0, max_output_tokens),
     }
     quota = db.scalar(select(Quota).where(Quota.subject_type == "user", Quota.subject_id == user.id))
     if quota is None:
@@ -1953,10 +1953,10 @@ def service_account_toggle(account_id: int, request: Request, csrf_token: str = 
 def service_account_policy(
     account_id: int, request: Request, purpose: str = Form("general_api"), allowed_models: list[str] = Form([]),
     scopes: list[str] = Form([]), allowed_endpoints: str = Form(""),
-    allow_custom_system_messages: bool = Form(False), requests_per_minute: int = Form(60),
-    tokens_per_minute: int = Form(60000), concurrent_requests: int = Form(4), requests_per_day: int = Form(10000),
-    requests_per_month: int = Form(100000), tokens_per_day: int = Form(2000000), tokens_per_month: int = Form(20000000),
-    max_input_tokens: int = Form(32768), max_output_tokens: int = Form(8192), csrf_token: str = Form(), db: Session = Depends(get_db),
+    allow_custom_system_messages: bool = Form(False), requests_per_minute: int = Form(0),
+    tokens_per_minute: int = Form(0), concurrent_requests: int = Form(0), requests_per_day: int = Form(0),
+    requests_per_month: int = Form(0), tokens_per_day: int = Form(0), tokens_per_month: int = Form(0),
+    max_input_tokens: int = Form(0), max_output_tokens: int = Form(0), csrf_token: str = Form(), db: Session = Depends(get_db),
 ):
     session = require_admin(request, db)
     verify_csrf(request, session, csrf_token)
@@ -1980,10 +1980,10 @@ def service_account_policy(
     account.allow_custom_system_messages = allow_custom_system_messages
     limits = {
         "requests_per_minute": max(0, requests_per_minute), "tokens_per_minute": max(0, tokens_per_minute),
-        "concurrent_requests": max(1, concurrent_requests), "requests_per_day": max(0, requests_per_day),
+        "concurrent_requests": max(0, concurrent_requests), "requests_per_day": max(0, requests_per_day),
         "requests_per_month": max(0, requests_per_month), "tokens_per_day": max(0, tokens_per_day),
-        "tokens_per_month": max(0, tokens_per_month), "max_input_tokens": max(1, max_input_tokens),
-        "max_output_tokens": max(1, max_output_tokens),
+        "tokens_per_month": max(0, tokens_per_month), "max_input_tokens": max(0, max_input_tokens),
+        "max_output_tokens": max(0, max_output_tokens),
     }
     quota = db.scalar(select(Quota).where(Quota.subject_type == "service_account", Quota.subject_id == account.id))
     if quota is None:
@@ -2032,10 +2032,10 @@ def api_key_create(
     request: Request, name: str = Form(), owner_type: str = Form(), owner_id: int = Form(),
     allowed_models: list[str] = Form([]), allowed_cidrs: str = Form(""), scopes: list[str] = Form([]),
     allowed_endpoints: str = Form(""),
-    requests_per_minute: int = Form(60), tokens_per_minute: int = Form(60000), concurrent_requests: int = Form(4),
-    requests_per_day: int = Form(10000), requests_per_month: int = Form(100000),
-    tokens_per_day: int = Form(2000000), tokens_per_month: int = Form(20000000),
-    max_input_tokens: int = Form(32768), max_output_tokens: int = Form(8192), expires_at: str = Form(""),
+    requests_per_minute: int = Form(0), tokens_per_minute: int = Form(0), concurrent_requests: int = Form(0),
+    requests_per_day: int = Form(0), requests_per_month: int = Form(0),
+    tokens_per_day: int = Form(0), tokens_per_month: int = Form(0),
+    max_input_tokens: int = Form(0), max_output_tokens: int = Form(0), expires_at: str = Form(""),
     csrf_token: str = Form(), db: Session = Depends(get_db),
 ):
     session = require_admin(request, db)
@@ -2074,10 +2074,10 @@ def api_key_create(
         scopes=selected_scopes,
         allowed_endpoints=endpoints,
         requests_per_minute=max(0, requests_per_minute), tokens_per_minute=max(0, tokens_per_minute),
-        concurrent_requests=max(1, concurrent_requests),
+        concurrent_requests=max(0, concurrent_requests),
         requests_per_day=max(0, requests_per_day), requests_per_month=max(0, requests_per_month),
         tokens_per_day=max(0, tokens_per_day), tokens_per_month=max(0, tokens_per_month),
-        max_input_tokens=max(1, max_input_tokens), max_output_tokens=max(1, max_output_tokens),
+        max_input_tokens=max(0, max_input_tokens), max_output_tokens=max(0, max_output_tokens),
         expires_at=expiry,
     )
     if key.user_id is None and key.service_account_id is None:

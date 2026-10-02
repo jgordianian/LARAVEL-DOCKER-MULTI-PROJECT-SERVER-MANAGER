@@ -51,20 +51,21 @@
       <details>
         <summary>Model permissions and quotas</summary>
         {% set limits = quota_map.get(user.id, {}) %}
+        <p class="small muted">Enter 0 for an unlimited gateway limit. The model context window remains the physical limit.</p>
         <form method="post" action="/admin/users/{{ user.id }}/policy" class="form-grid">
           <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
           <label>Permitted model IDs <small>comma-separated numeric IDs; blank allows every active model</small><input name="model_ids" value="{{ permission_map.get(user.id, [])|join(',') }}"></label>
           <label>Tool-enabled model IDs<input name="tool_model_ids" value="{{ tool_permission_map.get(user.id, [])|join(',') }}"></label>
           <label>Coding-enabled model IDs <small>required for coding/agentic models</small><input name="coding_model_ids" value="{{ coding_permission_map.get(user.id, [])|join(',') }}"></label>
-          <label>Requests/minute<input type="number" min="0" name="requests_per_minute" value="{{ limits.get('requests_per_minute', 30) }}"></label>
-          <label>Tokens/minute<input type="number" min="0" name="tokens_per_minute" value="{{ limits.get('tokens_per_minute', 30000) }}"></label>
-          <label>Concurrent requests<input type="number" min="1" name="concurrent_requests" value="{{ limits.get('concurrent_requests', 2) }}"></label>
-          <label>Requests/day<input type="number" min="0" name="requests_per_day" value="{{ limits.get('requests_per_day', 2000) }}"></label>
-          <label>Requests/month<input type="number" min="0" name="requests_per_month" value="{{ limits.get('requests_per_month', 30000) }}"></label>
-          <label>Tokens/day<input type="number" min="0" name="tokens_per_day" value="{{ limits.get('tokens_per_day', 500000) }}"></label>
-          <label>Tokens/month<input type="number" min="0" name="tokens_per_month" value="{{ limits.get('tokens_per_month', 5000000) }}"></label>
-          <label>Maximum input tokens<input type="number" min="1" name="max_input_tokens" value="{{ limits.get('max_input_tokens', 16384) }}"></label>
-          <label>Maximum output tokens<input type="number" min="1" name="max_output_tokens" value="{{ limits.get('max_output_tokens', 4096) }}"></label>
+          <label>Requests/minute<input type="number" min="0" name="requests_per_minute" value="{{ limits.get('requests_per_minute', 0) }}"></label>
+          <label>Tokens/minute<input type="number" min="0" name="tokens_per_minute" value="{{ limits.get('tokens_per_minute', 0) }}"></label>
+          <label>Concurrent requests<input type="number" min="0" name="concurrent_requests" value="{{ limits.get('concurrent_requests', 0) }}"></label>
+          <label>Requests/day<input type="number" min="0" name="requests_per_day" value="{{ limits.get('requests_per_day', 0) }}"></label>
+          <label>Requests/month<input type="number" min="0" name="requests_per_month" value="{{ limits.get('requests_per_month', 0) }}"></label>
+          <label>Tokens/day<input type="number" min="0" name="tokens_per_day" value="{{ limits.get('tokens_per_day', 0) }}"></label>
+          <label>Tokens/month<input type="number" min="0" name="tokens_per_month" value="{{ limits.get('tokens_per_month', 0) }}"></label>
+          <label>Maximum input tokens<input type="number" min="0" name="max_input_tokens" value="{{ limits.get('max_input_tokens', 0) }}"></label>
+          <label>Maximum output tokens<input type="number" min="0" name="max_output_tokens" value="{{ limits.get('max_output_tokens', 0) }}"></label>
           <button>Apply policy</button>
         </form>
         <p class="small">Model IDs: {% for model in models %}{{ model.id }}={{ model.alias }}{% if not loop.last %}, {% endif %}{% else %}none registered{% endfor %}</p>
